@@ -51,23 +51,16 @@ pub const WriteAheadLog = struct {
 
         while (true) {
             var key_len_bytes: [4]u8 = undefined;
-            _ = self.file.readAll(&key_len_bytes) catch break;
             const key_len = std.mem.readInt(u32, &key_len_bytes, .little);
 
             const key_buf = try self.allocator.alloc(u8, key_len);
             defer self.allocator.free(key_buf);
-            _ = self.file.readAll(key_buf) catch break;
 
             var value_len_bytes: [4]u8 = undefined;
-            _ = self.file.readAll(&value_len_bytes) catch break;
             const value_len = std.mem.readInt(u32, &value_len_bytes, .little);
 
             const value_buf = try self.allocator.alloc(u8, value_len);
             defer self.allocator.free(value_buf);
-            _ = self.file.readAll(value_buf) catch break;
-
-            var newline: [1]u8 = undefined;
-            _ = self.file.readAll(&newline) catch break;
 
             const value = try EventValue.deserialize(self.allocator, value_buf);
             try radix_tree.insert(key_buf, value);

@@ -5,6 +5,7 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     zig-overlay.url = "github:mitchellh/zig-overlay";
+    zls.url = "github:zigtools/zls";
 
     flake-compat = {
       url = "github:edolstra/flake-compat";
@@ -29,11 +30,13 @@
     flake-utils.lib.eachSystem systems (
       system: let
         pkgs = import nixpkgs {inherit overlays system;};
-        zig = inputs.zig-overlay.packages.${system}.default;
+        zig = inputs.zig-overlay.packages.${system}.master;
+        zls_pkg = inputs.zls.packages.${system}.default;
       in {
         devShells.default = pkgs.mkShell {
           packages = [
             zig
+            zls_pkg
           ];
         };
 

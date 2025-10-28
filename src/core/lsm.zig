@@ -89,20 +89,15 @@ pub const SSTable = struct {
         // TODO: replace the linear scan, maybe with a binary search
         while (true) {
             var key_len_bytes: [4]u8 = undefined;
-            _ = file.readAll(&key_len_bytes) catch break;
             const key_len = std.mem.readInt(u32, &key_len_bytes, .little);
 
             const key_buf = self.allocator.alloc(u8, key_len) catch break;
             defer self.allocator.free(key_buf);
-            _ = file.readAll(key_buf) catch break;
 
             var value_len_bytes: [4]u8 = undefined;
-            _ = file.readAll(&value_len_bytes) catch break;
             const value_len = std.mem.readInt(u32, &value_len_bytes, .little);
             const value_buf = self.allocator.alloc(u8, value_len) catch break;
             defer self.allocator.free(value_buf);
-
-            _ = file.readAll(value_buf) catch break;
 
             if (std.mem.eql(u8, key_buf, key)) {
                 return EventValue.deserialize(self.allocator, value_buf) catch null;

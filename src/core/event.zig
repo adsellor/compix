@@ -6,7 +6,13 @@ pub const EventValue = struct {
     payload: []const u8,
     timestamp: i64,
 
-    pub fn init(allocator: std.mem.Allocator, sequence: u64, event_type: []const u8, payload: []const u8, timestamp: i64) !EventValue {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        sequence: u64,
+        event_type: []const u8,
+        payload: []const u8,
+        timestamp: i64,
+    ) !EventValue {
         return EventValue{
             .sequence = sequence,
             .event_type = try allocator.dupe(u8, event_type),
