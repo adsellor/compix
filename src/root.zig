@@ -44,7 +44,7 @@ test "basic operations" {
     };
 
     for (sample_events, 0..) |sample, i| {
-        const value = try event.EventValue.init(allocator, i + 1, sample.event_type, sample.payload, std.time.timestamp());
+        const value = try event.EventValue.init(allocator, i + 1, sample.event_type, sample.payload, @truncate(std.time.nanoTimestamp()));
         try event_store.put(sample.key, value);
     }
 
@@ -76,7 +76,7 @@ test "bulk inserts" {
         const payload = try std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{i});
         defer allocator.free(payload);
 
-        const value = try event.EventValue.init(allocator, i + 1000, "bulk.insert", payload, std.time.timestamp());
+        const value = try event.EventValue.init(allocator, i + 1000, "bulk.insert", payload, @truncate(std.time.nanoTimestamp()));
         try event_store.put(key, value);
     }
 
@@ -119,7 +119,7 @@ test "range scans" {
     };
 
     for (sample_events, 0..) |sample, i| {
-        const value = try event.EventValue.init(allocator, i + 2000, sample.event_type, sample.payload, std.time.timestamp());
+        const value = try event.EventValue.init(allocator, i + 2000, sample.event_type, sample.payload, @truncate(std.time.nanoTimestamp()));
         try event_store.put(sample.key, value);
     }
 
@@ -178,7 +178,7 @@ test "concurrent simulation" {
 
     for (operations) |op| {
         if (std.mem.eql(u8, op.operation_type, "write")) {
-            const value = try event.EventValue.init(allocator, sequence, op.event_type, op.payload, std.time.timestamp());
+            const value = try event.EventValue.init(allocator, sequence, op.event_type, op.payload, @truncate(std.time.nanoTimestamp()));
             try event_store.put(op.key, value);
             writes_performed += 1;
             sequence += 1;
@@ -226,7 +226,7 @@ test "persistence recovery" {
     };
 
     for (instance1_events, 0..) |test_event, i| {
-        const value = try event.EventValue.init(allocator, i + 4000, test_event.event_type, test_event.payload, std.time.timestamp());
+        const value = try event.EventValue.init(allocator, i + 4000, test_event.event_type, test_event.payload, @truncate(std.time.nanoTimestamp()));
         try store1.put(test_event.key, value);
     }
 
@@ -241,7 +241,7 @@ test "persistence recovery" {
     };
 
     for (instance2_events, 0..) |test_event, i| {
-        const value = try event.EventValue.init(allocator, i + 4100, test_event.event_type, test_event.payload, std.time.timestamp());
+        const value = try event.EventValue.init(allocator, i + 4100, test_event.event_type, test_event.payload, @truncate(std.time.nanoTimestamp()));
         try store2.put(test_event.key, value);
     }
 
@@ -301,10 +301,10 @@ test "stress test" {
         const full_event_type = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ service, event_type_name });
         defer allocator.free(full_event_type);
 
-        const payload = try std.fmt.allocPrint(allocator, "{{\"operation_id\":{},\"service\":\"{s}\",\"timestamp\":{}}}", .{ i, service, std.time.timestamp() });
+        const payload = try std.fmt.allocPrint(allocator, "{{\"operation_id\":{},\"service\":\"{s}\",\"timestamp\":{}}}", .{ i, service, @truncate(std.time.nanoTimestamp()) });
         defer allocator.free(payload);
 
-        const value = try event.EventValue.init(allocator, i + 5000, full_event_type, payload, std.time.timestamp());
+        const value = try event.EventValue.init(allocator, i + 5000, full_event_type, payload, @truncate(std.time.nanoTimestamp()));
         try event_store.put(key, value);
 
         operations_completed += 1;
@@ -347,7 +347,7 @@ test "edge cases" {
     var event_store = try store.HybridEventStore.init(allocator, "data/test_edge_cases.wal");
     defer event_store.deinit();
 
-    const empty_value = try event.EventValue.init(allocator, 6000, "", "", std.time.timestamp());
+    const empty_value = try event.EventValue.init(allocator, 6000, "", "", @truncate(std.time.nanoTimestamp()));
     try event_store.put("edge:empty", empty_value);
 
     if (event_store.get("edge:empty")) |found_value| {
@@ -359,13 +359,13 @@ test "edge cases" {
         return error.EmptyValueNotFound;
     }
 
-    const long_key = try std.fmt.allocPrint(allocator, "edge:very:long:key:with:many:segments:and:even:more:segments:to:make:it:really:long:{}", .{std.time.timestamp()});
+    const long_key = try std.fmt.allocPrint(allocator, "edge:very:long:key:with:many:segments:and:even:more:segments:to:make:it:really:long:{}", .{@truncate(std.time.nanoTimestamp())});
     defer allocator.free(long_key);
 
     const long_payload = try std.fmt.allocPrint(allocator, "{{\"description\":\"This is a very long payload designed to test how the system handles large amounts of data in a single event. It contains multiple sentences and should stress test the serialization and storage mechanisms.\",\"data\":[{}]}}", .{std.time.nanoTimestamp()});
     defer allocator.free(long_payload);
 
-    const long_value = try event.EventValue.init(allocator, 6001, "test.long_data", long_payload, std.time.timestamp());
+    const long_value = try event.EventValue.init(allocator, 6001, "test.long_data", long_payload, @truncate(std.time.nanoTimestamp()));
     try event_store.put(long_key, long_value);
 
     if (event_store.get(long_key)) |found_value| {
@@ -386,7 +386,7 @@ test "edge cases" {
     };
 
     for (special_keys, 0..) |key, i| {
-        const value = try event.EventValue.init(allocator, 6100 + i, "test.special", "special payload", std.time.timestamp());
+        const value = try event.EventValue.init(allocator, 6100 + i, "test.special", "special payload", @truncate(std.time.nanoTimestamp()));
         try event_store.put(key, value);
     }
 
@@ -401,10 +401,10 @@ test "edge cases" {
 
     const overwrite_key = "edge:overwrite:test";
 
-    const value1 = try event.EventValue.init(allocator, 6200, "test.first", "first value", std.time.timestamp());
+    const value1 = try event.EventValue.init(allocator, 6200, "test.first", "first value", @truncate(std.time.nanoTimestamp()));
     try event_store.put(overwrite_key, value1);
 
-    const value2 = try event.EventValue.init(allocator, 6201, "test.second", "second value", std.time.timestamp());
+    const value2 = try event.EventValue.init(allocator, 6201, "test.second", "second value", @truncate(std.time.nanoTimestamp()));
     try event_store.put(overwrite_key, value2);
 
     if (event_store.get(overwrite_key)) |found_value| {

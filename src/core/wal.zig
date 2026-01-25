@@ -14,7 +14,7 @@ pub const WriteAheadLog = struct {
             else => return err,
         };
 
-        const file = try std.fs.cwd().createFile(file_path, .{ .truncate = false });
+        const file = try std.fs.cwd().createFile(file_path, .{ .truncate = false, .read = true });
         return WriteAheadLog{
             .file = file,
             .allocator = allocator,
@@ -51,19 +51,40 @@ pub const WriteAheadLog = struct {
 
         while (true) {
             var key_len_bytes: [4]u8 = undefined;
+            const bytes_read = try self.file.read(&key_len_bytes);
+            if (bytes_read == 0) break;
+            if (bytes_read < 4) return error.InvalidFormat;
+
             const key_len = std.mem.readInt(u32, &key_len_bytes, .little);
 
             const key_buf = try self.allocator.alloc(u8, key_len);
             defer self.allocator.free(key_buf);
+            try readExact(self.file, key_buf);
 
             var value_len_bytes: [4]u8 = undefined;
+            try readExact(self.file, &value_len_bytes);
+
             const value_len = std.mem.readInt(u32, &value_len_bytes, .little);
 
             const value_buf = try self.allocator.alloc(u8, value_len);
             defer self.allocator.free(value_buf);
+            try readExact(self.file, value_buf);
+
+            // Skip the newline character
+            var newline: [1]u8 = undefined;
+            _ = self.file.read(&newline) catch {};
 
             const value = try EventValue.deserialize(self.allocator, value_buf);
             try radix_tree.insert(key_buf, value);
         }
     }
 };
+
+fn readExact(file: std.fs.File, buf: []u8) !void {
+    var total_read: usize = 0;
+    while (total_read < buf.len) {
+        const bytes_read = try file.read(buf[total_read..]);
+        if (bytes_read == 0) return error.InvalidFormat;
+        total_read += bytes_read;
+    }
+}

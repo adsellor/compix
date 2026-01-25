@@ -12,7 +12,8 @@ pub fn main() !void {
     var event_store = try store.HybridEventStore.init(allocator, "data/events.wal");
     defer event_store.deinit();
 
-    const sample_value = try event.EventValue.init(allocator, 1, "system.startup", "{\"timestamp\":\"now\"}", std.Io.Timestamp.nanoseconds);
+    const now = try std.time.Instant.now();
+    const sample_value = try event.EventValue.init(allocator, 1, "system.startup", "{\"timestamp\":\"now\"}", now.timestamp.nsec);
     try event_store.put("system:startup", sample_value);
 
     if (event_store.get("system:startup")) |found_value| {

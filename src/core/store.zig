@@ -27,18 +27,23 @@ pub const HybridEventStore = struct {
     compaction_generation: u32,
 
     pub fn init(allocator: std.mem.Allocator, wal_path: []const u8) !HybridEventStore {
-        var store = HybridEventStore{
+        var memtable = try RadixTree.init(allocator);
+        errdefer memtable.deinit();
+
+        var wal_file = try WriteAheadLog.init(allocator, wal_path);
+        errdefer wal_file.deinit();
+
+        try wal_file.replay(&memtable);
+
+        return HybridEventStore{
             .allocator = allocator,
-            .memtable = try RadixTree.init(allocator),
+            .memtable = memtable,
             .memtable_size = 0,
             .max_memtable_size = 64 * 1024,
             .sstables = ArrayList(SSTable){},
-            .wal = try WriteAheadLog.init(allocator, wal_path),
+            .wal = wal_file,
             .compaction_generation = 0,
         };
-
-        try store.wal.replay(&store.memtable);
-        return store;
     }
 
     pub fn deinit(self: *HybridEventStore) void {

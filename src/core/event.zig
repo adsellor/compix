@@ -22,7 +22,13 @@ pub const EventValue = struct {
     }
 
     pub fn serialize(self: *const EventValue, allocator: std.mem.Allocator) ![]u8 {
-        return try std.fmt.allocPrint(allocator, "{}|{}|{}|{s}|{s}", .{ self.sequence, self.timestamp, self.payload.len, self.event_type, self.payload });
+        return try std.fmt.allocPrint(allocator, "{}|{}|{}|{s}|{s}", .{
+            self.sequence,
+            self.timestamp,
+            self.payload.len,
+            self.event_type,
+            self.payload,
+        });
     }
 
     pub fn deserialize(allocator: std.mem.Allocator, data: []const u8) !EventValue {
