@@ -67,15 +67,8 @@ pub const WriteAheadLog = struct {
     }
 
     pub fn replay(self: *WriteAheadLog, radix_tree: *RadixTree) !WalCursor {
-        var crumb = wal_cursor.load(self.allocator, self.wal_path) orelse WalCursor{ .file_offset = 0, .last_sequence = 0 };
-
-        const file_size = try self.file.getEndPos();
-        if (crumb.file_offset > file_size) {
-            crumb.file_offset = 0;
-            crumb.last_sequence = 0;
-        }
-
-        try self.file.seekTo(crumb.file_offset);
+        try self.file.seekTo(0);
+        var crumb = WalCursor{ .file_offset = 0, .last_sequence = 0 };
 
         while (true) {
             var magic_bytes: [4]u8 = undefined;
@@ -355,7 +348,15 @@ test "replay with crumb resumes from correct position" {
         const crumb3 = try wal_log.replay(&tree3);
         try std.testing.expectEqual(@as(u64, 8), crumb3.last_sequence);
 
-        try std.testing.expect(tree3.get("key_0") == null);
+        // Full replay from offset 0: all 8 keys should be present
+        {
+            var v = tree3.get("key_0") orelse return error.ExpectedValueNotFound;
+            v.deinit(allocator);
+        }
+        {
+            var v = tree3.get("key_4") orelse return error.ExpectedValueNotFound;
+            v.deinit(allocator);
+        }
         {
             var v = tree3.get("key_5") orelse return error.ExpectedValueNotFound;
             v.deinit(allocator);
