@@ -12,6 +12,16 @@ const EventValue = event.EventValue;
 const KeyValuePair = event.KeyValuePair;
 const Breadcrumb = breadcrumb_mod.Breadcrumb;
 
+pub const EVENT_PREFIX = "evt:";
+
+pub fn makeEventKey(allocator: std.mem.Allocator, origin: []const u8, event_type: []const u8, sequence: u64) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "evt:{s}:{s}:{x:0>16}", .{ origin, event_type, sequence });
+}
+
+pub fn makeEventPrefix(allocator: std.mem.Allocator, origin: []const u8, event_type: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(allocator, "evt:{s}:{s}:", .{ origin, event_type });
+}
+
 pub const EventStore = struct {
     allocator: std.mem.Allocator,
 
@@ -79,6 +89,43 @@ pub const EventStore = struct {
         }
 
         return null;
+    }
+
+    pub fn put_event(self: *EventStore, value: EventValue) !void {
+        const key = try makeEventKey(self.allocator, value.origin_service, value.event_type, value.sequence);
+        defer self.allocator.free(key);
+        try self.put(key, value);
+    }
+
+    pub fn query_events(self: *const EventStore, origin: []const u8, event_type: []const u8, from_sequence: u64) !ArrayList(EventValue) {
+        const prefix = try makeEventPrefix(self.allocator, origin, event_type);
+        defer self.allocator.free(prefix);
+
+        var scan_results = try self.scan_range(prefix);
+        defer scan_results.deinit(self.allocator);
+
+        var results = ArrayList(EventValue){};
+        errdefer {
+            for (results.items) |*v| v.deinit(self.allocator);
+            results.deinit(self.allocator);
+        }
+
+        for (scan_results.items) |*item| {
+            if (item.value.sequence >= from_sequence) {
+                try results.append(self.allocator, item.value);
+                self.allocator.free(item.key);
+            } else {
+                item.deinit(self.allocator);
+            }
+        }
+
+        std.mem.sort(EventValue, results.items, {}, struct {
+            fn lessThan(_: void, a: EventValue, b: EventValue) bool {
+                return a.sequence < b.sequence;
+            }
+        }.lessThan);
+
+        return results;
     }
 
     pub fn get_breadcrumbs(self: *const EventStore) !ArrayList(Breadcrumb) {
@@ -734,4 +781,197 @@ test "breadcrumb survives WAL replay" {
 
     std.fs.cwd().deleteFile("data/test_bc_replay.wal") catch {};
     std.fs.cwd().deleteFile("data/test_bc_replay.crumb") catch {};
+}
+
+test "put_event and query_events basic" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_event_query.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_event_query.crumb") catch {};
+
+    var store = try EventStore.init(allocator, "data/test_event_query.wal");
+    defer {
+        store.deinit();
+        std.fs.cwd().deleteFile("data/test_event_query.wal") catch {};
+        std.fs.cwd().deleteFile("data/test_event_query.crumb") catch {};
+    }
+
+    for (1..6) |i| {
+        const payload = try std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{i});
+        defer allocator.free(payload);
+        const ev = try EventValue.init(allocator, i, "order-service", "order.created", payload, @intCast(i * 100));
+        try store.put_event(ev);
+    }
+
+    var all = try store.query_events("order-service", "order.created", 0);
+    defer {
+        for (all.items) |*v| v.deinit(allocator);
+        all.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 5), all.items.len);
+
+    for (all.items, 0..) |item, i| {
+        try std.testing.expectEqual(@as(u64, i + 1), item.sequence);
+    }
+}
+
+test "query_events filters by from_sequence" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_event_filter.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_event_filter.crumb") catch {};
+
+    var store = try EventStore.init(allocator, "data/test_event_filter.wal");
+    defer {
+        store.deinit();
+        std.fs.cwd().deleteFile("data/test_event_filter.wal") catch {};
+        std.fs.cwd().deleteFile("data/test_event_filter.crumb") catch {};
+    }
+
+    for (1..11) |i| {
+        const ev = try EventValue.init(allocator, i, "order-service", "order.created", "{}", @intCast(i * 100));
+        try store.put_event(ev);
+    }
+
+    var partial = try store.query_events("order-service", "order.created", 7);
+    defer {
+        for (partial.items) |*v| v.deinit(allocator);
+        partial.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 4), partial.items.len);
+    try std.testing.expectEqual(@as(u64, 7), partial.items[0].sequence);
+    try std.testing.expectEqual(@as(u64, 10), partial.items[3].sequence);
+}
+
+test "query_events isolates by origin and event_type" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_event_isolate.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_event_isolate.crumb") catch {};
+
+    var store = try EventStore.init(allocator, "data/test_event_isolate.wal");
+    defer {
+        store.deinit();
+        std.fs.cwd().deleteFile("data/test_event_isolate.wal") catch {};
+        std.fs.cwd().deleteFile("data/test_event_isolate.crumb") catch {};
+    }
+
+    for (1..4) |i| {
+        const ev = try EventValue.init(allocator, i, "order-service", "order.created", "{}", @intCast(i));
+        try store.put_event(ev);
+    }
+    for (1..3) |i| {
+        const ev = try EventValue.init(allocator, i, "user-service", "user.registered", "{}", @intCast(i));
+        try store.put_event(ev);
+    }
+    for (1..3) |i| {
+        const ev = try EventValue.init(allocator, i, "order-service", "order.updated", "{}", @intCast(i));
+        try store.put_event(ev);
+    }
+
+    var orders = try store.query_events("order-service", "order.created", 0);
+    defer {
+        for (orders.items) |*v| v.deinit(allocator);
+        orders.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 3), orders.items.len);
+
+    var users = try store.query_events("user-service", "user.registered", 0);
+    defer {
+        for (users.items) |*v| v.deinit(allocator);
+        users.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 2), users.items.len);
+
+    var updates = try store.query_events("order-service", "order.updated", 0);
+    defer {
+        for (updates.items) |*v| v.deinit(allocator);
+        updates.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 2), updates.items.len);
+
+    var empty = try store.query_events("ghost-service", "ghost.event", 0);
+    defer empty.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), empty.items.len);
+}
+
+test "query_events does not leak into breadcrumbs or arbitrary keys" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_event_noleak.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_event_noleak.crumb") catch {};
+
+    var store = try EventStore.init(allocator, "data/test_event_noleak.wal");
+    defer {
+        store.deinit();
+        std.fs.cwd().deleteFile("data/test_event_noleak.wal") catch {};
+        std.fs.cwd().deleteFile("data/test_event_noleak.crumb") catch {};
+    }
+
+    const ev = try EventValue.init(allocator, 1, "order-service", "order.created", "{}", 100);
+    try store.put_event(ev);
+
+    const arb = try EventValue.init(allocator, 2, "order-service", "order.created", "{}", 200);
+    try store.put("order-service:o1:order", arb);
+
+    const bc = Breadcrumb{
+        .source_service = "order-service",
+        .event_type = "order.created",
+        .last_sequence = 5,
+        .peer_address = "10.0.0.5:4200",
+        .updated_at = 300,
+    };
+    try store.put_breadcrumb(bc, 3, "my-service", 300);
+
+    var results = try store.query_events("order-service", "order.created", 0);
+    defer {
+        for (results.items) |*v| v.deinit(allocator);
+        results.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqual(@as(u64, 1), results.items[0].sequence);
+}
+
+test "put_event survives WAL replay" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_event_replay.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_event_replay.crumb") catch {};
+
+    {
+        var store = try EventStore.init(allocator, "data/test_event_replay.wal");
+        defer store.deinit();
+
+        for (1..4) |i| {
+            const ev = try EventValue.init(allocator, i, "order-service", "order.created", "{}", @intCast(i));
+            try store.put_event(ev);
+        }
+    }
+
+    {
+        var store = try EventStore.init(allocator, "data/test_event_replay.wal");
+        defer store.deinit();
+
+        var results = try store.query_events("order-service", "order.created", 0);
+        defer {
+            for (results.items) |*v| v.deinit(allocator);
+            results.deinit(allocator);
+        }
+        try std.testing.expectEqual(@as(usize, 3), results.items.len);
+        try std.testing.expectEqual(@as(u64, 1), results.items[0].sequence);
+        try std.testing.expectEqual(@as(u64, 3), results.items[2].sequence);
+    }
+
+    std.fs.cwd().deleteFile("data/test_event_replay.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_event_replay.crumb") catch {};
 }
