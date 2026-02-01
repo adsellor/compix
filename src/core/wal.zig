@@ -40,29 +40,33 @@ pub const WriteAheadLog = struct {
         defer self.allocator.free(serialized_value);
 
         const entry_len: u32 = @intCast(4 + key.len + 4 + serialized_value.len + 1);
+        const total_size: usize = 4 + 8 + 4 + 4 + key.len + 4 + serialized_value.len + 1;
 
-        var magic_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &magic_bytes, MAGIC, .little);
-        try self.file.writeAll(&magic_bytes);
+        var stack_buf: [4096]u8 = undefined;
+        const buf = if (total_size <= stack_buf.len)
+            stack_buf[0..total_size]
+        else
+            try self.allocator.alloc(u8, total_size);
+        defer if (total_size > stack_buf.len) self.allocator.free(buf);
 
-        var seq_bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seq_bytes, value.sequence, .little);
-        try self.file.writeAll(&seq_bytes);
+        var pos: usize = 0;
+        std.mem.writeInt(u32, buf[pos..][0..4], MAGIC, .little);
+        pos += 4;
+        std.mem.writeInt(u64, buf[pos..][0..8], value.sequence, .little);
+        pos += 8;
+        std.mem.writeInt(u32, buf[pos..][0..4], entry_len, .little);
+        pos += 4;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(key.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..key.len], key);
+        pos += key.len;
+        std.mem.writeInt(u32, buf[pos..][0..4], @intCast(serialized_value.len), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..serialized_value.len], serialized_value);
+        pos += serialized_value.len;
+        buf[pos] = '\n';
 
-        var entry_len_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &entry_len_bytes, entry_len, .little);
-        try self.file.writeAll(&entry_len_bytes);
-
-        var key_len_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &key_len_bytes, @intCast(key.len), .little);
-        try self.file.writeAll(&key_len_bytes);
-        try self.file.writeAll(key);
-
-        var value_len_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &value_len_bytes, @intCast(serialized_value.len), .little);
-        try self.file.writeAll(&value_len_bytes);
-        try self.file.writeAll(serialized_value);
-        try self.file.writeAll("\n");
+        try self.file.writeAll(buf);
         try self.file.sync();
     }
 
@@ -315,14 +319,8 @@ test "replay with crumb resumes from correct position" {
 
         const crumb2 = try wal_log.replay(&tree2);
         try std.testing.expectEqual(@as(u64, 5), crumb2.last_sequence);
-        {
-            var v = tree2.get("key_0") orelse return error.ExpectedValueNotFound;
-            v.deinit(allocator);
-        }
-        {
-            var v = tree2.get("key_4") orelse return error.ExpectedValueNotFound;
-            v.deinit(allocator);
-        }
+        _ = tree2.get("key_0") orelse return error.ExpectedValueNotFound;
+        _ = tree2.get("key_4") orelse return error.ExpectedValueNotFound;
 
         for (5..8) |i| {
             const key = try std.fmt.allocPrint(allocator, "key_{}", .{i});
@@ -349,22 +347,10 @@ test "replay with crumb resumes from correct position" {
         try std.testing.expectEqual(@as(u64, 8), crumb3.last_sequence);
 
         // Full replay from offset 0: all 8 keys should be present
-        {
-            var v = tree3.get("key_0") orelse return error.ExpectedValueNotFound;
-            v.deinit(allocator);
-        }
-        {
-            var v = tree3.get("key_4") orelse return error.ExpectedValueNotFound;
-            v.deinit(allocator);
-        }
-        {
-            var v = tree3.get("key_5") orelse return error.ExpectedValueNotFound;
-            v.deinit(allocator);
-        }
-        {
-            var v = tree3.get("key_7") orelse return error.ExpectedValueNotFound;
-            v.deinit(allocator);
-        }
+        _ = tree3.get("key_0") orelse return error.ExpectedValueNotFound;
+        _ = tree3.get("key_4") orelse return error.ExpectedValueNotFound;
+        _ = tree3.get("key_5") orelse return error.ExpectedValueNotFound;
+        _ = tree3.get("key_7") orelse return error.ExpectedValueNotFound;
     }
 
     std.fs.cwd().deleteFile("data/test_replay_crumb.wal") catch {};

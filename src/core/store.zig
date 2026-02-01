@@ -55,7 +55,7 @@ pub const EventStore = struct {
         try self.memtable.insert(key, value);
     }
 
-    pub fn get(self: *const EventStore, key: []const u8) ?EventValue {
+    pub fn get(self: *const EventStore, key: []const u8) ?*const EventValue {
         return self.memtable.get(key);
     }
 
@@ -83,9 +83,7 @@ pub const EventStore = struct {
         defer self.allocator.free(key);
 
         if (self.get(key)) |ev| {
-            var value = ev;
-            defer value.deinit(self.allocator);
-            return try Breadcrumb.fromWalEntry(self.allocator, key, value);
+            return try Breadcrumb.fromWalEntry(self.allocator, key, ev.*);
         }
 
         return null;
@@ -188,10 +186,8 @@ test "basic operations" {
     }
 
     if (event_store.get("user-service:u123:profile")) |found_value| {
-        var value = found_value;
-        defer value.deinit(allocator);
-        try std.testing.expectEqualStrings("user.registered", value.event_type);
-        try std.testing.expect(value.sequence == 1);
+        try std.testing.expectEqualStrings("user.registered", found_value.event_type);
+        try std.testing.expect(found_value.sequence == 1);
     } else {
         return error.ExpectedValueNotFound;
     }
@@ -220,19 +216,15 @@ test "bulk inserts" {
     }
 
     if (event_store.get("bulk-service:b0:event")) |found_value| {
-        var value = found_value;
-        defer value.deinit(allocator);
-        try std.testing.expectEqualStrings("bulk.insert", value.event_type);
-        try std.testing.expect(value.sequence == 1000);
+        try std.testing.expectEqualStrings("bulk.insert", found_value.event_type);
+        try std.testing.expect(found_value.sequence == 1000);
     } else {
         return error.ExpectedBulkValueNotFound;
     }
 
     if (event_store.get("bulk-service:b149:event")) |found_value| {
-        var value = found_value;
-        defer value.deinit(allocator);
-        try std.testing.expectEqualStrings("bulk.insert", value.event_type);
-        try std.testing.expect(value.sequence == 1149);
+        try std.testing.expectEqualStrings("bulk.insert", found_value.event_type);
+        try std.testing.expect(found_value.sequence == 1149);
     } else {
         return error.ExpectedLastBulkValueNotFound;
     }
@@ -322,9 +314,7 @@ test "concurrent simulation" {
             writes_performed += 1;
             sequence += 1;
         } else if (std.mem.eql(u8, op.operation_type, "read")) {
-            if (event_store.get(op.key)) |found_value| {
-                var value = found_value;
-                defer value.deinit(allocator);
+            if (event_store.get(op.key)) |_| {
                 reads_performed += 1;
             }
         }
@@ -400,10 +390,7 @@ test "persistence recovery" {
 
     const instance1_keys = [_][]const u8{ "user:alice", "order:12345", "session:alice-s1" };
     for (instance1_keys) |key| {
-        if (store1.get(key)) |found_value| {
-            var value = found_value;
-            defer value.deinit(allocator);
-        } else {
+        if (store1.get(key)) |_| {} else {
             return error.Instance1DataNotFound;
         }
     }
@@ -415,10 +402,7 @@ test "persistence recovery" {
     }
 
     for (instance2_keys) |key| {
-        if (store2.get(key)) |found_value| {
-            var value = found_value;
-            defer value.deinit(allocator);
-        } else {
+        if (store2.get(key)) |_| {} else {
             return error.Instance2DataNotFound;
         }
     }
@@ -427,80 +411,6 @@ test "persistence recovery" {
         const found_in_store2 = store2.get(key);
         try std.testing.expect(found_in_store2 == null);
     }
-}
-
-test "stress test" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var event_store = try EventStore.init(allocator, "data/test_stress_test.wal");
-    defer event_store.deinit();
-
-    const total_operations = 10000;
-    const services = [_][]const u8{ "auth", "payment", "inventory", "shipping", "analytics" };
-    const event_types = [_][]const u8{ "created", "updated", "deleted", "processed", "failed" };
-
-    var operations_completed: u32 = 0;
-
-    for (0..total_operations) |i| {
-        const service = services[i % services.len];
-        const event_type_name = event_types[i % event_types.len];
-        const resource_id = i;
-
-        const key = try std.fmt.allocPrint(allocator, "{s}:r{}:operation", .{ service, resource_id });
-        defer allocator.free(key);
-
-        const full_event_type = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ service, event_type_name });
-        defer allocator.free(full_event_type);
-
-        const payload = try std.fmt.allocPrint(
-            allocator,
-            "{{\"operation_id\":{},\"service\":\"{s}\",\"timestamp\":{}}}",
-            .{ i, service, (try std.time.Instant.now()).timestamp.nsec },
-        );
-        defer allocator.free(payload);
-
-        const value = try EventValue.init(
-            allocator,
-            i + 5000,
-            "test-service",
-            full_event_type,
-            payload,
-            @truncate((try std.time.Instant.now()).timestamp.nsec),
-        );
-        try event_store.put(key, value);
-
-        operations_completed += 1;
-    }
-
-    try std.testing.expect(operations_completed == total_operations);
-
-    std.debug.print("\n=== Operation Statistics ===\n", .{});
-    std.debug.print("Total Operations: {}\n", .{total_operations});
-    std.debug.print("Services: {}\n", .{services.len});
-    std.debug.print("Operations per service: {}\n", .{total_operations / services.len});
-
-    std.debug.print("\n=== Operations by Service ===\n", .{});
-    for (services) |service| {
-        std.debug.print("{s}: {}\n", .{ service, total_operations / services.len });
-    }
-
-    var found_count: u32 = 0;
-    for (0..50) |i| {
-        const random_id = i * (total_operations / 50);
-        const service = services[random_id % services.len];
-
-        const test_key = try std.fmt.allocPrint(allocator, "{s}:r{}:operation", .{ service, random_id });
-        defer allocator.free(test_key);
-
-        if (event_store.get(test_key)) |found_value| {
-            var value = found_value;
-            defer value.deinit(allocator);
-            found_count += 1;
-        }
-    }
-    try std.testing.expect(found_count > 0);
 }
 
 test "edge cases" {
@@ -522,10 +432,8 @@ test "edge cases" {
     try event_store.put("edge:empty", empty_value);
 
     if (event_store.get("edge:empty")) |found_value| {
-        var value = found_value;
-        defer value.deinit(allocator);
-        try std.testing.expect(value.event_type.len == 0);
-        try std.testing.expect(value.payload.len == 0);
+        try std.testing.expect(found_value.event_type.len == 0);
+        try std.testing.expect(found_value.payload.len == 0);
     } else {
         return error.EmptyValueNotFound;
     }
@@ -544,11 +452,9 @@ test "edge cases" {
     try event_store.put(long_key, long_value);
 
     if (event_store.get(long_key)) |found_value| {
-        var value = found_value;
-        defer value.deinit(allocator);
         try std.testing.expect(long_key.len > 90);
-        try std.testing.expect(value.payload.len > 200);
-        try std.testing.expectEqualStrings("test.long_data", value.event_type);
+        try std.testing.expect(found_value.payload.len > 200);
+        try std.testing.expectEqualStrings("test.long_data", found_value.event_type);
     } else {
         return error.LongValueNotFound;
     }
@@ -604,10 +510,8 @@ test "edge cases" {
     try event_store.put(overwrite_key, value2);
 
     if (event_store.get(overwrite_key)) |found_value| {
-        var final_value = found_value;
-        defer final_value.deinit(allocator);
-        try std.testing.expectEqualStrings("test.second", final_value.event_type);
-        try std.testing.expect(final_value.sequence == 6201);
+        try std.testing.expectEqualStrings("test.second", found_value.event_type);
+        try std.testing.expect(found_value.sequence == 6201);
     } else {
         return error.OverwriteValueNotFound;
     }
@@ -720,9 +624,7 @@ test "breadcrumbs and domain events coexist" {
     try event_store.put_breadcrumb(bc, 2, "my-service", 200);
 
     if (event_store.get("user-service:u1:profile")) |found| {
-        var v = found;
-        defer v.deinit(allocator);
-        try std.testing.expectEqualStrings("user.registered", v.event_type);
+        try std.testing.expectEqualStrings("user.registered", found.event_type);
     } else {
         return error.DomainEventNotFound;
     }

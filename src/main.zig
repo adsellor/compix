@@ -16,9 +16,7 @@ pub fn main() !void {
     const sample_value = try event.EventValue.init(allocator, 1, "compix", "system.startup", "{\"timestamp\":\"now\"}", now.timestamp.nsec);
     try event_store.put("system:startup", sample_value);
 
-    if (event_store.get("system:startup")) |found_value| {
-        var value = found_value;
-        defer value.deinit(allocator);
+    if (event_store.get("system:startup")) |_| {
         print("Event store is working correctly!\n", .{});
     } else {
         print("Event store test failed!\n", .{});

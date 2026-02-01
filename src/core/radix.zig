@@ -55,18 +55,19 @@ pub const RadixTree = struct {
     }
 
     pub fn insert(self: *RadixTree, key: []const u8, value: EventValue) !void {
-        try self.insert_recursive(self.root, key, value);
-        self.size += 1;
+        const is_new = try self.insert_recursive(self.root, key, value);
+        if (is_new) self.size += 1;
     }
 
-    fn insert_recursive(self: *RadixTree, node: *RadixNode, key: []const u8, value: EventValue) !void {
+    fn insert_recursive(self: *RadixTree, node: *RadixNode, key: []const u8, value: EventValue) !bool {
         if (key.len == 0) {
+            const was_new = !node.is_terminal;
             if (node.value) |*existing| {
                 existing.deinit(self.allocator);
             }
             node.value = value;
             node.is_terminal = true;
-            return;
+            return was_new;
         }
 
         for (node.children.items) |child| {
@@ -85,6 +86,7 @@ pub const RadixTree = struct {
         new_child.value = value;
         new_child.is_terminal = true;
         try node.children.append(self.allocator, new_child);
+        return true;
     }
 
     fn split_child(self: *RadixTree, child: *RadixNode, split_pos: usize) !void {
@@ -109,21 +111,14 @@ pub const RadixTree = struct {
         try child.children.append(self.allocator, new_child);
     }
 
-    pub fn get(self: *const RadixTree, key: []const u8) ?EventValue {
+    pub fn get(self: *const RadixTree, key: []const u8) ?*const EventValue {
         return self.get_recursive(self.root, key);
     }
 
-    fn get_recursive(self: *const RadixTree, node: *const RadixNode, key: []const u8) ?EventValue {
+    fn get_recursive(self: *const RadixTree, node: *const RadixNode, key: []const u8) ?*const EventValue {
         if (key.len == 0) {
-            if (node.is_terminal and node.value != null) {
-                const original = node.value.?;
-                return EventValue{
-                    .sequence = original.sequence,
-                    .event_type = self.allocator.dupe(u8, original.event_type) catch return null,
-                    .payload = self.allocator.dupe(u8, original.payload) catch return null,
-                    .timestamp = original.timestamp,
-                    .origin_service = self.allocator.dupe(u8, original.origin_service) catch return null,
-                };
+            if (node.is_terminal) {
+                if (node.value) |*v| return v;
             }
             return null;
         }
@@ -138,23 +133,30 @@ pub const RadixTree = struct {
     }
 
     pub fn scan_prefix(self: *const RadixTree, prefix: []const u8, results: *ArrayList(KeyValuePair)) !void {
-        try self.scan_prefix_recursive(self.root, prefix, "", results);
+        var key_buf = ArrayList(u8){};
+        defer key_buf.deinit(self.allocator);
+        try self.scan_prefix_recursive(self.root, prefix, &key_buf, results);
     }
 
     fn scan_prefix_recursive(
         self: *const RadixTree,
         node: *const RadixNode,
         target_prefix: []const u8,
-        current_key: []const u8,
+        key_buf: *ArrayList(u8),
         results: *ArrayList(KeyValuePair),
     ) !void {
-        const full_key = if (current_key.len == 0)
-            node.key_fragment
-        else
-            try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ current_key, node.key_fragment });
-        defer if (current_key.len > 0) self.allocator.free(full_key);
+        const prev_len = key_buf.items.len;
+        try key_buf.appendSlice(self.allocator, node.key_fragment);
+        defer key_buf.items.len = prev_len;
 
-        if (node.is_terminal and std.mem.startsWith(u8, full_key, target_prefix)) {
+        const full_key = key_buf.items;
+
+        // Prune: if full_key is long enough, it must start with the prefix
+        if (full_key.len >= target_prefix.len and !std.mem.startsWith(u8, full_key, target_prefix)) return;
+        // Prune: if full_key is shorter, the prefix must start with full_key
+        if (full_key.len < target_prefix.len and !std.mem.startsWith(u8, target_prefix, full_key)) return;
+
+        if (node.is_terminal and full_key.len >= target_prefix.len) {
             const original = node.value.?;
             try results.append(self.allocator, KeyValuePair{
                 .key = try self.allocator.dupe(u8, full_key),
@@ -169,7 +171,7 @@ pub const RadixTree = struct {
         }
 
         for (node.children.items) |child| {
-            try self.scan_prefix_recursive(child, target_prefix, full_key, results);
+            try self.scan_prefix_recursive(child, target_prefix, key_buf, results);
         }
     }
 };
