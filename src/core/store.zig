@@ -6,6 +6,7 @@ const wal = @import("wal.zig");
 const event = @import("event.zig");
 const breadcrumb_mod = @import("breadcrumb.zig");
 
+const Io = std.Io;
 const RadixTree = radix.RadixTree;
 const WriteAheadLog = wal.WriteAheadLog;
 const EventValue = event.EventValue;
@@ -27,27 +28,31 @@ pub const EventStore = struct {
 
     memtable: RadixTree,
 
-    wal: WriteAheadLog,
+    wal: *WriteAheadLog,
 
-    pub fn init(allocator: std.mem.Allocator, wal_path: []const u8) !EventStore {
+    pub fn init(allocator: std.mem.Allocator, wal_path: []const u8, io: Io) !EventStore {
         var memtable = try RadixTree.init(allocator);
         errdefer memtable.deinit();
 
-        var wal_file = try WriteAheadLog.init(allocator, wal_path);
-        errdefer wal_file.deinit();
+        const wal_ptr = try allocator.create(WriteAheadLog);
+        errdefer allocator.destroy(wal_ptr);
 
-        _ = try wal_file.replay(&memtable);
+        wal_ptr.* = try WriteAheadLog.init(allocator, wal_path, io);
+        errdefer wal_ptr.deinit();
+
+        _ = try wal_ptr.replay(&memtable);
 
         return EventStore{
             .allocator = allocator,
             .memtable = memtable,
-            .wal = wal_file,
+            .wal = wal_ptr,
         };
     }
 
     pub fn deinit(self: *EventStore) void {
         self.memtable.deinit();
         self.wal.deinit();
+        self.allocator.destroy(self.wal);
     }
 
     pub fn put(self: *EventStore, key: []const u8, value: EventValue) !void {
@@ -166,7 +171,11 @@ test "basic operations" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var event_store = try EventStore.init(allocator, "data/test_basic_operations.wal");
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var event_store = try EventStore.init(allocator, "data/test_basic_operations.wal", io);
     defer event_store.deinit();
 
     const sample_events = [_]struct {
@@ -181,7 +190,14 @@ test "basic operations" {
     };
 
     for (sample_events, 0..) |sample, i| {
-        const value = try EventValue.init(allocator, i + 1, "test-service", sample.event_type, sample.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(
+            allocator,
+            i + 1,
+            "test-service",
+            sample.event_type,
+            sample.payload,
+            @truncate((try std.time.Instant.now()).timestamp.nsec),
+        );
         try event_store.put(sample.key, value);
     }
 
@@ -201,7 +217,11 @@ test "bulk inserts" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var event_store = try EventStore.init(allocator, "data/test_bulk_inserts.wal");
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var event_store = try EventStore.init(allocator, "data/test_bulk_inserts.wal", io);
     defer event_store.deinit();
 
     for (0..150) |i| {
@@ -235,7 +255,11 @@ test "range scans" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var event_store = try EventStore.init(allocator, "data/test_range_scans.wal");
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var event_store = try EventStore.init(allocator, "data/test_range_scans.wal", io);
     defer event_store.deinit();
 
     const sample_events = [_]struct {
@@ -285,7 +309,11 @@ test "concurrent simulation" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var event_store = try EventStore.init(allocator, "data/test_concurrent_simulation.wal");
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var event_store = try EventStore.init(allocator, "data/test_concurrent_simulation.wal", io);
     defer event_store.deinit();
 
     const operations = [_]struct {
@@ -338,10 +366,14 @@ test "persistence recovery" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var store1 = try EventStore.init(allocator, "data/test_instance1.wal");
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var store1 = try EventStore.init(allocator, "data/test_instance1.wal", io);
     defer store1.deinit();
 
-    var store2 = try EventStore.init(allocator, "data/test_instance2.wal");
+    var store2 = try EventStore.init(allocator, "data/test_instance2.wal", io);
     defer store2.deinit();
 
     const instance1_events = [_]struct {
@@ -418,7 +450,11 @@ test "edge cases" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var event_store = try EventStore.init(allocator, "data/test_edge_cases.wal");
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var event_store = try EventStore.init(allocator, "data/test_edge_cases.wal", io);
     defer event_store.deinit();
 
     const empty_value = try EventValue.init(
@@ -522,10 +558,14 @@ test "put_breadcrumb and get_breadcrumb round-trip" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_bc_roundtrip.wal") catch {};
     std.fs.cwd().deleteFile("data/test_bc_roundtrip.crumb") catch {};
 
-    var event_store = try EventStore.init(allocator, "data/test_bc_roundtrip.wal");
+    var event_store = try EventStore.init(allocator, "data/test_bc_roundtrip.wal", io);
     defer {
         event_store.deinit();
         std.fs.cwd().deleteFile("data/test_bc_roundtrip.wal") catch {};
@@ -559,10 +599,14 @@ test "get_breadcrumbs returns all breadcrumbs" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_bc_list.wal") catch {};
     std.fs.cwd().deleteFile("data/test_bc_list.crumb") catch {};
 
-    var event_store = try EventStore.init(allocator, "data/test_bc_list.wal");
+    var event_store = try EventStore.init(allocator, "data/test_bc_list.wal", io);
     defer {
         event_store.deinit();
         std.fs.cwd().deleteFile("data/test_bc_list.wal") catch {};
@@ -601,10 +645,14 @@ test "breadcrumbs and domain events coexist" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_bc_coexist.wal") catch {};
     std.fs.cwd().deleteFile("data/test_bc_coexist.crumb") catch {};
 
-    var event_store = try EventStore.init(allocator, "data/test_bc_coexist.wal");
+    var event_store = try EventStore.init(allocator, "data/test_bc_coexist.wal", io);
     defer {
         event_store.deinit();
         std.fs.cwd().deleteFile("data/test_bc_coexist.wal") catch {};
@@ -648,11 +696,15 @@ test "breadcrumb survives WAL replay" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_bc_replay.wal") catch {};
     std.fs.cwd().deleteFile("data/test_bc_replay.crumb") catch {};
 
     {
-        var event_store = try EventStore.init(allocator, "data/test_bc_replay.wal");
+        var event_store = try EventStore.init(allocator, "data/test_bc_replay.wal", io);
         defer event_store.deinit();
 
         const bc = Breadcrumb{
@@ -666,7 +718,7 @@ test "breadcrumb survives WAL replay" {
     }
 
     {
-        var event_store = try EventStore.init(allocator, "data/test_bc_replay.wal");
+        var event_store = try EventStore.init(allocator, "data/test_bc_replay.wal", io);
         defer event_store.deinit();
 
         const maybe_bc = try event_store.get_breadcrumb("order-service", "order.created");
@@ -690,10 +742,14 @@ test "put_event and query_events basic" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_event_query.wal") catch {};
     std.fs.cwd().deleteFile("data/test_event_query.crumb") catch {};
 
-    var store = try EventStore.init(allocator, "data/test_event_query.wal");
+    var store = try EventStore.init(allocator, "data/test_event_query.wal", io);
     defer {
         store.deinit();
         std.fs.cwd().deleteFile("data/test_event_query.wal") catch {};
@@ -724,10 +780,14 @@ test "query_events filters by from_sequence" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_event_filter.wal") catch {};
     std.fs.cwd().deleteFile("data/test_event_filter.crumb") catch {};
 
-    var store = try EventStore.init(allocator, "data/test_event_filter.wal");
+    var store = try EventStore.init(allocator, "data/test_event_filter.wal", io);
     defer {
         store.deinit();
         std.fs.cwd().deleteFile("data/test_event_filter.wal") catch {};
@@ -754,10 +814,14 @@ test "query_events isolates by origin and event_type" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_event_isolate.wal") catch {};
     std.fs.cwd().deleteFile("data/test_event_isolate.crumb") catch {};
 
-    var store = try EventStore.init(allocator, "data/test_event_isolate.wal");
+    var store = try EventStore.init(allocator, "data/test_event_isolate.wal", io);
     defer {
         store.deinit();
         std.fs.cwd().deleteFile("data/test_event_isolate.wal") catch {};
@@ -808,10 +872,14 @@ test "query_events does not leak into breadcrumbs or arbitrary keys" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_event_noleak.wal") catch {};
     std.fs.cwd().deleteFile("data/test_event_noleak.crumb") catch {};
 
-    var store = try EventStore.init(allocator, "data/test_event_noleak.wal");
+    var store = try EventStore.init(allocator, "data/test_event_noleak.wal", io);
     defer {
         store.deinit();
         std.fs.cwd().deleteFile("data/test_event_noleak.wal") catch {};
@@ -847,11 +915,15 @@ test "put_event survives WAL replay" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_event_replay.wal") catch {};
     std.fs.cwd().deleteFile("data/test_event_replay.crumb") catch {};
 
     {
-        var store = try EventStore.init(allocator, "data/test_event_replay.wal");
+        var store = try EventStore.init(allocator, "data/test_event_replay.wal", io);
         defer store.deinit();
 
         for (1..4) |i| {
@@ -861,7 +933,7 @@ test "put_event survives WAL replay" {
     }
 
     {
-        var store = try EventStore.init(allocator, "data/test_event_replay.wal");
+        var store = try EventStore.init(allocator, "data/test_event_replay.wal", io);
         defer store.deinit();
 
         var results = try store.query_events("order-service", "order.created", 0);

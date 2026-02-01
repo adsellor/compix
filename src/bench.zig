@@ -4,6 +4,7 @@ const radix = @import("core/radix.zig");
 const wal = @import("core/wal.zig");
 const event = @import("core/event.zig");
 
+const Io = std.Io;
 const EventValue = event.EventValue;
 const EventStore = store.EventStore;
 const RadixTree = radix.RadixTree;
@@ -33,7 +34,11 @@ fn bench_wal_append(allocator: std.mem.Allocator) !void {
         std.fs.cwd().deleteFile("data/bench_wal_append.crumb") catch {};
     }
 
-    var wal_log = try WriteAheadLog.init(allocator, path);
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var wal_log = try WriteAheadLog.init(allocator, path, io);
     defer wal_log.deinit();
 
     const count: usize = 5_000;
@@ -52,8 +57,9 @@ fn bench_wal_append(allocator: std.mem.Allocator) !void {
         try wal_log.append_event(key, val);
     }
 
+    try wal_log.flush();
     const end = try std.time.Instant.now();
-    print_result("wal.append_event (5k writes + sync)", count, elapsed_us(start, end));
+    print_result("wal.append_event (5k writes + async sync)", count, elapsed_us(start, end));
 }
 
 fn bench_wal_replay(allocator: std.mem.Allocator) !void {
@@ -65,8 +71,12 @@ fn bench_wal_replay(allocator: std.mem.Allocator) !void {
         std.fs.cwd().deleteFile("data/bench_wal_replay.crumb") catch {};
     }
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     {
-        var wal_log = try WriteAheadLog.init(allocator, path);
+        var wal_log = try WriteAheadLog.init(allocator, path, io);
         defer wal_log.deinit();
 
         for (0..10_000) |i| {
@@ -83,7 +93,7 @@ fn bench_wal_replay(allocator: std.mem.Allocator) !void {
         }
     }
 
-    var wal_log = try WriteAheadLog.init(allocator, path);
+    var wal_log = try WriteAheadLog.init(allocator, path, io);
     defer wal_log.deinit();
 
     var tree = try RadixTree.init(allocator);
@@ -322,7 +332,11 @@ fn bench_store_stress(allocator: std.mem.Allocator) !void {
         std.fs.cwd().deleteFile(crumb_path) catch {};
     }
 
-    var event_store = try EventStore.init(allocator, wal_path);
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var event_store = try EventStore.init(allocator, wal_path, io);
     defer event_store.deinit();
 
     const total_operations: usize = 10_000;

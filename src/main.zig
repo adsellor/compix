@@ -9,7 +9,11 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var event_store = try store.EventStore.init(allocator, "data/events.wal");
+    var threaded = std.Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var event_store = try store.EventStore.init(allocator, "data/events.wal", io);
     defer event_store.deinit();
 
     const now = try std.time.Instant.now();

@@ -6,32 +6,97 @@ const EventValue = event.EventValue;
 const RadixTree = radix.RadixTree;
 const WalCursor = wal_cursor.WalCursor;
 
+const Io = std.Io;
+const IoFile = Io.File;
+const IoDir = Io.Dir;
+
 pub const MAGIC: u32 = 0xC0BEEFD8;
 pub const HEADER_SIZE: usize = 16;
 pub const MAX_ENTRY_SIZE: usize = 4 * 1024 * 1024;
 
+const SYNC_INITIAL_BACKOFF_NS: u64 = 1_000_000; // 1ms
+const SYNC_MAX_BACKOFF_NS: u64 = 500_000_000; // 500ms
+const SYNC_MAX_RETRIES: u32 = 10;
+
+const SyncError = error{SyncFailed};
+
+fn syncWithBackoff(fd: std.posix.fd_t) SyncError!void {
+    var backoff_ns: u64 = SYNC_INITIAL_BACKOFF_NS;
+    var attempt: u32 = 0;
+    while (attempt < SYNC_MAX_RETRIES) : (attempt += 1) {
+        std.posix.fsync(fd) catch {
+            std.posix.nanosleep(0, backoff_ns);
+            backoff_ns = @min(backoff_ns * 2, SYNC_MAX_BACKOFF_NS);
+            continue;
+        };
+        return;
+    }
+    return error.SyncFailed;
+}
+
+fn writeAllPwrite(fd: std.posix.fd_t, buf: []const u8, offset: u64) !void {
+    var written: usize = 0;
+    while (written < buf.len) {
+        const n = std.posix.pwrite(fd, buf[written..], offset + written) catch return error.InputOutput;
+        if (n == 0) return error.InputOutput;
+        written += n;
+    }
+}
+
+fn readExactIo(file: IoFile, io: Io, buf: []u8, offset: u64) !void {
+    var total_read: usize = 0;
+    while (total_read < buf.len) {
+        var iovecs = [1][]u8{buf[total_read..]};
+        const n = file.readPositional(io, &iovecs, offset + total_read) catch return error.InvalidFormat;
+        if (n == 0) return error.InvalidFormat;
+        total_read += n;
+    }
+}
+
 pub const WriteAheadLog = struct {
-    file: std.fs.File,
+    file: IoFile,
+    io: Io,
     allocator: std.mem.Allocator,
     wal_path: []const u8,
+    write_pos: u64,
+    dirty: bool,
 
-    pub fn init(allocator: std.mem.Allocator, file_path: []const u8) !WriteAheadLog {
-        std.fs.cwd().makeDir("data") catch |err| switch (err) {
+    pub fn init(allocator: std.mem.Allocator, file_path: []const u8, io: Io) !WriteAheadLog {
+        const dir = IoDir.cwd();
+
+        dir.makeDir(io, "data") catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
 
-        const file = try std.fs.cwd().createFile(file_path, .{ .truncate = false, .read = true });
+        const file = dir.openFile(io, file_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => try dir.createFile(io, file_path, .{ .truncate = false, .read = true }),
+            else => return err,
+        };
+
+        const file_size = (try file.stat(io)).size;
+
         return WriteAheadLog{
             .file = file,
+            .io = io,
             .allocator = allocator,
             .wal_path = try allocator.dupe(u8, file_path),
+            .write_pos = file_size,
+            .dirty = false,
         };
     }
 
     pub fn deinit(self: *WriteAheadLog) void {
-        self.file.close();
+        self.flush() catch {};
+        self.file.close(self.io);
         self.allocator.free(self.wal_path);
+    }
+
+    pub fn flush(self: *WriteAheadLog) !void {
+        if (self.dirty) {
+            try syncWithBackoff(self.file.handle);
+            self.dirty = false;
+        }
     }
 
     /// [4B magic][8B sequence][4B entry_len][4B key_len][key][4B value_len][value][1B newline]
@@ -66,72 +131,79 @@ pub const WriteAheadLog = struct {
         pos += serialized_value.len;
         buf[pos] = '\n';
 
-        try self.file.writeAll(buf);
-        try self.file.sync();
+        try writeAllPwrite(self.file.handle, buf, self.write_pos);
+        self.write_pos += total_size;
+        self.dirty = true;
     }
 
     pub fn replay(self: *WriteAheadLog, radix_tree: *RadixTree) !WalCursor {
-        try self.file.seekTo(0);
+        const file_size = (try self.file.stat(self.io)).size;
+        var offset: u64 = 0;
         var crumb = WalCursor{ .file_offset = 0, .last_sequence = 0 };
 
-        while (true) {
+        while (offset < file_size) {
+            if (offset + 4 > file_size) break;
+
             var magic_bytes: [4]u8 = undefined;
-            const bytes_read = try self.file.read(&magic_bytes);
-            if (bytes_read == 0) break;
-            if (bytes_read < 4) return error.InvalidFormat;
+            readExactIo(self.file, self.io, &magic_bytes, offset) catch break;
+            offset += 4;
 
             const magic = std.mem.readInt(u32, &magic_bytes, .little);
             if (magic != MAGIC) return error.InvalidFormat;
 
             var seq_bytes: [8]u8 = undefined;
-            try readExact(self.file, &seq_bytes);
+            try readExactIo(self.file, self.io, &seq_bytes, offset);
             const sequence = std.mem.readInt(u64, &seq_bytes, .little);
+            offset += 8;
 
             var entry_len_bytes: [4]u8 = undefined;
-            try readExact(self.file, &entry_len_bytes);
+            try readExactIo(self.file, self.io, &entry_len_bytes, offset);
             const entry_len = std.mem.readInt(u32, &entry_len_bytes, .little);
             if (entry_len > MAX_ENTRY_SIZE) return error.InvalidFormat;
+            offset += 4;
 
             var key_len_bytes: [4]u8 = undefined;
-            try readExact(self.file, &key_len_bytes);
+            try readExactIo(self.file, self.io, &key_len_bytes, offset);
             const key_len = std.mem.readInt(u32, &key_len_bytes, .little);
+            offset += 4;
 
             const key_buf = try self.allocator.alloc(u8, key_len);
             defer self.allocator.free(key_buf);
-            try readExact(self.file, key_buf);
+            try readExactIo(self.file, self.io, key_buf, offset);
+            offset += key_len;
 
             var value_len_bytes: [4]u8 = undefined;
-            try readExact(self.file, &value_len_bytes);
+            try readExactIo(self.file, self.io, &value_len_bytes, offset);
             const value_len = std.mem.readInt(u32, &value_len_bytes, .little);
+            offset += 4;
 
             const expected_entry_len: u32 = @intCast(4 + key_len + 4 + value_len + 1);
             if (entry_len != expected_entry_len) return error.InvalidFormat;
 
             const value_buf = try self.allocator.alloc(u8, value_len);
             defer self.allocator.free(value_buf);
-            try readExact(self.file, value_buf);
+            try readExactIo(self.file, self.io, value_buf, offset);
+            offset += value_len;
 
-            // TODO: see if can get rid of this by having more effecient way to store stuff
-            var newline: [1]u8 = undefined;
-            _ = self.file.read(&newline) catch {};
+            // Skip newline
+            offset += 1;
 
             const deserialized = try EventValue.deserialize(self.allocator, value_buf);
             try radix_tree.insert(key_buf, deserialized);
 
-            crumb.file_offset = try self.file.getPos();
+            crumb.file_offset = offset;
             crumb.last_sequence = sequence;
         }
 
         try wal_cursor.save(self.allocator, self.wal_path, crumb);
 
-        // NOTE: Ensure file position is at end for subsequent appends
-        try self.file.seekFromEnd(0);
+        self.write_pos = offset;
 
         return crumb;
     }
 
     pub fn find_by_sequence(self: *WriteAheadLog, target: u64) !?u64 {
-        const file_size = try self.file.getEndPos();
+        const file_size = (try self.file.stat(self.io)).size;
         if (file_size == 0) return null;
 
         var lo: u64 = 0;
@@ -163,15 +235,15 @@ pub const WriteAheadLog = struct {
     }
 
     fn scan_for_entry(self: *WriteAheadLog, start: u64) !?u64 {
-        const file_size = try self.file.getEndPos();
+        const file_size = (try self.file.stat(self.io)).size;
         const search_limit = @min(start + MAX_ENTRY_SIZE, file_size);
         var pos = start;
 
         while (pos < search_limit) {
-            try self.file.seekTo(pos);
             var buf: [4096]u8 = undefined;
             const to_read: usize = @intCast(@min(@as(u64, buf.len), search_limit - pos));
-            const bytes_read = try self.file.read(buf[0..to_read]);
+            var iovecs = [1][]u8{buf[0..to_read]};
+            const bytes_read = self.file.readPositional(self.io, &iovecs, pos) catch return null;
             if (bytes_read == 0) return null;
 
             if (bytes_read < 4) {
@@ -195,9 +267,9 @@ pub const WriteAheadLog = struct {
     }
 
     fn validate_entry_at(self: *WriteAheadLog, offset: u64) !bool {
-        try self.file.seekTo(offset);
         var header: [HEADER_SIZE]u8 = undefined;
-        const n = try self.file.read(&header);
+        var iovecs = [1][]u8{&header};
+        const n = self.file.readPositional(self.io, &iovecs, offset) catch return false;
         if (n < HEADER_SIZE) return false;
 
         const magic = std.mem.readInt(u32, header[0..4], .little);
@@ -210,38 +282,31 @@ pub const WriteAheadLog = struct {
     }
 
     fn read_sequence_at(self: *WriteAheadLog, offset: u64) !u64 {
-        try self.file.seekTo(offset + 4); // skip magic
         var seq_bytes: [8]u8 = undefined;
-        try readExact(self.file, &seq_bytes);
+        try readExactIo(self.file, self.io, &seq_bytes, offset + 4);
         return std.mem.readInt(u64, &seq_bytes, .little);
     }
 
     fn read_entry_len_at(self: *WriteAheadLog, offset: u64) !u32 {
-        try self.file.seekTo(offset + 12); // skip magic + sequence
         var len_bytes: [4]u8 = undefined;
-        try readExact(self.file, &len_bytes);
+        try readExactIo(self.file, self.io, &len_bytes, offset + 12);
         return std.mem.readInt(u32, &len_bytes, .little);
     }
 };
-
-fn readExact(file: std.fs.File, buf: []u8) !void {
-    var total_read: usize = 0;
-    while (total_read < buf.len) {
-        const bytes_read = try file.read(buf[total_read..]);
-        if (bytes_read == 0) return error.InvalidFormat;
-        total_read += bytes_read;
-    }
-}
 
 test "find_by_sequence returns correct offsets" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_find_seq.wal") catch {};
     std.fs.cwd().deleteFile("data/test_find_seq.crumb") catch {};
 
-    var wal_log = try WriteAheadLog.init(allocator, "data/test_find_seq.wal");
+    var wal_log = try WriteAheadLog.init(allocator, "data/test_find_seq.wal", io);
     defer {
         wal_log.deinit();
         std.fs.cwd().deleteFile("data/test_find_seq.wal") catch {};
@@ -261,6 +326,8 @@ test "find_by_sequence returns correct offsets" {
         };
         try wal_log.append_event(key, val);
     }
+
+    try wal_log.flush();
 
     const offset_100 = try wal_log.find_by_sequence(100);
     try std.testing.expect(offset_100 != null);
@@ -285,11 +352,15 @@ test "replay with crumb resumes from correct position" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var threaded = Io.Threaded.init(allocator);
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.fs.cwd().deleteFile("data/test_replay_crumb.wal") catch {};
     std.fs.cwd().deleteFile("data/test_replay_crumb.crumb") catch {};
 
     {
-        var wal_log = try WriteAheadLog.init(allocator, "data/test_replay_crumb.wal");
+        var wal_log = try WriteAheadLog.init(allocator, "data/test_replay_crumb.wal", io);
         defer wal_log.deinit();
 
         var tree1 = try RadixTree.init(allocator);
@@ -311,7 +382,7 @@ test "replay with crumb resumes from correct position" {
     }
 
     {
-        var wal_log = try WriteAheadLog.init(allocator, "data/test_replay_crumb.wal");
+        var wal_log = try WriteAheadLog.init(allocator, "data/test_replay_crumb.wal", io);
         defer wal_log.deinit();
 
         var tree2 = try RadixTree.init(allocator);
@@ -337,7 +408,7 @@ test "replay with crumb resumes from correct position" {
     }
 
     {
-        var wal_log = try WriteAheadLog.init(allocator, "data/test_replay_crumb.wal");
+        var wal_log = try WriteAheadLog.init(allocator, "data/test_replay_crumb.wal", io);
         defer wal_log.deinit();
 
         var tree3 = try RadixTree.init(allocator);
