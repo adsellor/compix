@@ -42,8 +42,8 @@ pub const SSTable = struct {
 
         var results = ArrayList(KeyValuePair){};
         defer {
-            for (results.items) |item| {
-                self.allocator.free(item.key);
+            for (results.items) |*item| {
+                item.deinit(self.allocator);
             }
             results.deinit(self.allocator);
         }

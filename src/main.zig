@@ -13,7 +13,7 @@ pub fn main() !void {
     defer event_store.deinit();
 
     const now = try std.time.Instant.now();
-    const sample_value = try event.EventValue.init(allocator, 1, "system.startup", "{\"timestamp\":\"now\"}", now.timestamp.nsec);
+    const sample_value = try event.EventValue.init(allocator, 1, "compix", "system.startup", "{\"timestamp\":\"now\"}", now.timestamp.nsec);
     try event_store.put("system:startup", sample_value);
 
     if (event_store.get("system:startup")) |found_value| {

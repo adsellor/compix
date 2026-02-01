@@ -122,6 +122,7 @@ pub const RadixTree = struct {
                     .event_type = self.allocator.dupe(u8, original.event_type) catch return null,
                     .payload = self.allocator.dupe(u8, original.payload) catch return null,
                     .timestamp = original.timestamp,
+                    .origin_service = self.allocator.dupe(u8, original.origin_service) catch return null,
                 };
             }
             return null;
@@ -154,9 +155,16 @@ pub const RadixTree = struct {
         defer if (current_key.len > 0) self.allocator.free(full_key);
 
         if (node.is_terminal and std.mem.startsWith(u8, full_key, target_prefix)) {
+            const original = node.value.?;
             try results.append(self.allocator, KeyValuePair{
                 .key = try self.allocator.dupe(u8, full_key),
-                .value = node.value.?,
+                .value = EventValue{
+                    .sequence = original.sequence,
+                    .event_type = try self.allocator.dupe(u8, original.event_type),
+                    .payload = try self.allocator.dupe(u8, original.payload),
+                    .timestamp = original.timestamp,
+                    .origin_service = try self.allocator.dupe(u8, original.origin_service),
+                },
             });
         }
 

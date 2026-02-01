@@ -5,12 +5,14 @@ const radix = @import("radix.zig");
 const lsm = @import("lsm.zig");
 const wal = @import("wal.zig");
 const event = @import("event.zig");
+const breadcrumb_mod = @import("breadcrumb.zig");
 
 const RadixTree = radix.RadixTree;
 const SSTable = lsm.SSTable;
 const WriteAheadLog = wal.WriteAheadLog;
 const EventValue = event.EventValue;
 const KeyValuePair = event.KeyValuePair;
+const Breadcrumb = breadcrumb_mod.Breadcrumb;
 
 pub const HybridEventStore = struct {
     allocator: std.mem.Allocator,
@@ -32,7 +34,7 @@ pub const HybridEventStore = struct {
         var wal_file = try WriteAheadLog.init(allocator, wal_path);
         errdefer wal_file.deinit();
 
-        try wal_file.replay(&memtable);
+        _ = try wal_file.replay(&memtable);
 
         return HybridEventStore{
             .allocator = allocator,
@@ -62,7 +64,6 @@ pub const HybridEventStore = struct {
         if (self.memtable_size > self.max_memtable_size) {
             try self.flush_memtable();
         }
-
     }
 
     pub fn get(self: *const HybridEventStore, key: []const u8) ?EventValue {
@@ -88,7 +89,6 @@ pub const HybridEventStore = struct {
     }
 
     fn flush_memtable(self: *HybridEventStore) !void {
-
         const sstable_path = try std.fmt.allocPrint(self.allocator, "data/sstable_{}.dat", .{self.compaction_generation});
         defer self.allocator.free(sstable_path);
 
@@ -100,7 +100,6 @@ pub const HybridEventStore = struct {
         self.memtable = try RadixTree.init(self.allocator);
         self.memtable_size = 0;
         self.compaction_generation += 1;
-
     }
 
     pub fn get_stats(self: *const HybridEventStore) void {
@@ -110,7 +109,62 @@ pub const HybridEventStore = struct {
         std.debug.print("Generation: {}\n", .{self.compaction_generation});
         std.debug.print("Estimated memtable size: {} bytes\n", .{self.memtable_size});
     }
+
+    pub fn put_breadcrumb(self: *HybridEventStore, bc: Breadcrumb, local_sequence: u64, self_service: []const u8, timestamp: i64) !void {
+        const key = try Breadcrumb.makeKey(self.allocator, bc.source_service, bc.event_type);
+        defer self.allocator.free(key);
+
+        const ev = try bc.toEventValue(self.allocator, local_sequence, self_service, timestamp);
+        try self.put(key, ev);
+    }
+
+    pub fn get_breadcrumb(self: *const HybridEventStore, source_service: []const u8, event_type: []const u8) !?Breadcrumb {
+        const key = try Breadcrumb.makeKey(self.allocator, source_service, event_type);
+        defer self.allocator.free(key);
+
+        if (self.get(key)) |ev| {
+            var value = ev;
+            defer value.deinit(self.allocator);
+            return try Breadcrumb.fromWalEntry(self.allocator, key, value);
+        }
+
+        return null;
+    }
+
+    pub fn get_breadcrumbs(self: *const HybridEventStore) !ArrayList(Breadcrumb) {
+        var scan_results = try self.scan_range(breadcrumb_mod.KEY_PREFIX);
+        defer {
+            for (scan_results.items) |*item| {
+                item.deinit(self.allocator);
+            }
+            scan_results.deinit(self.allocator);
+        }
+
+        var breadcrumbs = ArrayList(Breadcrumb){};
+        errdefer {
+            for (breadcrumbs.items) |*bc| bc.deinit(self.allocator);
+            breadcrumbs.deinit(self.allocator);
+        }
+
+        for (scan_results.items) |item| {
+            if (try Breadcrumb.fromWalEntry(self.allocator, item.key, item.value)) |bc| {
+                try breadcrumbs.append(self.allocator, bc);
+            }
+        }
+
+        return breadcrumbs;
+    }
 };
+
+test {
+    _ = @import("wal.zig");
+    _ = @import("wal_cursor.zig");
+    _ = @import("breadcrumb.zig");
+    _ = @import("event.zig");
+    _ = @import("contract.zig");
+    _ = @import("recovery.zig");
+    _ = @import("identity.zig");
+}
 
 test "basic operations" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -132,7 +186,7 @@ test "basic operations" {
     };
 
     for (sample_events, 0..) |sample, i| {
-        const value = try EventValue.init(allocator, i + 1, sample.event_type, sample.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(allocator, i + 1, "test-service", sample.event_type, sample.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
         try event_store.put(sample.key, value);
     }
 
@@ -164,7 +218,7 @@ test "bulk inserts" {
         const payload = try std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{i});
         defer allocator.free(payload);
 
-        const value = try EventValue.init(allocator, i + 1000, "bulk.insert", payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(allocator, i + 1000, "test-service", "bulk.insert", payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
         try event_store.put(key, value);
     }
 
@@ -207,14 +261,14 @@ test "range scans" {
     };
 
     for (sample_events, 0..) |sample, i| {
-        const value = try EventValue.init(allocator, i + 2000, sample.event_type, sample.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(allocator, i + 2000, "test-service", sample.event_type, sample.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
         try event_store.put(sample.key, value);
     }
 
     var user_events = try event_store.scan_range("user-service:");
     defer {
-        for (user_events.items) |item| {
-            event_store.allocator.free(item.key);
+        for (user_events.items) |*item| {
+            item.deinit(event_store.allocator);
         }
         user_events.deinit(event_store.allocator);
     }
@@ -266,7 +320,7 @@ test "concurrent simulation" {
 
     for (operations) |op| {
         if (std.mem.eql(u8, op.operation_type, "write")) {
-            const value = try EventValue.init(allocator, sequence, op.event_type, op.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+            const value = try EventValue.init(allocator, sequence, "test-service", op.event_type, op.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
             try event_store.put(op.key, value);
             writes_performed += 1;
             sequence += 1;
@@ -284,8 +338,8 @@ test "concurrent simulation" {
 
     var concurrent_scan = try event_store.scan_range("session:");
     defer {
-        for (concurrent_scan.items) |item| {
-            event_store.allocator.free(item.key);
+        for (concurrent_scan.items) |*item| {
+            item.deinit(event_store.allocator);
         }
         concurrent_scan.deinit(event_store.allocator);
     }
@@ -314,7 +368,14 @@ test "persistence recovery" {
     };
 
     for (instance1_events, 0..) |test_event, i| {
-        const value = try EventValue.init(allocator, i + 4000, test_event.event_type, test_event.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(
+            allocator,
+            i + 4000,
+            "test-service",
+            test_event.event_type,
+            test_event.payload,
+            @truncate((try std.time.Instant.now()).timestamp.nsec),
+        );
         try store1.put(test_event.key, value);
     }
 
@@ -329,7 +390,14 @@ test "persistence recovery" {
     };
 
     for (instance2_events, 0..) |test_event, i| {
-        const value = try EventValue.init(allocator, i + 4100, test_event.event_type, test_event.payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(
+            allocator,
+            i + 4100,
+            "test-service",
+            test_event.event_type,
+            test_event.payload,
+            @truncate((try std.time.Instant.now()).timestamp.nsec),
+        );
         try store2.put(test_event.key, value);
     }
 
@@ -389,10 +457,21 @@ test "stress test" {
         const full_event_type = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ service, event_type_name });
         defer allocator.free(full_event_type);
 
-        const payload = try std.fmt.allocPrint(allocator, "{{\"operation_id\":{},\"service\":\"{s}\",\"timestamp\":{}}}", .{ i, service, (try std.time.Instant.now()).timestamp.nsec });
+        const payload = try std.fmt.allocPrint(
+            allocator,
+            "{{\"operation_id\":{},\"service\":\"{s}\",\"timestamp\":{}}}",
+            .{ i, service, (try std.time.Instant.now()).timestamp.nsec },
+        );
         defer allocator.free(payload);
 
-        const value = try EventValue.init(allocator, i + 5000, full_event_type, payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(
+            allocator,
+            i + 5000,
+            "test-service",
+            full_event_type,
+            payload,
+            @truncate((try std.time.Instant.now()).timestamp.nsec),
+        );
         try event_store.put(key, value);
 
         operations_completed += 1;
@@ -435,7 +514,14 @@ test "edge cases" {
     var event_store = try HybridEventStore.init(allocator, "data/test_edge_cases.wal");
     defer event_store.deinit();
 
-    const empty_value = try EventValue.init(allocator, 6000, "", "", @truncate((try std.time.Instant.now()).timestamp.nsec));
+    const empty_value = try EventValue.init(
+        allocator,
+        6000,
+        "test-service",
+        "",
+        "",
+        @truncate((try std.time.Instant.now()).timestamp.nsec),
+    );
     try event_store.put("edge:empty", empty_value);
 
     if (event_store.get("edge:empty")) |found_value| {
@@ -450,10 +536,14 @@ test "edge cases" {
     const long_key = try std.fmt.allocPrint(allocator, "edge:very:long:key:with:many:segments:and:even:more:segments:to:make:it:really:long:{}", .{(try std.time.Instant.now()).timestamp.nsec});
     defer allocator.free(long_key);
 
-    const long_payload = try std.fmt.allocPrint(allocator, "{{\"description\":\"This is a very long payload designed to test how the system handles large amounts of data in a single event. It contains multiple sentences and should stress test the serialization and storage mechanisms.\",\"data\":[{}]}}", .{(try std.time.Instant.now()).timestamp.nsec});
+    const long_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"description\":\"This is a very long payload designed to test how the system handles large amounts of data in a single event. It contains multiple sentences and should stress test the serialization and storage mechanisms.\",\"data\":[{}]}}",
+        .{(try std.time.Instant.now()).timestamp.nsec},
+    );
     defer allocator.free(long_payload);
 
-    const long_value = try EventValue.init(allocator, 6001, "test.long_data", long_payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+    const long_value = try EventValue.init(allocator, 6001, "test-service", "test.long_data", long_payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
     try event_store.put(long_key, long_value);
 
     if (event_store.get(long_key)) |found_value| {
@@ -474,14 +564,21 @@ test "edge cases" {
     };
 
     for (special_keys, 0..) |key, i| {
-        const value = try EventValue.init(allocator, 6100 + i, "test.special", "special payload", @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(
+            allocator,
+            6100 + i,
+            "test-service",
+            "test.special",
+            "special payload",
+            @truncate((try std.time.Instant.now()).timestamp.nsec),
+        );
         try event_store.put(key, value);
     }
 
     var special_scan = try event_store.scan_range("edge:special:");
     defer {
-        for (special_scan.items) |item| {
-            event_store.allocator.free(item.key);
+        for (special_scan.items) |*item| {
+            item.deinit(event_store.allocator);
         }
         special_scan.deinit(event_store.allocator);
     }
@@ -489,10 +586,24 @@ test "edge cases" {
 
     const overwrite_key = "edge:overwrite:test";
 
-    const value1 = try EventValue.init(allocator, 6200, "test.first", "first value", (try std.time.Instant.now()).timestamp.nsec);
+    const value1 = try EventValue.init(
+        allocator,
+        6200,
+        "test-service",
+        "test.first",
+        "first value",
+        (try std.time.Instant.now()).timestamp.nsec,
+    );
     try event_store.put(overwrite_key, value1);
 
-    const value2 = try EventValue.init(allocator, 6201, "test.second", "second value", (try std.time.Instant.now()).timestamp.nsec);
+    const value2 = try EventValue.init(
+        allocator,
+        6201,
+        "test-service",
+        "test.second",
+        "second value",
+        (try std.time.Instant.now()).timestamp.nsec,
+    );
     try event_store.put(overwrite_key, value2);
 
     if (event_store.get(overwrite_key)) |found_value| {
@@ -503,4 +614,174 @@ test "edge cases" {
     } else {
         return error.OverwriteValueNotFound;
     }
+}
+
+test "put_breadcrumb and get_breadcrumb round-trip" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_bc_roundtrip.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_bc_roundtrip.crumb") catch {};
+
+    var event_store = try HybridEventStore.init(allocator, "data/test_bc_roundtrip.wal");
+    defer {
+        event_store.deinit();
+        std.fs.cwd().deleteFile("data/test_bc_roundtrip.wal") catch {};
+        std.fs.cwd().deleteFile("data/test_bc_roundtrip.crumb") catch {};
+    }
+
+    const bc = Breadcrumb{
+        .source_service = "order-service",
+        .event_type = "order.created",
+        .last_sequence = 42,
+        .peer_address = "10.0.0.5:4200",
+        .updated_at = 1700000000,
+    };
+
+    try event_store.put_breadcrumb(bc, 1, "my-service", 1700000000);
+
+    const maybe_bc = try event_store.get_breadcrumb("order-service", "order.created");
+    try std.testing.expect(maybe_bc != null);
+
+    var restored = maybe_bc.?;
+    defer restored.deinit(allocator);
+
+    try std.testing.expectEqualStrings("order-service", restored.source_service);
+    try std.testing.expectEqualStrings("order.created", restored.event_type);
+    try std.testing.expectEqual(@as(u64, 42), restored.last_sequence);
+    try std.testing.expectEqualStrings("10.0.0.5:4200", restored.peer_address);
+}
+
+test "get_breadcrumbs returns all breadcrumbs" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_bc_list.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_bc_list.crumb") catch {};
+
+    var event_store = try HybridEventStore.init(allocator, "data/test_bc_list.wal");
+    defer {
+        event_store.deinit();
+        std.fs.cwd().deleteFile("data/test_bc_list.wal") catch {};
+        std.fs.cwd().deleteFile("data/test_bc_list.crumb") catch {};
+    }
+
+    const bc1 = Breadcrumb{
+        .source_service = "order-service",
+        .event_type = "order.created",
+        .last_sequence = 42,
+        .peer_address = "10.0.0.5:4200",
+        .updated_at = 100,
+    };
+    try event_store.put_breadcrumb(bc1, 1, "my-service", 100);
+
+    const bc2 = Breadcrumb{
+        .source_service = "user-service",
+        .event_type = "user.registered",
+        .last_sequence = 10,
+        .peer_address = "10.0.0.6:4200",
+        .updated_at = 200,
+    };
+    try event_store.put_breadcrumb(bc2, 2, "my-service", 200);
+
+    var breadcrumbs = try event_store.get_breadcrumbs();
+    defer {
+        for (breadcrumbs.items) |*item| item.deinit(allocator);
+        breadcrumbs.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), breadcrumbs.items.len);
+}
+
+test "breadcrumbs and domain events coexist" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_bc_coexist.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_bc_coexist.crumb") catch {};
+
+    var event_store = try HybridEventStore.init(allocator, "data/test_bc_coexist.wal");
+    defer {
+        event_store.deinit();
+        std.fs.cwd().deleteFile("data/test_bc_coexist.wal") catch {};
+        std.fs.cwd().deleteFile("data/test_bc_coexist.crumb") catch {};
+    }
+
+    const domain_ev = try EventValue.init(allocator, 1, "my-service", "user.registered", "{\"email\":\"test@test.com\"}", 100);
+    try event_store.put("user-service:u1:profile", domain_ev);
+
+    const bc = Breadcrumb{
+        .source_service = "order-service",
+        .event_type = "order.created",
+        .last_sequence = 5,
+        .peer_address = "10.0.0.5:4200",
+        .updated_at = 200,
+    };
+    try event_store.put_breadcrumb(bc, 2, "my-service", 200);
+
+    if (event_store.get("user-service:u1:profile")) |found| {
+        var v = found;
+        defer v.deinit(allocator);
+        try std.testing.expectEqualStrings("user.registered", v.event_type);
+    } else {
+        return error.DomainEventNotFound;
+    }
+
+    const maybe_bc = try event_store.get_breadcrumb("order-service", "order.created");
+    try std.testing.expect(maybe_bc != null);
+    var restored = maybe_bc.?;
+    defer restored.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 5), restored.last_sequence);
+
+    var user_scan = try event_store.scan_range("user-service:");
+    defer {
+        for (user_scan.items) |*item| item.deinit(allocator);
+        user_scan.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 1), user_scan.items.len);
+}
+
+test "breadcrumb survives WAL replay" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    std.fs.cwd().deleteFile("data/test_bc_replay.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_bc_replay.crumb") catch {};
+
+    {
+        var event_store = try HybridEventStore.init(allocator, "data/test_bc_replay.wal");
+        defer event_store.deinit();
+
+        const bc = Breadcrumb{
+            .source_service = "order-service",
+            .event_type = "order.created",
+            .last_sequence = 99,
+            .peer_address = "10.0.0.5:4200",
+            .updated_at = 500,
+        };
+        try event_store.put_breadcrumb(bc, 1, "my-service", 500);
+    }
+
+    {
+        var event_store = try HybridEventStore.init(allocator, "data/test_bc_replay.wal");
+        defer event_store.deinit();
+
+        const maybe_bc = try event_store.get_breadcrumb("order-service", "order.created");
+        try std.testing.expect(maybe_bc != null);
+
+        var restored = maybe_bc.?;
+        defer restored.deinit(allocator);
+
+        try std.testing.expectEqualStrings("order-service", restored.source_service);
+        try std.testing.expectEqualStrings("order.created", restored.event_type);
+        try std.testing.expectEqual(@as(u64, 99), restored.last_sequence);
+        try std.testing.expectEqualStrings("10.0.0.5:4200", restored.peer_address);
+    }
+
+    std.fs.cwd().deleteFile("data/test_bc_replay.wal") catch {};
+    std.fs.cwd().deleteFile("data/test_bc_replay.crumb") catch {};
 }
