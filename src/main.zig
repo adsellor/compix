@@ -40,7 +40,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Recovery warning: {}\n", .{err});
     };
 
+    server.registerSignalHandlers();
+
     std.debug.print("compix: {s}/{s} ready\n", .{ cfg.identity.name, cfg.identity.instance_id });
 
     try srv.serve();
+
+    std.debug.print("compix: shutting down\n", .{});
 }

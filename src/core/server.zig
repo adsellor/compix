@@ -20,6 +20,22 @@ const Breadcrumb = breadcrumb_mod.Breadcrumb;
 
 const log = std.log.scoped(.server);
 
+var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn handleSignal(_: std.posix.SIG) callconv(.c) void {
+    shutdown_requested.store(true, .release);
+}
+
+pub inline fn registerSignalHandlers() void {
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = handleSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.TERM, &act, null);
+    std.posix.sigaction(.INT, &act, null);
+}
+
 pub const Server = struct {
     allocator: Allocator,
     store: *EventStore,
@@ -229,9 +245,9 @@ pub const Server = struct {
     pub fn serve(self: *Server) !void {
         log.info("listening on {s}", .{self.identity.listen_address});
 
-        while (self.running) {
+        while (self.running and !shutdown_requested.load(.acquire)) {
             const conn = self.listener.accept() catch |err| {
-                if (!self.running) return;
+                if (!self.running or shutdown_requested.load(.acquire)) return;
                 log.warn("accept error: {}", .{err});
                 continue;
             };
