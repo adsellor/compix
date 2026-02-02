@@ -1,8 +1,7 @@
 const std = @import("std");
 const ArrayList = std.ArrayList;
 
-const radix = @import("radix.zig");
-const wal = @import("wal.zig");
+const lsm_mod = @import("lsm.zig");
 const event = @import("event.zig");
 const breadcrumb_mod = @import("breadcrumb.zig");
 const contract_mod = @import("contract.zig");
@@ -10,8 +9,7 @@ const contract_mod = @import("contract.zig");
 const DependencyContract = contract_mod.DependencyContract;
 
 const Io = std.Io;
-const RadixTree = radix.RadixTree;
-const WriteAheadLog = wal.WriteAheadLog;
+const LSMEngine = lsm_mod.LSMEngine;
 const EventValue = event.EventValue;
 const KeyValuePair = event.KeyValuePair;
 const Breadcrumb = breadcrumb_mod.Breadcrumb;
@@ -38,26 +36,17 @@ pub const PutResult = struct {
 
 pub const EventStore = struct {
     allocator: std.mem.Allocator,
-
-    memtable: RadixTree,
-
-    wal: *WriteAheadLog,
-
+    lsm: *LSMEngine,
     identity: ?[]const u8,
     contracts: []const DependencyContract,
     next_sequence: u64,
 
     pub fn init(allocator: std.mem.Allocator, wal_path: []const u8, io: Io, config: Config) !EventStore {
-        var memtable = try RadixTree.init(allocator);
-        errdefer memtable.deinit();
+        const lsm_ptr = try allocator.create(LSMEngine);
+        errdefer allocator.destroy(lsm_ptr);
 
-        const wal_ptr = try allocator.create(WriteAheadLog);
-        errdefer allocator.destroy(wal_ptr);
-
-        wal_ptr.* = try WriteAheadLog.init(allocator, wal_path, io);
-        errdefer wal_ptr.deinit();
-
-        _ = try wal_ptr.replay(&memtable);
+        lsm_ptr.* = try LSMEngine.init(allocator, wal_path, io);
+        errdefer lsm_ptr.deinit();
 
         var next_seq: u64 = 0;
         if (config.identity) |id| {
@@ -65,7 +54,7 @@ pub const EventStore = struct {
             defer allocator.free(prefix);
 
             var local_events = ArrayList(KeyValuePair){};
-            try memtable.scan_prefix(prefix, &local_events);
+            try lsm_ptr.scan_prefix(prefix, &local_events);
             defer {
                 for (local_events.items) |*item| item.deinit(allocator);
                 local_events.deinit(allocator);
@@ -78,8 +67,7 @@ pub const EventStore = struct {
 
         return EventStore{
             .allocator = allocator,
-            .memtable = memtable,
-            .wal = wal_ptr,
+            .lsm = lsm_ptr,
             .identity = config.identity,
             .contracts = config.contracts,
             .next_sequence = next_seq,
@@ -87,29 +75,29 @@ pub const EventStore = struct {
     }
 
     pub fn deinit(self: *EventStore) void {
-        self.memtable.deinit();
-        self.wal.deinit();
-        self.allocator.destroy(self.wal);
+        self.lsm.deinit();
+        self.allocator.destroy(self.lsm);
     }
 
     pub fn put(self: *EventStore, key: []const u8, value: EventValue) !void {
-        try self.wal.append_event(key, value);
-        try self.memtable.insert(key, value);
+        try self.lsm.put(key, value);
+        try self.lsm.sync();
     }
 
-    pub fn get(self: *const EventStore, key: []const u8) ?*const EventValue {
-        return self.memtable.get(key);
+    pub fn get(self: *EventStore, key: []const u8) !?EventValue {
+        return try self.lsm.get(self.allocator, key);
     }
 
-    pub fn scan_range(self: *const EventStore, prefix: []const u8) !ArrayList(KeyValuePair) {
+    pub fn scan_range(self: *EventStore, prefix: []const u8) !ArrayList(KeyValuePair) {
         var results = ArrayList(KeyValuePair){};
-        try self.memtable.scan_prefix(prefix, &results);
+        try self.lsm.scan_prefix(prefix, &results);
         return results;
     }
 
     pub fn get_stats(self: *const EventStore) void {
         std.debug.print("Store Statistics:\n", .{});
-        std.debug.print("Memtable entries: {}\n", .{self.memtable.size});
+        std.debug.print("Memtable entries: {}\n", .{self.lsm.memtableCount()});
+        std.debug.print("SSTable count: {}\n", .{self.lsm.sstableCount()});
     }
 
     pub fn put_breadcrumb(self: *EventStore, bc: Breadcrumb, local_sequence: u64, self_service: []const u8, timestamp: i64) !void {
@@ -120,12 +108,14 @@ pub const EventStore = struct {
         try self.put(key, ev);
     }
 
-    pub fn get_breadcrumb(self: *const EventStore, source_service: []const u8, event_type: []const u8) !?Breadcrumb {
+    pub fn get_breadcrumb(self: *EventStore, source_service: []const u8, event_type: []const u8) !?Breadcrumb {
         const key = try Breadcrumb.makeKey(self.allocator, source_service, event_type);
         defer self.allocator.free(key);
 
-        if (self.get(key)) |ev| {
-            return try Breadcrumb.fromWalEntry(self.allocator, key, ev.*);
+        if (try self.get(key)) |ev_c| {
+            var ev = ev_c;
+            defer ev.deinit(self.allocator);
+            return try Breadcrumb.fromWalEntry(self.allocator, key, ev);
         }
 
         return null;
@@ -151,41 +141,31 @@ pub const EventStore = struct {
         return .{ .sequence = seq, .timestamp = now };
     }
 
-    /// Enforced write path for events received from peers over the wire.
-    /// Rejects events not covered by a declared contract and silently deduplicates.
     pub fn ingest_event(self: *EventStore, value: EventValue) !void {
-        // 1. Contract check: reject if no contract covers this origin+type
         if (!self.isAllowedByContract(value.origin_service, value.event_type))
             return error.UnauthorizedOrigin;
 
-        // 2. Dedup check: skip if this exact (origin, type, sequence) already exists
         const key = try makeEventKey(self.allocator, value.origin_service, value.event_type, value.sequence);
         defer self.allocator.free(key);
-        if (self.memtable.get(key) != null) {
-            // Idempotent: silent skip. Free the caller's allocations since
-            // on the success path put() takes ownership.
+        if (try self.lsm.contains(key)) {
             var v = value;
             v.deinit(self.allocator);
             return;
         }
 
-        // 3. Write through WAL + memtable (same as put)
         try self.put(key, value);
     }
 
     fn isAllowedByContract(self: *const EventStore, origin: []const u8, event_type: []const u8) bool {
-        // If no identity set, allow everything (backwards compat)
         if (self.identity == null) return true;
-        // Local events are always allowed
         if (std.mem.eql(u8, origin, self.identity.?)) return true;
-        // Check contracts for remote events
         for (self.contracts) |contract| {
             if (contract.matchesEvent(origin, event_type)) return true;
         }
         return false;
     }
 
-    pub fn query_events(self: *const EventStore, origin: []const u8, event_type: []const u8, from_sequence: u64) !ArrayList(EventValue) {
+    pub fn query_events(self: *EventStore, origin: []const u8, event_type: []const u8, from_sequence: u64) !ArrayList(EventValue) {
         const prefix = try makeEventPrefix(self.allocator, origin, event_type);
         defer self.allocator.free(prefix);
 
@@ -216,7 +196,7 @@ pub const EventStore = struct {
         return results;
     }
 
-    pub fn get_breadcrumbs(self: *const EventStore) !ArrayList(Breadcrumb) {
+    pub fn get_breadcrumbs(self: *EventStore) !ArrayList(Breadcrumb) {
         var scan_results = try self.scan_range(breadcrumb_mod.KEY_PREFIX);
         defer {
             for (scan_results.items) |*item| {
@@ -253,6 +233,11 @@ test {
     _ = @import("transport.zig");
     _ = @import("config.zig");
     _ = @import("server.zig");
+    _ = @import("memtable.zig");
+    _ = @import("sstable.zig");
+    _ = @import("manifest.zig");
+    _ = @import("merge_iterator.zig");
+    _ = @import("lsm.zig");
 }
 
 test "basic operations" {
@@ -290,14 +275,16 @@ test "basic operations" {
         try event_store.put(sample.key, value);
     }
 
-    if (event_store.get("user-service:u123:profile")) |found_value| {
+    if (try event_store.get("user-service:u123:profile")) |fv_c| {
+        var found_value = fv_c;
+        defer found_value.deinit(allocator);
         try std.testing.expectEqualStrings("user.registered", found_value.event_type);
         try std.testing.expect(found_value.sequence == 1);
     } else {
         return error.ExpectedValueNotFound;
     }
 
-    const nonexistent = event_store.get("nonexistent");
+    const nonexistent = try event_store.get("nonexistent");
     try std.testing.expect(nonexistent == null);
 }
 
@@ -320,18 +307,29 @@ test "bulk inserts" {
         const payload = try std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{i});
         defer allocator.free(payload);
 
-        const value = try EventValue.init(allocator, i + 1000, "test-service", "bulk.insert", payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(
+            allocator,
+            i + 1000,
+            "test-service",
+            "bulk.insert",
+            payload,
+            @truncate((try std.time.Instant.now()).timestamp.nsec),
+        );
         try event_store.put(key, value);
     }
 
-    if (event_store.get("bulk-service:b0:event")) |found_value| {
+    if (try event_store.get("bulk-service:b0:event")) |fv_c| {
+        var found_value = fv_c;
+        defer found_value.deinit(allocator);
         try std.testing.expectEqualStrings("bulk.insert", found_value.event_type);
         try std.testing.expect(found_value.sequence == 1000);
     } else {
         return error.ExpectedBulkValueNotFound;
     }
 
-    if (event_store.get("bulk-service:b149:event")) |found_value| {
+    if (try event_store.get("bulk-service:b149:event")) |fv_c| {
+        var found_value = fv_c;
+        defer found_value.deinit(allocator);
         try std.testing.expectEqualStrings("bulk.insert", found_value.event_type);
         try std.testing.expect(found_value.sequence == 1149);
     } else {
@@ -431,7 +429,9 @@ test "concurrent simulation" {
             writes_performed += 1;
             sequence += 1;
         } else if (std.mem.eql(u8, op.operation_type, "read")) {
-            if (event_store.get(op.key)) |_| {
+            if (try event_store.get(op.key)) |fv_c| {
+                var fv = fv_c;
+                fv.deinit(allocator);
                 reads_performed += 1;
             }
         }
@@ -511,25 +511,31 @@ test "persistence recovery" {
 
     const instance1_keys = [_][]const u8{ "user:alice", "order:12345", "session:alice-s1" };
     for (instance1_keys) |key| {
-        if (store1.get(key)) |_| {} else {
+        if (try store1.get(key)) |fv_c| {
+            var fv = fv_c;
+            fv.deinit(allocator);
+        } else {
             return error.Instance1DataNotFound;
         }
     }
 
     const instance2_keys = [_][]const u8{ "user:bob", "order:67890", "session:bob-s1" };
     for (instance2_keys) |key| {
-        const found_in_store1 = store1.get(key);
+        const found_in_store1 = try store1.get(key);
         try std.testing.expect(found_in_store1 == null);
     }
 
     for (instance2_keys) |key| {
-        if (store2.get(key)) |_| {} else {
+        if (try store2.get(key)) |fv_c| {
+            var fv = fv_c;
+            fv.deinit(allocator);
+        } else {
             return error.Instance2DataNotFound;
         }
     }
 
     for (instance1_keys) |key| {
-        const found_in_store2 = store2.get(key);
+        const found_in_store2 = try store2.get(key);
         try std.testing.expect(found_in_store2 == null);
     }
 }
@@ -556,7 +562,9 @@ test "edge cases" {
     );
     try event_store.put("edge:empty", empty_value);
 
-    if (event_store.get("edge:empty")) |found_value| {
+    if (try event_store.get("edge:empty")) |fv_c| {
+        var found_value = fv_c;
+        defer found_value.deinit(allocator);
         try std.testing.expect(found_value.event_type.len == 0);
         try std.testing.expect(found_value.payload.len == 0);
     } else {
@@ -576,7 +584,9 @@ test "edge cases" {
     const long_value = try EventValue.init(allocator, 6001, "test-service", "test.long_data", long_payload, @truncate((try std.time.Instant.now()).timestamp.nsec));
     try event_store.put(long_key, long_value);
 
-    if (event_store.get(long_key)) |found_value| {
+    if (try event_store.get(long_key)) |fv_c| {
+        var found_value = fv_c;
+        defer found_value.deinit(allocator);
         try std.testing.expect(long_key.len > 90);
         try std.testing.expect(found_value.payload.len > 200);
         try std.testing.expectEqualStrings("test.long_data", found_value.event_type);
@@ -634,7 +644,9 @@ test "edge cases" {
     );
     try event_store.put(overwrite_key, value2);
 
-    if (event_store.get(overwrite_key)) |found_value| {
+    if (try event_store.get(overwrite_key)) |fv_c| {
+        var found_value = fv_c;
+        defer found_value.deinit(allocator);
         try std.testing.expectEqualStrings("test.second", found_value.event_type);
         try std.testing.expect(found_value.sequence == 6201);
     } else {
@@ -651,14 +663,14 @@ test "put_breadcrumb and get_breadcrumb round-trip" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_roundtrip.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_roundtrip.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_roundtrip.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_roundtrip.crumb") catch {};
 
     var event_store = try EventStore.init(allocator, "data/test_bc_roundtrip.wal", io, .{});
     defer {
         event_store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_bc_roundtrip.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_bc_roundtrip.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_bc_roundtrip.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_bc_roundtrip.crumb") catch {};
     }
 
     const bc = Breadcrumb{
@@ -692,14 +704,14 @@ test "get_breadcrumbs returns all breadcrumbs" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_list.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_list.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_list.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_list.crumb") catch {};
 
     var event_store = try EventStore.init(allocator, "data/test_bc_list.wal", io, .{});
     defer {
         event_store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_bc_list.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_bc_list.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_bc_list.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_bc_list.crumb") catch {};
     }
 
     const bc1 = Breadcrumb{
@@ -738,14 +750,14 @@ test "breadcrumbs and domain events coexist" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_coexist.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_coexist.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_coexist.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_coexist.crumb") catch {};
 
     var event_store = try EventStore.init(allocator, "data/test_bc_coexist.wal", io, .{});
     defer {
         event_store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_bc_coexist.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_bc_coexist.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_bc_coexist.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_bc_coexist.crumb") catch {};
     }
 
     const domain_ev = try EventValue.init(allocator, 1, "my-service", "user.registered", "{\"email\":\"test@test.com\"}", 100);
@@ -760,7 +772,9 @@ test "breadcrumbs and domain events coexist" {
     };
     try event_store.put_breadcrumb(bc, 2, "my-service", 200);
 
-    if (event_store.get("user-service:u1:profile")) |found| {
+    if (try event_store.get("user-service:u1:profile")) |fv_c| {
+        var found = fv_c;
+        defer found.deinit(allocator);
         try std.testing.expectEqualStrings("user.registered", found.event_type);
     } else {
         return error.DomainEventNotFound;
@@ -789,8 +803,8 @@ test "breadcrumb survives WAL replay" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_replay.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_replay.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_replay.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_replay.crumb") catch {};
 
     {
         var event_store = try EventStore.init(allocator, "data/test_bc_replay.wal", io, .{});
@@ -822,8 +836,8 @@ test "breadcrumb survives WAL replay" {
         try std.testing.expectEqualStrings("10.0.0.5:4200", restored.peer_address);
     }
 
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_replay.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_bc_replay.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_replay.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_bc_replay.crumb") catch {};
 }
 
 test "put_event and query_events basic" {
@@ -835,14 +849,14 @@ test "put_event and query_events basic" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_event_query.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_event_query.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_query.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_query.crumb") catch {};
 
     var store = try EventStore.init(allocator, "data/test_event_query.wal", io, .{});
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_event_query.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_event_query.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_query.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_query.crumb") catch {};
     }
 
     for (1..6) |i| {
@@ -873,14 +887,14 @@ test "query_events filters by from_sequence" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_event_filter.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_event_filter.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_filter.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_filter.crumb") catch {};
 
     var store = try EventStore.init(allocator, "data/test_event_filter.wal", io, .{});
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_event_filter.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_event_filter.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_filter.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_filter.crumb") catch {};
     }
 
     for (1..11) |i| {
@@ -907,14 +921,14 @@ test "query_events isolates by origin and event_type" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_event_isolate.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_event_isolate.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_isolate.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_isolate.crumb") catch {};
 
     var store = try EventStore.init(allocator, "data/test_event_isolate.wal", io, .{});
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_event_isolate.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_event_isolate.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_isolate.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_isolate.crumb") catch {};
     }
 
     for (1..4) |i| {
@@ -965,14 +979,14 @@ test "query_events does not leak into breadcrumbs or arbitrary keys" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_event_noleak.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_event_noleak.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_noleak.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_noleak.crumb") catch {};
 
     var store = try EventStore.init(allocator, "data/test_event_noleak.wal", io, .{});
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_event_noleak.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_event_noleak.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_noleak.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_noleak.crumb") catch {};
     }
 
     const ev = try EventValue.init(allocator, 1, "order-service", "order.created", "{}", 100);
@@ -1008,8 +1022,8 @@ test "put_event survives WAL replay" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_event_replay.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_event_replay.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_replay.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_replay.crumb") catch {};
 
     {
         var store = try EventStore.init(allocator, "data/test_event_replay.wal", io, .{});
@@ -1035,8 +1049,8 @@ test "put_event survives WAL replay" {
         try std.testing.expectEqual(@as(u64, 3), results.items[2].sequence);
     }
 
-    Io.Dir.cwd().deleteFile(io,"data/test_event_replay.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_event_replay.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_replay.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_replay.crumb") catch {};
 }
 
 test "ingest_event accepts events matching a declared contract" {
@@ -1048,8 +1062,8 @@ test "ingest_event accepts events matching a declared contract" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_accept.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_accept.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_accept.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_accept.crumb") catch {};
 
     const contracts = [_]DependencyContract{.{
         .source_service = "order-service",
@@ -1064,8 +1078,8 @@ test "ingest_event accepts events matching a declared contract" {
     });
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_accept.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_accept.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_accept.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_accept.crumb") catch {};
     }
 
     const ev = try EventValue.init(allocator, 1, "order-service", "order.created", "{}", 100);
@@ -1088,8 +1102,8 @@ test "ingest_event rejects events from undeclared origins" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_reject_origin.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_reject_origin.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_reject_origin.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_reject_origin.crumb") catch {};
 
     const contracts = [_]DependencyContract{.{
         .source_service = "order-service",
@@ -1104,8 +1118,8 @@ test "ingest_event rejects events from undeclared origins" {
     });
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_reject_origin.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_reject_origin.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_reject_origin.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_reject_origin.crumb") catch {};
     }
 
     var ev = try EventValue.init(allocator, 1, "unknown-service", "order.created", "{}", 100);
@@ -1123,8 +1137,8 @@ test "ingest_event rejects events with undeclared event types" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_reject_type.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_reject_type.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_reject_type.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_reject_type.crumb") catch {};
 
     const contracts = [_]DependencyContract{.{
         .source_service = "order-service",
@@ -1139,8 +1153,8 @@ test "ingest_event rejects events with undeclared event types" {
     });
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_reject_type.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_reject_type.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_reject_type.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_reject_type.crumb") catch {};
     }
 
     var ev = try EventValue.init(allocator, 1, "order-service", "order.deleted", "{}", 100);
@@ -1158,8 +1172,8 @@ test "ingest_event silently deduplicates same (origin, type, sequence)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_dedup.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_dedup.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_dedup.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_dedup.crumb") catch {};
 
     const contracts = [_]DependencyContract{.{
         .source_service = "order-service",
@@ -1174,14 +1188,13 @@ test "ingest_event silently deduplicates same (origin, type, sequence)" {
     });
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_dedup.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_dedup.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_dedup.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_dedup.crumb") catch {};
     }
 
     const ev1 = try EventValue.init(allocator, 1, "order-service", "order.created", "{\"first\":true}", 100);
     try store.ingest_event(ev1);
 
-    // Same origin, type, sequence — should be silently skipped
     const ev2 = try EventValue.init(allocator, 1, "order-service", "order.created", "{\"second\":true}", 200);
     try store.ingest_event(ev2);
 
@@ -1204,18 +1217,17 @@ test "ingest_event allows local origin events (origin == identity)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_local.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_local.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_local.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_local.crumb") catch {};
 
-    // No contracts — but local origin should still be allowed
     var store = try EventStore.init(allocator, "data/test_ingest_local.wal", io, .{
         .identity = "my-service",
         .contracts = &.{},
     });
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_local.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_local.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_local.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_local.crumb") catch {};
     }
 
     const ev = try EventValue.init(allocator, 1, "my-service", "user.registered", "{}", 100);
@@ -1238,15 +1250,14 @@ test "ingest_event with no identity set accepts everything" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_noident.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_ingest_noident.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_noident.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_noident.crumb") catch {};
 
-    // Default config: no identity, no contracts
     var store = try EventStore.init(allocator, "data/test_ingest_noident.wal", io, .{});
     defer {
         store.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_noident.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_ingest_noident.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_noident.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_noident.crumb") catch {};
     }
 
     const ev = try EventValue.init(allocator, 1, "any-service", "any.event", "{}", 100);

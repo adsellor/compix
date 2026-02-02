@@ -5,12 +5,17 @@ const wal = @import("core/wal.zig");
 const event = @import("core/event.zig");
 const protocol = @import("core/protocol.zig");
 const transport = @import("core/transport.zig");
+const sstable = @import("core/sstable.zig");
+const lsm_mod = @import("core/lsm.zig");
+const memtable_mod = @import("core/memtable.zig");
 
 const Io = std.Io;
 const EventValue = event.EventValue;
 const EventStore = store.EventStore;
 const RadixTree = radix.RadixTree;
 const WriteAheadLog = wal.WriteAheadLog;
+const LSMEngine = lsm_mod.LSMEngine;
+const Memtable = memtable_mod.Memtable;
 const ArrayList = std.ArrayList;
 const KeyValuePair = event.KeyValuePair;
 const Message = protocol.Message;
@@ -406,16 +411,34 @@ fn bench_scan_prefix_selectivity(allocator: std.mem.Allocator, log: *BenchLog) !
     }
 }
 
+fn cleanupBenchLSM(allocator: std.mem.Allocator, io: Io, base: []const u8) void {
+    const wal_path = std.fmt.allocPrint(allocator, "{s}.wal", .{base}) catch return;
+    defer allocator.free(wal_path);
+    const crumb = std.fmt.allocPrint(allocator, "{s}.crumb", .{base}) catch return;
+    defer allocator.free(crumb);
+    const manifest = std.fmt.allocPrint(allocator, "{s}.manifest", .{base}) catch return;
+    defer allocator.free(manifest);
+
+    IoDir.cwd().deleteFile(io, wal_path) catch {};
+    IoDir.cwd().deleteFile(io, crumb) catch {};
+    IoDir.cwd().deleteFile(io, manifest) catch {};
+
+    for (0..20) |i| {
+        for (0..3) |lvl| {
+            const p = std.fmt.allocPrint(allocator, "{s}_L{d}_{d:0>8}.sst", .{ base, lvl, i + 1 }) catch continue;
+            defer allocator.free(p);
+            IoDir.cwd().deleteFile(io, p) catch {};
+        }
+    }
+}
+
+const IoDir = Io.Dir;
+
 fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const wal_path = "data/bench_stress.wal";
-    const crumb_path = "data/bench_stress.crumb";
     const sio = Io.Threaded.global_single_threaded.io();
-    Io.Dir.cwd().deleteFile(sio, wal_path) catch {};
-    Io.Dir.cwd().deleteFile(sio, crumb_path) catch {};
-    defer {
-        Io.Dir.cwd().deleteFile(sio, wal_path) catch {};
-        Io.Dir.cwd().deleteFile(sio, crumb_path) catch {};
-    }
+    cleanupBenchLSM(allocator, sio, "data/bench_stress");
+    defer cleanupBenchLSM(allocator, sio, "data/bench_stress");
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -450,7 +473,7 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
         try event_store.put(key, value);
     }
     const write_end = try std.time.Instant.now();
-    log.result(allocator, "store.put (10k WAL+radix writes)", total_operations, elapsed_us(write_start, write_end));
+    log.result(allocator, "store.put durable (10k synced writes)", total_operations, elapsed_us(write_start, write_end));
 
     const read_count: usize = 1_000;
     var read_keys = try allocator.alloc([]u8, read_count);
@@ -467,7 +490,11 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
     var found: usize = 0;
     const read_start = try std.time.Instant.now();
     for (0..read_count) |i| {
-        if (event_store.get(read_keys[i])) |_| found += 1;
+        if (try event_store.get(read_keys[i])) |v| {
+            var val = v;
+            val.deinit(allocator);
+            found += 1;
+        }
     }
     const read_end = try std.time.Instant.now();
     log.result(allocator, "store.get (1k point reads)", read_count, elapsed_us(read_start, read_end));
@@ -484,7 +511,7 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const scan_end = try std.time.Instant.now();
     log.result(allocator, "store.scan_range (5 prefix scans)", services.len, elapsed_us(scan_start, scan_end));
     log.note(allocator, "\n    total scan results: {}\n", .{total_scan_results});
-    log.note(allocator, "    memtable entries: {}\n", .{event_store.memtable.size});
+    log.note(allocator, "    memtable entries: {}\n", .{event_store.lsm.memtableCount()});
 }
 
 fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !void {
@@ -743,6 +770,285 @@ fn bench_transport_message_burst(allocator: std.mem.Allocator, log: *BenchLog) !
     log.result(allocator, "transport message echo on single conn (5k)", count, elapsed_us(start, end));
 }
 
+fn bench_memtable_insert(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    var mt = Memtable.init(allocator);
+    defer mt.deinit();
+
+    const count: usize = 50_000;
+    const start = try std.time.Instant.now();
+
+    for (0..count) |i| {
+        const key = try std.fmt.allocPrint(allocator, "mt:k{d:0>8}", .{i});
+        defer allocator.free(key);
+        const val = try EventValue.init(allocator, i + 1, "bench-service", "bench.insert", "{}", 0);
+        try mt.insert(key, val);
+    }
+    const end = try std.time.Instant.now();
+
+    log.result(allocator, "memtable.insert (50k sorted)", count, elapsed_us(start, end));
+    log.note(allocator, "    size_bytes: {}\n", .{mt.size_bytes});
+}
+
+fn bench_memtable_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    var mt = Memtable.init(allocator);
+    defer mt.deinit();
+
+    const key_count: usize = 10_000;
+    var keys = try allocator.alloc([]u8, key_count);
+    defer {
+        for (keys) |k| allocator.free(k);
+        allocator.free(keys);
+    }
+
+    for (0..key_count) |i| {
+        keys[i] = try std.fmt.allocPrint(allocator, "mt:get:k{d:0>8}", .{i});
+        const val = try EventValue.init(allocator, i + 1, "svc", "evt", "{}", 0);
+        try mt.insert(keys[i], val);
+    }
+
+    const lookups: usize = 100_000;
+    var found: usize = 0;
+
+    const start = try std.time.Instant.now();
+    for (0..lookups) |i| {
+        if (try mt.get(allocator, keys[i % key_count])) |v| {
+            var val = v;
+            val.deinit(allocator);
+            found += 1;
+        }
+    }
+    const end = try std.time.Instant.now();
+
+    std.debug.assert(found == lookups);
+    log.result(allocator, "memtable.get (100k lookups, 10k keys)", lookups, elapsed_us(start, end));
+}
+
+fn bench_sstable_write(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const sio = Io.Threaded.global_single_threaded.io();
+    const path = "data/bench_sst_write.sst";
+    IoDir.cwd().deleteFile(sio, path) catch {};
+    defer IoDir.cwd().deleteFile(sio, path) catch {};
+
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const count: usize = 10_000;
+    var entries = try allocator.alloc(sstable.RawEntry, count);
+    defer {
+        for (entries) |e| {
+            allocator.free(e.key);
+            allocator.free(e.value);
+        }
+        allocator.free(entries);
+    }
+
+    for (0..count) |i| {
+        entries[i] = .{
+            .key = try std.fmt.allocPrint(allocator, "sst:k{d:0>8}", .{i}),
+            .value = try std.fmt.allocPrint(allocator, "{}|0|2|bench-svc|bench.evt|{{}}", .{i + 1}),
+        };
+    }
+
+    const start = try std.time.Instant.now();
+    _ = try sstable.writeSSTable(allocator, path, io, entries);
+    const end = try std.time.Instant.now();
+
+    log.result(allocator, "sstable.write (10k entries)", count, elapsed_us(start, end));
+}
+
+fn bench_sstable_read(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const sio = Io.Threaded.global_single_threaded.io();
+    const path = "data/bench_sst_read.sst";
+    IoDir.cwd().deleteFile(sio, path) catch {};
+    defer IoDir.cwd().deleteFile(sio, path) catch {};
+
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const count: usize = 10_000;
+    var entries = try allocator.alloc(sstable.RawEntry, count);
+    defer {
+        for (entries) |e| {
+            allocator.free(e.key);
+            allocator.free(e.value);
+        }
+        allocator.free(entries);
+    }
+
+    var keys = try allocator.alloc([]u8, count);
+    defer allocator.free(keys);
+
+    for (0..count) |i| {
+        const k = try std.fmt.allocPrint(allocator, "sst:k{d:0>8}", .{i});
+        entries[i] = .{
+            .key = k,
+            .value = try std.fmt.allocPrint(allocator, "{}|0|2|bench-svc|bench.evt|{{}}", .{i + 1}),
+        };
+        keys[i] = k;
+    }
+
+    _ = try sstable.writeSSTable(allocator, path, io, entries);
+
+    var reader = try sstable.SSTableReader.open(allocator, path, io);
+    defer reader.deinit();
+
+    const lookups: usize = 10_000;
+    var found: usize = 0;
+
+    const start = try std.time.Instant.now();
+    for (0..lookups) |i| {
+        if (try reader.get(allocator, keys[i % count])) |v| {
+            var val = v;
+            val.deinit(allocator);
+            found += 1;
+        }
+    }
+    const end = try std.time.Instant.now();
+
+    std.debug.assert(found == lookups);
+    log.result(allocator, "sstable.get (10k point reads)", lookups, elapsed_us(start, end));
+}
+
+fn bench_lsm_put_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const sio = Io.Threaded.global_single_threaded.io();
+    cleanupBenchLSM(allocator, sio, "data/bench_lsm_pg");
+    defer cleanupBenchLSM(allocator, sio, "data/bench_lsm_pg");
+
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var lsm = try LSMEngine.init(allocator, "data/bench_lsm_pg.wal", io);
+    defer lsm.deinit();
+
+    const write_count: usize = 10_000;
+    const write_start = try std.time.Instant.now();
+    for (0..write_count) |i| {
+        const key = try std.fmt.allocPrint(allocator, "lsm:k{d:0>8}", .{i});
+        defer allocator.free(key);
+        const val = try EventValue.init(allocator, i + 1, "bench-svc", "bench.put", "{}", 0);
+        try lsm.put(key, val);
+    }
+    const write_end = try std.time.Instant.now();
+    log.result(allocator, "lsm.put (10k writes)", write_count, elapsed_us(write_start, write_end));
+
+    const read_count: usize = 5_000;
+    var found: usize = 0;
+    const read_start = try std.time.Instant.now();
+    for (0..read_count) |i| {
+        const key = try std.fmt.allocPrint(allocator, "lsm:k{d:0>8}", .{i * 2});
+        defer allocator.free(key);
+        if (try lsm.get(allocator, key)) |v| {
+            var val = v;
+            val.deinit(allocator);
+            found += 1;
+        }
+    }
+    const read_end = try std.time.Instant.now();
+
+    std.debug.assert(found == read_count);
+    log.result(allocator, "lsm.get (5k reads, in-memtable)", read_count, elapsed_us(read_start, read_end));
+}
+
+fn bench_lsm_flush(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const sio = Io.Threaded.global_single_threaded.io();
+    cleanupBenchLSM(allocator, sio, "data/bench_lsm_flush");
+    defer cleanupBenchLSM(allocator, sio, "data/bench_lsm_flush");
+
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var lsm = try LSMEngine.init(allocator, "data/bench_lsm_flush.wal", io);
+    defer lsm.deinit();
+
+    // Write entries
+    const count: usize = 10_000;
+    for (0..count) |i| {
+        const key = try std.fmt.allocPrint(allocator, "flush:k{d:0>8}", .{i});
+        defer allocator.free(key);
+        const val = try EventValue.init(allocator, i + 1, "svc", "evt", "{\"data\":\"some payload\"}", 0);
+        try lsm.put(key, val);
+    }
+
+    const start = try std.time.Instant.now();
+    try lsm.flush();
+    const end = try std.time.Instant.now();
+
+    log.result(allocator, "lsm.flush (10k entries -> SSTable)", 1, elapsed_us(start, end));
+    log.note(allocator, "    SSTable count after flush: {}\n", .{lsm.sstableCount()});
+
+    // Read after flush (from SSTable)
+    var found: usize = 0;
+    const read_start = try std.time.Instant.now();
+    for (0..1_000) |i| {
+        const key = try std.fmt.allocPrint(allocator, "flush:k{d:0>8}", .{i * 10});
+        defer allocator.free(key);
+        if (try lsm.get(allocator, key)) |v| {
+            var val = v;
+            val.deinit(allocator);
+            found += 1;
+        }
+    }
+    const read_end = try std.time.Instant.now();
+
+    std.debug.assert(found == 1_000);
+    log.result(allocator, "lsm.get after flush (1k reads from SSTable)", 1_000, elapsed_us(read_start, read_end));
+}
+
+fn bench_lsm_scan(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const sio = Io.Threaded.global_single_threaded.io();
+    cleanupBenchLSM(allocator, sio, "data/bench_lsm_scan");
+    defer cleanupBenchLSM(allocator, sio, "data/bench_lsm_scan");
+
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var lsm = try LSMEngine.init(allocator, "data/bench_lsm_scan.wal", io);
+    defer lsm.deinit();
+
+    const services = [_][]const u8{ "auth", "payment", "inventory", "shipping", "analytics" };
+
+    for (0..5_000) |i| {
+        const svc = services[i % services.len];
+        const key = try std.fmt.allocPrint(allocator, "{s}:r{d:0>8}:evt", .{ svc, i });
+        defer allocator.free(key);
+        const val = try EventValue.init(allocator, i + 1, "svc", "evt", "{}", 0);
+        try lsm.put(key, val);
+    }
+
+    // Flush half to SSTable, keep rest in memtable
+    try lsm.flush();
+
+    for (5_000..10_000) |i| {
+        const svc = services[i % services.len];
+        const key = try std.fmt.allocPrint(allocator, "{s}:r{d:0>8}:evt", .{ svc, i });
+        defer allocator.free(key);
+        const val = try EventValue.init(allocator, i + 1, "svc", "evt", "{}", 0);
+        try lsm.put(key, val);
+    }
+
+    const scans: usize = 50;
+    var total_results: usize = 0;
+
+    const start = try std.time.Instant.now();
+    for (0..scans) |i| {
+        const prefix = services[i % services.len];
+        var results = ArrayList(KeyValuePair){};
+        try lsm.scan_prefix(prefix, &results);
+        total_results += results.items.len;
+        for (results.items) |*item| item.deinit(allocator);
+        results.deinit(allocator);
+    }
+    const end = try std.time.Instant.now();
+
+    log.result(allocator, "lsm.scan_prefix (50 scans, cross memtable+SST)", scans, elapsed_us(start, end));
+    log.note(allocator, "    total matched results: {}\n", .{total_results});
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -766,6 +1072,19 @@ pub fn main() !void {
     log.section(allocator, "Radix scan_prefix");
     try bench_scan_prefix(allocator, &log);
     try bench_scan_prefix_selectivity(allocator, &log);
+
+    log.section(allocator, "Memtable");
+    try bench_memtable_insert(allocator, &log);
+    try bench_memtable_get(allocator, &log);
+
+    log.section(allocator, "SSTable");
+    try bench_sstable_write(allocator, &log);
+    try bench_sstable_read(allocator, &log);
+
+    log.section(allocator, "LSM Engine");
+    try bench_lsm_put_get(allocator, &log);
+    try bench_lsm_flush(allocator, &log);
+    try bench_lsm_scan(allocator, &log);
 
     log.section(allocator, "EventStore end-to-end");
     try bench_store_stress(allocator, &log);

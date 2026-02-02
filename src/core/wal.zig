@@ -49,13 +49,16 @@ fn readExactIo(file: IoFile, io: Io, buf: []u8, offset: u64) !void {
     }
 }
 
+const WRITE_BUF_CAP: usize = 256 * 1024;
+
 pub const WriteAheadLog = struct {
     file: IoFile,
     io: Io,
     allocator: std.mem.Allocator,
     wal_path: []const u8,
     write_pos: u64,
-    dirty: bool,
+    write_buf: []u8,
+    buf_len: usize,
 
     pub fn init(allocator: std.mem.Allocator, file_path: []const u8, io: Io) !WriteAheadLog {
         const dir = IoDir.cwd();
@@ -72,30 +75,39 @@ pub const WriteAheadLog = struct {
 
         const file_size = (try file.stat(io)).size;
 
+        const wb = try allocator.alloc(u8, WRITE_BUF_CAP);
+        errdefer allocator.free(wb);
+
         return WriteAheadLog{
             .file = file,
             .io = io,
             .allocator = allocator,
             .wal_path = try allocator.dupe(u8, file_path),
             .write_pos = file_size,
-            .dirty = false,
+            .write_buf = wb,
+            .buf_len = 0,
         };
     }
 
     pub fn deinit(self: *WriteAheadLog) void {
-        self.flush() catch {};
+        self.sync() catch {};
         self.file.close(self.io);
+        self.allocator.free(self.write_buf);
         self.allocator.free(self.wal_path);
     }
 
-    pub fn flush(self: *WriteAheadLog) !void {
-        if (self.dirty) {
-            try syncWithBackoff(self.file, self.io);
-            self.dirty = false;
-        }
+    pub fn sync(self: *WriteAheadLog) !void {
+        if (self.buf_len == 0) return;
+        try writeAllPwrite(self.file, self.io, self.write_buf[0..self.buf_len], self.write_pos);
+        self.write_pos += self.buf_len;
+        self.buf_len = 0;
+        try syncWithBackoff(self.file, self.io);
     }
 
-    /// [4B magic][8B sequence][4B entry_len][4B key_len][key][4B value_len][value][1B newline]
+    pub fn flush(self: *WriteAheadLog) !void {
+        try self.sync();
+    }
+
     pub fn append_event(self: *WriteAheadLog, key: []const u8, value: EventValue) !void {
         const serialized_value = try value.serialize(self.allocator);
         defer self.allocator.free(serialized_value);
@@ -103,13 +115,23 @@ pub const WriteAheadLog = struct {
         const entry_len: u32 = @intCast(4 + key.len + 4 + serialized_value.len + 1);
         const total_size: usize = 4 + 8 + 4 + 4 + key.len + 4 + serialized_value.len + 1;
 
-        var stack_buf: [4096]u8 = undefined;
-        const buf = if (total_size <= stack_buf.len)
-            stack_buf[0..total_size]
-        else
-            try self.allocator.alloc(u8, total_size);
-        defer if (total_size > stack_buf.len) self.allocator.free(buf);
+        if (self.buf_len + total_size > self.write_buf.len) {
+            try self.sync();
+            if (total_size > self.write_buf.len) {
+                const buf = try self.allocator.alloc(u8, total_size);
+                defer self.allocator.free(buf);
+                serializeEntry(buf, key, value, serialized_value, entry_len);
+                try writeAllPwrite(self.file, self.io, buf, self.write_pos);
+                self.write_pos += total_size;
+                return;
+            }
+        }
 
+        serializeEntry(self.write_buf[self.buf_len..][0..total_size], key, value, serialized_value, entry_len);
+        self.buf_len += total_size;
+    }
+
+    fn serializeEntry(buf: []u8, key: []const u8, value: EventValue, serialized_value: []const u8, entry_len: u32) void {
         var pos: usize = 0;
         std.mem.writeInt(u32, buf[pos..][0..4], MAGIC, .little);
         pos += 4;
@@ -126,13 +148,18 @@ pub const WriteAheadLog = struct {
         @memcpy(buf[pos..][0..serialized_value.len], serialized_value);
         pos += serialized_value.len;
         buf[pos] = '\n';
-
-        try writeAllPwrite(self.file, self.io, buf, self.write_pos);
-        self.write_pos += total_size;
-        self.dirty = true;
     }
 
-    pub fn replay(self: *WriteAheadLog, radix_tree: *RadixTree) !WalCursor {
+    pub fn truncate(self: *WriteAheadLog) !void {
+        self.sync() catch {};
+        self.file.close(self.io);
+        const dir = IoDir.cwd();
+        self.file = try dir.createFile(self.io, self.wal_path, .{ .truncate = true, .read = true });
+        self.write_pos = 0;
+        self.buf_len = 0;
+    }
+
+    pub fn replay(self: *WriteAheadLog, target: anytype) !WalCursor {
         const file_size = (try self.file.stat(self.io)).size;
         var offset: u64 = 0;
         var crumb = WalCursor{ .file_offset = 0, .last_sequence = 0 };
@@ -185,7 +212,7 @@ pub const WriteAheadLog = struct {
             offset += 1;
 
             const deserialized = try EventValue.deserialize(self.allocator, value_buf);
-            try radix_tree.insert(key_buf, deserialized);
+            try target.insert(key_buf, deserialized);
 
             crumb.file_offset = offset;
             crumb.last_sequence = sequence;
@@ -299,14 +326,14 @@ test "find_by_sequence returns correct offsets" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_find_seq.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_find_seq.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_find_seq.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_find_seq.crumb") catch {};
 
     var wal_log = try WriteAheadLog.init(allocator, "data/test_find_seq.wal", io);
     defer {
         wal_log.deinit();
-        Io.Dir.cwd().deleteFile(io,"data/test_find_seq.wal") catch {};
-        Io.Dir.cwd().deleteFile(io,"data/test_find_seq.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_find_seq.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_find_seq.crumb") catch {};
     }
 
     for (0..10) |i| {
@@ -352,8 +379,8 @@ test "replay with crumb resumes from correct position" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteFile(io,"data/test_replay_crumb.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_replay_crumb.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_replay_crumb.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_replay_crumb.crumb") catch {};
 
     {
         var wal_log = try WriteAheadLog.init(allocator, "data/test_replay_crumb.wal", io);
@@ -420,6 +447,6 @@ test "replay with crumb resumes from correct position" {
         _ = tree3.get("key_7") orelse return error.ExpectedValueNotFound;
     }
 
-    Io.Dir.cwd().deleteFile(io,"data/test_replay_crumb.wal") catch {};
-    Io.Dir.cwd().deleteFile(io,"data/test_replay_crumb.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_replay_crumb.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_replay_crumb.crumb") catch {};
 }
