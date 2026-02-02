@@ -1,0 +1,13 @@
+{
+  "service_name": "order-service",
+  "instance_id": "node-1",
+  "listen_address": "127.0.0.1:4200",
+  "wal_path": "data/events.wal",
+  "contracts": [
+    {
+      "source_service": "user-service",
+      "event_types": ["user.registered", "user.updated"],
+      "peer_address": "10.0.0.6:4200"
+    }
+  ]
+}

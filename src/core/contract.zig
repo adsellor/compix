@@ -16,6 +16,17 @@ pub const DependencyContract = struct {
         }
         return false;
     }
+
+    /// Returns true if this contract covers the given (origin, event_type) pair.
+    /// NOTE: This is teh same logic as matchesBreadcrumb with different arguments
+    /// maybe this can be refactored
+    pub fn matchesEvent(self: *const DependencyContract, origin: []const u8, event_type: []const u8) bool {
+        if (!std.mem.eql(u8, self.source_service, origin)) return false;
+        for (self.event_types) |et| {
+            if (std.mem.eql(u8, et, event_type)) return true;
+        }
+        return false;
+    }
 };
 
 test "matchesBreadcrumb matches correct source and type" {
@@ -79,4 +90,38 @@ test "matchesBreadcrumb rejects wrong event type" {
         .updated_at = 100,
     };
     try std.testing.expect(!contract.matchesBreadcrumb(wrong_type));
+}
+
+test "matchesEvent matches correct origin and type" {
+    const contract = DependencyContract{
+        .source_service = "order-service",
+        .event_types = &[_][]const u8{ "order.created", "order.updated" },
+        .peer_address = "10.0.0.5:4200",
+        .retention_hint = null,
+    };
+
+    try std.testing.expect(contract.matchesEvent("order-service", "order.created"));
+    try std.testing.expect(contract.matchesEvent("order-service", "order.updated"));
+}
+
+test "matchesEvent rejects wrong origin" {
+    const contract = DependencyContract{
+        .source_service = "order-service",
+        .event_types = &[_][]const u8{"order.created"},
+        .peer_address = "10.0.0.5:4200",
+        .retention_hint = null,
+    };
+
+    try std.testing.expect(!contract.matchesEvent("user-service", "order.created"));
+}
+
+test "matchesEvent rejects wrong event type" {
+    const contract = DependencyContract{
+        .source_service = "order-service",
+        .event_types = &[_][]const u8{"order.created"},
+        .peer_address = "10.0.0.5:4200",
+        .retention_hint = null,
+    };
+
+    try std.testing.expect(!contract.matchesEvent("order-service", "order.deleted"));
 }

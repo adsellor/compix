@@ -1,4 +1,7 @@
 const std = @import("std");
+const Io = std.Io;
+const IoDir = Io.Dir;
+const IoFile = Io.File;
 
 pub const WalCursor = struct {
     file_offset: u64,
@@ -31,22 +34,26 @@ pub fn save(allocator: std.mem.Allocator, wal_path: []const u8, cursor: WalCurso
     const path = try derivePath(allocator, wal_path);
     defer allocator.free(path);
 
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
-    defer file.close();
+    const dir = IoDir.cwd();
+    const io = Io.Threaded.global_single_threaded.io();
+    const file = try dir.createFile(io, path, .{ .truncate = true });
+    defer file.close(io);
 
     const bytes = cursor.serialize();
-    try file.writeAll(&bytes);
+    try file.writePositionalAll(io, &bytes, 0);
 }
 
 pub fn load(allocator: std.mem.Allocator, wal_path: []const u8) ?WalCursor {
     const path = derivePath(allocator, wal_path) catch return null;
     defer allocator.free(path);
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
+    const dir = IoDir.cwd();
+    const io = Io.Threaded.global_single_threaded.io();
+    const file = dir.openFile(io, path, .{}) catch return null;
+    defer file.close(io);
 
     var bytes: [16]u8 = undefined;
-    const n = file.read(&bytes) catch return null;
+    const n = file.readPositionalAll(io, &bytes, 0) catch return null;
     if (n < 16) return null;
 
     return WalCursor.deserialize(bytes);
@@ -62,12 +69,13 @@ test "serialize/deserialize round-trip" {
 
 test "save/load round-trip" {
     const allocator = std.testing.allocator;
+    const io = Io.Threaded.global_single_threaded.io();
 
-    std.fs.cwd().deleteFile("data/test_wal_cursor_roundtrip.crumb") catch {};
+    IoDir.cwd().deleteFile(io, "data/test_wal_cursor_roundtrip.crumb") catch {};
 
     const cursor = WalCursor{ .file_offset = 42, .last_sequence = 100 };
     try save(allocator, "data/test_wal_cursor_roundtrip.wal", cursor);
-    defer std.fs.cwd().deleteFile("data/test_wal_cursor_roundtrip.crumb") catch {};
+    defer IoDir.cwd().deleteFile(io, "data/test_wal_cursor_roundtrip.crumb") catch {};
 
     const loaded = load(allocator, "data/test_wal_cursor_roundtrip.wal");
     try std.testing.expect(loaded != null);

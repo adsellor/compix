@@ -20,12 +20,13 @@ const SYNC_MAX_RETRIES: u32 = 10;
 
 const SyncError = error{SyncFailed};
 
-fn syncWithBackoff(fd: std.posix.fd_t) SyncError!void {
+fn syncWithBackoff(file: IoFile, io: Io) SyncError!void {
     var backoff_ns: u64 = SYNC_INITIAL_BACKOFF_NS;
     var attempt: u32 = 0;
     while (attempt < SYNC_MAX_RETRIES) : (attempt += 1) {
-        std.posix.fsync(fd) catch {
-            std.posix.nanosleep(0, backoff_ns);
+        file.sync(io) catch {
+            const req = std.os.linux.timespec{ .sec = 0, .nsec = @intCast(backoff_ns) };
+            _ = std.os.linux.nanosleep(&req, null);
             backoff_ns = @min(backoff_ns * 2, SYNC_MAX_BACKOFF_NS);
             continue;
         };
@@ -34,13 +35,8 @@ fn syncWithBackoff(fd: std.posix.fd_t) SyncError!void {
     return error.SyncFailed;
 }
 
-fn writeAllPwrite(fd: std.posix.fd_t, buf: []const u8, offset: u64) !void {
-    var written: usize = 0;
-    while (written < buf.len) {
-        const n = std.posix.pwrite(fd, buf[written..], offset + written) catch return error.InputOutput;
-        if (n == 0) return error.InputOutput;
-        written += n;
-    }
+fn writeAllPwrite(file: IoFile, io: Io, buf: []const u8, offset: u64) !void {
+    file.writePositionalAll(io, buf, offset) catch return error.InputOutput;
 }
 
 fn readExactIo(file: IoFile, io: Io, buf: []u8, offset: u64) !void {
@@ -64,7 +60,7 @@ pub const WriteAheadLog = struct {
     pub fn init(allocator: std.mem.Allocator, file_path: []const u8, io: Io) !WriteAheadLog {
         const dir = IoDir.cwd();
 
-        dir.makeDir(io, "data") catch |err| switch (err) {
+        dir.createDir(io, "data", .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -94,7 +90,7 @@ pub const WriteAheadLog = struct {
 
     pub fn flush(self: *WriteAheadLog) !void {
         if (self.dirty) {
-            try syncWithBackoff(self.file.handle);
+            try syncWithBackoff(self.file, self.io);
             self.dirty = false;
         }
     }
@@ -131,7 +127,7 @@ pub const WriteAheadLog = struct {
         pos += serialized_value.len;
         buf[pos] = '\n';
 
-        try writeAllPwrite(self.file.handle, buf, self.write_pos);
+        try writeAllPwrite(self.file, self.io, buf, self.write_pos);
         self.write_pos += total_size;
         self.dirty = true;
     }
@@ -299,18 +295,18 @@ test "find_by_sequence returns correct offsets" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var threaded = Io.Threaded.init(allocator);
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
 
-    std.fs.cwd().deleteFile("data/test_find_seq.wal") catch {};
-    std.fs.cwd().deleteFile("data/test_find_seq.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io,"data/test_find_seq.wal") catch {};
+    Io.Dir.cwd().deleteFile(io,"data/test_find_seq.crumb") catch {};
 
     var wal_log = try WriteAheadLog.init(allocator, "data/test_find_seq.wal", io);
     defer {
         wal_log.deinit();
-        std.fs.cwd().deleteFile("data/test_find_seq.wal") catch {};
-        std.fs.cwd().deleteFile("data/test_find_seq.crumb") catch {};
+        Io.Dir.cwd().deleteFile(io,"data/test_find_seq.wal") catch {};
+        Io.Dir.cwd().deleteFile(io,"data/test_find_seq.crumb") catch {};
     }
 
     for (0..10) |i| {
@@ -352,12 +348,12 @@ test "replay with crumb resumes from correct position" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var threaded = Io.Threaded.init(allocator);
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
 
-    std.fs.cwd().deleteFile("data/test_replay_crumb.wal") catch {};
-    std.fs.cwd().deleteFile("data/test_replay_crumb.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io,"data/test_replay_crumb.wal") catch {};
+    Io.Dir.cwd().deleteFile(io,"data/test_replay_crumb.crumb") catch {};
 
     {
         var wal_log = try WriteAheadLog.init(allocator, "data/test_replay_crumb.wal", io);
@@ -424,6 +420,6 @@ test "replay with crumb resumes from correct position" {
         _ = tree3.get("key_7") orelse return error.ExpectedValueNotFound;
     }
 
-    std.fs.cwd().deleteFile("data/test_replay_crumb.wal") catch {};
-    std.fs.cwd().deleteFile("data/test_replay_crumb.crumb") catch {};
+    Io.Dir.cwd().deleteFile(io,"data/test_replay_crumb.wal") catch {};
+    Io.Dir.cwd().deleteFile(io,"data/test_replay_crumb.crumb") catch {};
 }

@@ -2,3 +2,5 @@
 zig-out/
 data/
 todo.md
+bench/results-*.md
+example.json
