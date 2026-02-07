@@ -41,6 +41,7 @@ pub const EventStore = struct {
     identity: ?[]const u8,
     contracts: []const DependencyContract,
     next_sequence: u64,
+    io: Io,
 
     pub fn init(allocator: std.mem.Allocator, wal_path: []const u8, io: Io, config: Config) !EventStore {
         const lsm_ptr = try allocator.create(LSMEngine);
@@ -72,6 +73,7 @@ pub const EventStore = struct {
             .identity = config.identity,
             .contracts = config.contracts,
             .next_sequence = next_seq,
+            .io = io,
         };
     }
 
@@ -133,7 +135,7 @@ pub const EventStore = struct {
 
         self.next_sequence += 1;
         const seq = self.next_sequence;
-        const now: i64 = @intCast((try time_mod.Instant.now()).timestamp.sec);
+        const now: i64 = @intCast(time_mod.Instant.now(self.io).timestamp.sec);
 
         var ev = try EventValue.init(self.allocator, seq, id, event_type, payload, now);
         errdefer ev.deinit(self.allocator);
@@ -271,7 +273,7 @@ test "basic operations" {
             "test-service",
             sample.event_type,
             sample.payload,
-            @truncate((try time_mod.Instant.now()).timestamp.nsec),
+            @truncate(time_mod.Instant.now(io).timestamp.nsec),
         );
         try event_store.put(sample.key, value);
     }
@@ -314,7 +316,7 @@ test "bulk inserts" {
             "test-service",
             "bulk.insert",
             payload,
-            @truncate((try time_mod.Instant.now()).timestamp.nsec),
+            @truncate(time_mod.Instant.now(io).timestamp.nsec),
         );
         try event_store.put(key, value);
     }
@@ -362,7 +364,7 @@ test "range scans" {
     };
 
     for (sample_events, 0..) |sample, i| {
-        const value = try EventValue.init(allocator, i + 2000, "test-service", sample.event_type, sample.payload, @truncate((try time_mod.Instant.now()).timestamp.nsec));
+        const value = try EventValue.init(allocator, i + 2000, "test-service", sample.event_type, sample.payload, @truncate(time_mod.Instant.now(io).timestamp.nsec));
         try event_store.put(sample.key, value);
     }
 
@@ -425,7 +427,7 @@ test "concurrent simulation" {
 
     for (operations) |op| {
         if (std.mem.eql(u8, op.operation_type, "write")) {
-            const value = try EventValue.init(allocator, sequence, "test-service", op.event_type, op.payload, @truncate((try time_mod.Instant.now()).timestamp.nsec));
+            const value = try EventValue.init(allocator, sequence, "test-service", op.event_type, op.payload, @truncate(time_mod.Instant.now(io).timestamp.nsec));
             try event_store.put(op.key, value);
             writes_performed += 1;
             sequence += 1;
@@ -483,7 +485,7 @@ test "persistence recovery" {
             "test-service",
             test_event.event_type,
             test_event.payload,
-            @truncate((try time_mod.Instant.now()).timestamp.nsec),
+            @truncate(time_mod.Instant.now(io).timestamp.nsec),
         );
         try store1.put(test_event.key, value);
     }
@@ -505,7 +507,7 @@ test "persistence recovery" {
             "test-service",
             test_event.event_type,
             test_event.payload,
-            @truncate((try time_mod.Instant.now()).timestamp.nsec),
+            @truncate(time_mod.Instant.now(io).timestamp.nsec),
         );
         try store2.put(test_event.key, value);
     }
@@ -559,7 +561,7 @@ test "edge cases" {
         "test-service",
         "",
         "",
-        @truncate((try time_mod.Instant.now()).timestamp.nsec),
+        @truncate(time_mod.Instant.now(io).timestamp.nsec),
     );
     try event_store.put("edge:empty", empty_value);
 
@@ -572,17 +574,17 @@ test "edge cases" {
         return error.EmptyValueNotFound;
     }
 
-    const long_key = try std.fmt.allocPrint(allocator, "edge:very:long:key:with:many:segments:and:even:more:segments:to:make:it:really:long:{}", .{(try time_mod.Instant.now()).timestamp.nsec});
+    const long_key = try std.fmt.allocPrint(allocator, "edge:very:long:key:with:many:segments:and:even:more:segments:to:make:it:really:long:{}", .{time_mod.Instant.now(io).timestamp.nsec});
     defer allocator.free(long_key);
 
     const long_payload = try std.fmt.allocPrint(
         allocator,
         "{{\"description\":\"This is a very long payload designed to test how the system handles large amounts of data in a single event. It contains multiple sentences and should stress test the serialization and storage mechanisms.\",\"data\":[{}]}}",
-        .{(try time_mod.Instant.now()).timestamp.nsec},
+        .{time_mod.Instant.now(io).timestamp.nsec},
     );
     defer allocator.free(long_payload);
 
-    const long_value = try EventValue.init(allocator, 6001, "test-service", "test.long_data", long_payload, @truncate((try time_mod.Instant.now()).timestamp.nsec));
+    const long_value = try EventValue.init(allocator, 6001, "test-service", "test.long_data", long_payload, @truncate(time_mod.Instant.now(io).timestamp.nsec));
     try event_store.put(long_key, long_value);
 
     if (try event_store.get(long_key)) |fv_c| {
@@ -609,7 +611,7 @@ test "edge cases" {
             "test-service",
             "test.special",
             "special payload",
-            @truncate((try time_mod.Instant.now()).timestamp.nsec),
+            @truncate(time_mod.Instant.now(io).timestamp.nsec),
         );
         try event_store.put(key, value);
     }
@@ -631,7 +633,7 @@ test "edge cases" {
         "test-service",
         "test.first",
         "first value",
-        (try time_mod.Instant.now()).timestamp.nsec,
+        time_mod.Instant.now(io).timestamp.nsec,
     );
     try event_store.put(overwrite_key, value1);
 
@@ -641,7 +643,7 @@ test "edge cases" {
         "test-service",
         "test.second",
         "second value",
-        (try time_mod.Instant.now()).timestamp.nsec,
+        time_mod.Instant.now(io).timestamp.nsec,
     );
     try event_store.put(overwrite_key, value2);
 

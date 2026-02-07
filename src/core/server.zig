@@ -138,8 +138,7 @@ pub const Server = struct {
                 }
 
                 if (pr.events.len > 0) {
-                    const now: i64 = @intCast((time_mod.Instant.now() catch
-                        return).timestamp.sec);
+                    const now: i64 = @intCast(time_mod.Instant.now(self.io).timestamp.sec);
 
                     const bc = Breadcrumb{
                         .source_service = task.source_service,

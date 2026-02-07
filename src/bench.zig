@@ -22,7 +22,7 @@ const KeyValuePair = event.KeyValuePair;
 const Message = protocol.Message;
 
 fn timestamp_ns() i64 {
-    return (time_mod.Instant.now() catch return 0).timestamp.nsec;
+    return time_mod.Instant.now(Io.Threaded.global_single_threaded.io()).timestamp.nsec;
 }
 
 fn elapsed_us(start: time_mod.Instant, end: time_mod.Instant) u64 {
@@ -68,9 +68,8 @@ const BenchLog = struct {
             else => return err,
         };
 
-        var ts: std.os.linux.timespec = undefined;
-        _ = std.os.linux.clock_gettime(.REALTIME, &ts);
-        const epoch_secs: u64 = @intCast(ts.sec);
+        const instant = time_mod.Instant.now(io);
+        const epoch_secs: u64 = @intCast(instant.timestamp.sec);
         const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
         const day = es.getEpochDay().calculateYearDay();
         const md = day.calculateMonthDay();
@@ -131,7 +130,7 @@ fn bench_wal_append(allocator: std.mem.Allocator, log: *BenchLog) !void {
     defer wal_log.deinit();
 
     const count: usize = 5_000;
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
 
     for (0..count) |i| {
         const key = try std.fmt.allocPrint(allocator, "bench:wal:{}", .{i});
@@ -147,7 +146,7 @@ fn bench_wal_append(allocator: std.mem.Allocator, log: *BenchLog) !void {
     }
 
     try wal_log.flush();
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
     log.result(allocator, "wal.append_event (5k writes + async sync)", count, elapsed_us(start, end));
 }
 
@@ -189,14 +188,15 @@ fn bench_wal_replay(allocator: std.mem.Allocator, log: *BenchLog) !void {
     var tree = try RadixTree.init(allocator);
     defer tree.deinit();
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     _ = try wal_log.replay(&tree);
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     log.result(allocator, "wal.replay (10k entries)", 10_000, elapsed_us(start, end));
 }
 
 fn bench_radix_insert(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     var tree = try RadixTree.init(allocator);
     defer tree.deinit();
 
@@ -228,17 +228,18 @@ fn bench_radix_insert(allocator: std.mem.Allocator, log: *BenchLog) !void {
         };
     }
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..count) |i| {
         try tree.insert(keys[i], vals[i]);
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     std.debug.assert(tree.size == count);
     log.result(allocator, "radix.insert (50k unique keys)", count, elapsed_us(start, end));
 }
 
 fn bench_radix_overwrite(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     var tree = try RadixTree.init(allocator);
     defer tree.deinit();
 
@@ -255,18 +256,19 @@ fn bench_radix_overwrite(allocator: std.mem.Allocator, log: *BenchLog) !void {
         keys[i] = try std.fmt.allocPrint(allocator, "ow:k{}", .{i});
     }
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..count) |i| {
         const val = try EventValue.init(allocator, i, "bench-service", "bench.overwrite", "{}", 0);
         try tree.insert(keys[i % unique_keys], val);
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     std.debug.assert(tree.size == unique_keys);
     log.result(allocator, "radix.insert (1k keys x10 overwrites)", count, elapsed_us(start, end));
 }
 
 fn bench_radix_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     var tree = try RadixTree.init(allocator);
     defer tree.deinit();
 
@@ -286,19 +288,20 @@ fn bench_radix_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const lookups: usize = 100_000;
     var found: usize = 0;
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..lookups) |i| {
         if (tree.get(keys[i % key_count])) |_| {
             found += 1;
         }
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     std.debug.assert(found == lookups);
     log.result(allocator, "radix.get (100k lookups, 10k keys)", lookups, elapsed_us(start, end));
 }
 
 fn bench_radix_get_miss(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     var tree = try RadixTree.init(allocator);
     defer tree.deinit();
 
@@ -322,19 +325,20 @@ fn bench_radix_get_miss(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const lookups: usize = 100_000;
     var misses: usize = 0;
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..lookups) |i| {
         if (tree.get(miss_keys[i % miss_key_count]) == null) {
             misses += 1;
         }
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     std.debug.assert(misses == lookups);
     log.result(allocator, "radix.get miss (100k misses)", lookups, elapsed_us(start, end));
 }
 
 fn bench_scan_prefix(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     var tree = try RadixTree.init(allocator);
     defer tree.deinit();
 
@@ -351,7 +355,7 @@ fn bench_scan_prefix(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const scans: usize = 200;
     var total_results: usize = 0;
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..scans) |i| {
         const prefix = services[i % services.len];
         var results = ArrayList(KeyValuePair){};
@@ -360,13 +364,14 @@ fn bench_scan_prefix(allocator: std.mem.Allocator, log: *BenchLog) !void {
         for (results.items) |*item| item.deinit(allocator);
         results.deinit(allocator);
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     log.result(allocator, "radix.scan_prefix (200 scans over 10k)", scans, elapsed_us(start, end));
     log.note(allocator, "    total matched results across scans: {}\n", .{total_results});
 }
 
 fn bench_scan_prefix_selectivity(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     var tree = try RadixTree.init(allocator);
     defer tree.deinit();
 
@@ -378,14 +383,14 @@ fn bench_scan_prefix_selectivity(allocator: std.mem.Allocator, log: *BenchLog) !
     }
 
     {
-        const start = try time_mod.Instant.now();
+        const start = time_mod.Instant.now(io);
         for (0..50) |_| {
             var results = ArrayList(KeyValuePair){};
             try tree.scan_prefix("sel:", &results);
             for (results.items) |*item| item.deinit(allocator);
             results.deinit(allocator);
         }
-        const end = try time_mod.Instant.now();
+        const end = time_mod.Instant.now(io);
         log.result(allocator, "scan_prefix wide  (50x, ~10k hits each)", 50, elapsed_us(start, end));
     }
 
@@ -400,14 +405,14 @@ fn bench_scan_prefix_selectivity(allocator: std.mem.Allocator, log: *BenchLog) !
             prefixes[i] = try std.fmt.allocPrint(allocator, "sel:svc:r{x:0>8}:", .{i});
         }
 
-        const start = try time_mod.Instant.now();
+        const start = time_mod.Instant.now(io);
         for (0..narrow_count) |i| {
             var results = ArrayList(KeyValuePair){};
             try tree.scan_prefix(prefixes[i], &results);
             for (results.items) |*item| item.deinit(allocator);
             results.deinit(allocator);
         }
-        const end = try time_mod.Instant.now();
+        const end = time_mod.Instant.now(io);
         log.result(allocator, "scan_prefix narrow (10k x ~1 hit each)", narrow_count, elapsed_us(start, end));
     }
 }
@@ -452,7 +457,7 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const services = [_][]const u8{ "auth", "payment", "inventory", "shipping", "analytics" };
     const event_type_names = [_][]const u8{ "created", "updated", "deleted", "processed", "failed" };
 
-    const write_start = try time_mod.Instant.now();
+    const write_start = time_mod.Instant.now(io);
     for (0..total_operations) |i| {
         const svc = services[i % services.len];
         const etn = event_type_names[i % event_type_names.len];
@@ -473,7 +478,7 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
         const value = try EventValue.init(allocator, i + 5000, "test-service", full_event_type, payload, timestamp_ns());
         try event_store.put(key, value);
     }
-    const write_end = try time_mod.Instant.now();
+    const write_end = time_mod.Instant.now(io);
     log.result(allocator, "store.put durable (10k synced writes)", total_operations, elapsed_us(write_start, write_end));
 
     const read_count: usize = 1_000;
@@ -489,7 +494,7 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
     }
 
     var found: usize = 0;
-    const read_start = try time_mod.Instant.now();
+    const read_start = time_mod.Instant.now(io);
     for (0..read_count) |i| {
         if (try event_store.get(read_keys[i])) |v| {
             var val = v;
@@ -497,11 +502,11 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
             found += 1;
         }
     }
-    const read_end = try time_mod.Instant.now();
+    const read_end = time_mod.Instant.now(io);
     log.result(allocator, "store.get (1k point reads)", read_count, elapsed_us(read_start, read_end));
     std.debug.assert(found == read_count);
 
-    const scan_start = try time_mod.Instant.now();
+    const scan_start = time_mod.Instant.now(io);
     var total_scan_results: usize = 0;
     for (services) |svc| {
         var results = try event_store.scan_range(svc);
@@ -509,13 +514,14 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
         for (results.items) |*item| item.deinit(allocator);
         results.deinit(allocator);
     }
-    const scan_end = try time_mod.Instant.now();
+    const scan_end = time_mod.Instant.now(io);
     log.result(allocator, "store.scan_range (5 prefix scans)", services.len, elapsed_us(scan_start, scan_end));
     log.note(allocator, "\n    total scan results: {}\n", .{total_scan_results});
     log.note(allocator, "    memtable entries: {}\n", .{event_store.lsm.memtableCount()});
 }
 
 fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     {
         const count: usize = 50_000;
         const msg = Message{ .handshake = .{
@@ -523,14 +529,14 @@ fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !v
             .instance_id = "node-1",
         } };
 
-        const start = try time_mod.Instant.now();
+        const start = time_mod.Instant.now(io);
         for (0..count) |_| {
             const frame = try protocol.encode(allocator, msg);
             var decoded = try protocol.decode(allocator, frame);
             protocol.deinit(&decoded, allocator);
             allocator.free(frame);
         }
-        const end = try time_mod.Instant.now();
+        const end = time_mod.Instant.now(io);
         log.result(allocator, "protocol handshake encode+decode (50k)", count, elapsed_us(start, end));
     }
 
@@ -542,14 +548,14 @@ fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !v
             .max_count = 100,
         } };
 
-        const start = try time_mod.Instant.now();
+        const start = time_mod.Instant.now(io);
         for (0..count) |_| {
             const frame = try protocol.encode(allocator, msg);
             var decoded = try protocol.decode(allocator, frame);
             protocol.deinit(&decoded, allocator);
             allocator.free(frame);
         }
-        const end = try time_mod.Instant.now();
+        const end = time_mod.Instant.now(io);
         log.result(allocator, "protocol pull_request encode+decode (50k)", count, elapsed_us(start, end));
     }
 
@@ -569,14 +575,14 @@ fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !v
 
         const msg = Message{ .pull_response = .{ .events = &entries } };
 
-        const start = try time_mod.Instant.now();
+        const start = time_mod.Instant.now(io);
         for (0..count) |_| {
             const frame = try protocol.encode(allocator, msg);
             var decoded = try protocol.decode(allocator, frame);
             protocol.deinit(&decoded, allocator);
             allocator.free(frame);
         }
-        const end = try time_mod.Instant.now();
+        const end = time_mod.Instant.now(io);
         log.result(allocator, "protocol pull_response(10 events) enc+dec (10k)", count, elapsed_us(start, end));
     }
 
@@ -598,14 +604,14 @@ fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !v
 
         const msg = Message{ .pull_response = .{ .events = entries_list } };
 
-        const start = try time_mod.Instant.now();
+        const start = time_mod.Instant.now(io);
         for (0..count) |_| {
             const frame = try protocol.encode(allocator, msg);
             var decoded = try protocol.decode(allocator, frame);
             protocol.deinit(&decoded, allocator);
             allocator.free(frame);
         }
-        const end = try time_mod.Instant.now();
+        const end = time_mod.Instant.now(io);
         log.result(allocator, "protocol pull_response(100 events) enc+dec (1k)", count, elapsed_us(start, end));
     }
 }
@@ -636,7 +642,7 @@ fn bench_transport_handshake(allocator: std.mem.Allocator, log: *BenchLog) !void
     const addr_str = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
     defer allocator.free(addr_str);
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..count) |_| {
         const conn = try transport.dial(allocator, addr_str, io);
         try conn.sendMessage(.{ .handshake = .{
@@ -647,7 +653,7 @@ fn bench_transport_handshake(allocator: std.mem.Allocator, log: *BenchLog) !void
         protocol.deinit(&resp, allocator);
         conn.destroy();
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     server_thread.join();
     log.result(allocator, "transport dial+handshake round-trip (500)", count, elapsed_us(start, end));
@@ -706,7 +712,7 @@ fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog)
     } });
 
     var total_events: usize = 0;
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..rounds) |_| {
         try conn.sendMessage(.{ .pull_request = .{
             .event_type = "order.created",
@@ -718,7 +724,7 @@ fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog)
         total_events += resp.pull_response.events.len;
         protocol.deinit(&resp, allocator);
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     server_thread.join();
     log.result(allocator, "transport pull req+resp (500 rounds, 20 events each)", rounds, elapsed_us(start, end));
@@ -755,7 +761,7 @@ fn bench_transport_message_burst(allocator: std.mem.Allocator, log: *BenchLog) !
     const conn = try transport.dial(allocator, addr_str, io);
     defer conn.destroy();
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..count) |i| {
         try conn.sendMessage(.{ .pull_request = .{
             .event_type = "order.created",
@@ -765,18 +771,19 @@ fn bench_transport_message_burst(allocator: std.mem.Allocator, log: *BenchLog) !
         var resp = try conn.recvMessage();
         protocol.deinit(&resp, allocator);
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     server_thread.join();
     log.result(allocator, "transport message echo on single conn (5k)", count, elapsed_us(start, end));
 }
 
 fn bench_memtable_insert(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     var mt = Memtable.init(allocator);
     defer mt.deinit();
 
     const count: usize = 50_000;
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
 
     for (0..count) |i| {
         const key = try std.fmt.allocPrint(allocator, "mt:k{d:0>8}", .{i});
@@ -784,13 +791,14 @@ fn bench_memtable_insert(allocator: std.mem.Allocator, log: *BenchLog) !void {
         const val = try EventValue.init(allocator, i + 1, "bench-service", "bench.insert", "{}", 0);
         try mt.insert(key, val);
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     log.result(allocator, "memtable.insert (50k sorted)", count, elapsed_us(start, end));
     log.note(allocator, "    size_bytes: {}\n", .{mt.size_bytes});
 }
 
 fn bench_memtable_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const io = Io.Threaded.global_single_threaded.io();
     var mt = Memtable.init(allocator);
     defer mt.deinit();
 
@@ -810,7 +818,7 @@ fn bench_memtable_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const lookups: usize = 100_000;
     var found: usize = 0;
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..lookups) |i| {
         if (try mt.get(allocator, keys[i % key_count])) |v| {
             var val = v;
@@ -818,7 +826,7 @@ fn bench_memtable_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
             found += 1;
         }
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     std.debug.assert(found == lookups);
     log.result(allocator, "memtable.get (100k lookups, 10k keys)", lookups, elapsed_us(start, end));
@@ -851,9 +859,9 @@ fn bench_sstable_write(allocator: std.mem.Allocator, log: *BenchLog) !void {
         };
     }
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     _ = try sstable.writeSSTable(allocator, path, io, entries);
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     log.result(allocator, "sstable.write (10k entries)", count, elapsed_us(start, end));
 }
@@ -898,7 +906,7 @@ fn bench_sstable_read(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const lookups: usize = 10_000;
     var found: usize = 0;
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..lookups) |i| {
         if (try reader.get(allocator, keys[i % count])) |v| {
             var val = v;
@@ -906,7 +914,7 @@ fn bench_sstable_read(allocator: std.mem.Allocator, log: *BenchLog) !void {
             found += 1;
         }
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     std.debug.assert(found == lookups);
     log.result(allocator, "sstable.get (10k point reads)", lookups, elapsed_us(start, end));
@@ -925,19 +933,19 @@ fn bench_lsm_put_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
     defer lsm.deinit();
 
     const write_count: usize = 10_000;
-    const write_start = try time_mod.Instant.now();
+    const write_start = time_mod.Instant.now(io);
     for (0..write_count) |i| {
         const key = try std.fmt.allocPrint(allocator, "lsm:k{d:0>8}", .{i});
         defer allocator.free(key);
         const val = try EventValue.init(allocator, i + 1, "bench-svc", "bench.put", "{}", 0);
         try lsm.put(key, val);
     }
-    const write_end = try time_mod.Instant.now();
+    const write_end = time_mod.Instant.now(io);
     log.result(allocator, "lsm.put (10k writes)", write_count, elapsed_us(write_start, write_end));
 
     const read_count: usize = 5_000;
     var found: usize = 0;
-    const read_start = try time_mod.Instant.now();
+    const read_start = time_mod.Instant.now(io);
     for (0..read_count) |i| {
         const key = try std.fmt.allocPrint(allocator, "lsm:k{d:0>8}", .{i * 2});
         defer allocator.free(key);
@@ -947,7 +955,7 @@ fn bench_lsm_put_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
             found += 1;
         }
     }
-    const read_end = try time_mod.Instant.now();
+    const read_end = time_mod.Instant.now(io);
 
     std.debug.assert(found == read_count);
     log.result(allocator, "lsm.get (5k reads, in-memtable)", read_count, elapsed_us(read_start, read_end));
@@ -974,16 +982,16 @@ fn bench_lsm_flush(allocator: std.mem.Allocator, log: *BenchLog) !void {
         try lsm.put(key, val);
     }
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     try lsm.flush();
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     log.result(allocator, "lsm.flush (10k entries -> SSTable)", 1, elapsed_us(start, end));
     log.note(allocator, "    SSTable count after flush: {}\n", .{lsm.sstableCount()});
 
     // Read after flush (from SSTable)
     var found: usize = 0;
-    const read_start = try time_mod.Instant.now();
+    const read_start = time_mod.Instant.now(io);
     for (0..1_000) |i| {
         const key = try std.fmt.allocPrint(allocator, "flush:k{d:0>8}", .{i * 10});
         defer allocator.free(key);
@@ -993,7 +1001,7 @@ fn bench_lsm_flush(allocator: std.mem.Allocator, log: *BenchLog) !void {
             found += 1;
         }
     }
-    const read_end = try time_mod.Instant.now();
+    const read_end = time_mod.Instant.now(io);
 
     std.debug.assert(found == 1_000);
     log.result(allocator, "lsm.get after flush (1k reads from SSTable)", 1_000, elapsed_us(read_start, read_end));
@@ -1035,7 +1043,7 @@ fn bench_lsm_scan(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const scans: usize = 50;
     var total_results: usize = 0;
 
-    const start = try time_mod.Instant.now();
+    const start = time_mod.Instant.now(io);
     for (0..scans) |i| {
         const prefix = services[i % services.len];
         var results = ArrayList(KeyValuePair){};
@@ -1044,7 +1052,7 @@ fn bench_lsm_scan(allocator: std.mem.Allocator, log: *BenchLog) !void {
         for (results.items) |*item| item.deinit(allocator);
         results.deinit(allocator);
     }
-    const end = try time_mod.Instant.now();
+    const end = time_mod.Instant.now(io);
 
     log.result(allocator, "lsm.scan_prefix (50 scans, cross memtable+SST)", scans, elapsed_us(start, end));
     log.note(allocator, "    total matched results: {}\n", .{total_results});
