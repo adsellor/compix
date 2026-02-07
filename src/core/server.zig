@@ -11,6 +11,7 @@ const recovery_mod = @import("recovery.zig");
 const breadcrumb_mod = @import("breadcrumb.zig");
 const contract_mod = @import("contract.zig");
 const identity_mod = @import("identity.zig");
+const time_mod = @import("time.zig");
 
 const EventStore = store_mod.EventStore;
 const EventValue = event_mod.EventValue;
@@ -137,7 +138,7 @@ pub const Server = struct {
                 }
 
                 if (pr.events.len > 0) {
-                    const now: i64 = @intCast((std.time.Instant.now() catch
+                    const now: i64 = @intCast((time_mod.Instant.now() catch
                         return).timestamp.sec);
 
                     const bc = Breadcrumb{
