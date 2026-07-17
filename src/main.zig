@@ -30,17 +30,23 @@ pub fn main(init: std.process.Init) !void {
     };
     defer event_store.deinit();
 
-    var srv = server.Server.init(allocator, &event_store, cfg.identity, cfg.contracts, io) catch |err| {
+    var srv = server.Server.init(
+        allocator,
+        &event_store,
+        cfg.identity,
+        cfg.contracts,
+        io,
+    ) catch |err| {
         std.debug.print("Failed to start server: {}\n", .{err});
         return err;
     };
     defer srv.deinit();
 
-    srv.runRecovery() catch |err| {
+    srv.run_recovery() catch |err| {
         std.debug.print("Recovery warning: {}\n", .{err});
     };
 
-    server.registerSignalHandlers();
+    server.register_signal_handlers();
 
     std.debug.print("compix: {s}/{s} ready\n", .{ cfg.identity.name, cfg.identity.instance_id });
 

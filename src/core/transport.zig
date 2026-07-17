@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 
 const Message = protocol.Message;
 
-pub fn parseAddress(address_str: []const u8) !net.IpAddress {
+pub fn parse_address(address_str: []const u8) !net.IpAddress {
     return net.IpAddress.parseLiteral(address_str) catch return error.InvalidAddress;
 }
 
@@ -35,7 +35,7 @@ pub const Connection = struct {
         return self;
     }
 
-    pub fn sendMessage(self: *Connection, msg: Message) !void {
+    pub fn send_message(self: *Connection, msg: Message) !void {
         const frame = try protocol.encode(self.allocator, msg);
         defer self.allocator.free(frame);
         try self._writer.interface.writeAll(frame);
@@ -44,12 +44,12 @@ pub const Connection = struct {
 
     /// Receive a length-prefixed frame and decode it.
     /// NOTE: Caller must call protocol.deinit on the returned message.
-    pub fn recvMessage(self: *Connection) !Message {
+    pub fn recv_message(self: *Connection) !Message {
         var len_buf: [4]u8 = undefined;
         try self._reader.interface.readSliceAll(&len_buf);
 
         const payload_len = std.mem.readInt(u32, &len_buf, .big);
-        if (payload_len > protocol.MAX_FRAME_SIZE) return error.FrameTooLarge;
+        if (payload_len > protocol.frame_size_max) return error.FrameTooLarge;
         if (payload_len < 2) return error.TruncatedFrame;
 
         const frame = try self.allocator.alloc(u8, 4 + payload_len);
@@ -73,7 +73,7 @@ pub const Listener = struct {
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, address_str: []const u8, io: Io) !Listener {
-        const addr = try parseAddress(address_str);
+        const addr = try parse_address(address_str);
         const server = try addr.listen(io, .{ .reuse_address = true });
         return .{ .server = server, .io = io, .allocator = allocator };
     }
@@ -83,7 +83,7 @@ pub const Listener = struct {
         return Connection.create(self.allocator, stream, self.io);
     }
 
-    pub fn getPort(self: *const Listener) u16 {
+    pub fn get_port(self: *const Listener) u16 {
         return self.server.socket.address.getPort();
     }
 
@@ -93,33 +93,33 @@ pub const Listener = struct {
 };
 
 pub fn dial(allocator: Allocator, address_str: []const u8, io: Io) !*Connection {
-    const addr = try parseAddress(address_str);
+    const addr = try parse_address(address_str);
     const stream = try addr.connect(io, .{ .mode = .stream });
     return Connection.create(allocator, stream, io);
 }
 
-test "parseAddress valid" {
-    const addr = try parseAddress("127.0.0.1:4200");
+test "parse_address valid" {
+    const addr = try parse_address("127.0.0.1:4200");
     try std.testing.expectEqual(@as(u16, 4200), addr.getPort());
 }
 
-test "parseAddress port 0" {
-    const addr = try parseAddress("127.0.0.1:0");
+test "parse_address port 0" {
+    const addr = try parse_address("127.0.0.1:0");
     try std.testing.expectEqual(@as(u16, 0), addr.getPort());
 }
 
-test "parseAddress no colon defaults to port 0" {
-    const addr = try parseAddress("127.0.0.1");
+test "parse_address no colon defaults to port 0" {
+    const addr = try parse_address("127.0.0.1");
     try std.testing.expectEqual(@as(u16, 0), addr.getPort());
 }
 
-test "parseAddress invalid host" {
-    const result = parseAddress("not-an-ip");
+test "parse_address invalid host" {
+    const result = parse_address("not-an-ip");
     try std.testing.expectError(error.InvalidAddress, result);
 }
 
-test "parseAddress invalid port" {
-    const result = parseAddress("127.0.0.1:abc");
+test "parse_address invalid port" {
+    const result = parse_address("127.0.0.1:abc");
     try std.testing.expectError(error.InvalidAddress, result);
 }
 
@@ -131,14 +131,14 @@ test "handshake round-trip over TCP" {
 
     var listener = try Listener.init(allocator, "127.0.0.1:0", io);
     defer listener.deinit();
-    const port = listener.getPort();
+    const port = listener.get_port();
 
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(l: *Listener) void {
             const conn = l.accept() catch return;
             defer conn.destroy();
-            var msg = conn.recvMessage() catch return;
-            conn.sendMessage(msg) catch {};
+            var msg = conn.recv_message() catch return;
+            conn.send_message(msg) catch {};
             protocol.deinit(&msg, l.allocator);
         }
     }.run, .{&listener});
@@ -149,12 +149,12 @@ test "handshake round-trip over TCP" {
     const client = try dial(allocator, addr_str, io);
     defer client.destroy();
 
-    try client.sendMessage(.{ .handshake = .{
+    try client.send_message(.{ .handshake = .{
         .service_name = "order-service",
         .instance_id = "node-1",
     } });
 
-    var response = try client.recvMessage();
+    var response = try client.recv_message();
     defer protocol.deinit(&response, allocator);
 
     try std.testing.expectEqualStrings("order-service", response.handshake.service_name);
@@ -171,21 +171,21 @@ test "pull_request and pull_response over TCP" {
 
     var listener = try Listener.init(allocator, "127.0.0.1:0", io);
     defer listener.deinit();
-    const port = listener.getPort();
+    const port = listener.get_port();
 
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(l: *Listener) void {
             const conn = l.accept() catch return;
             defer conn.destroy();
 
-            var req = conn.recvMessage() catch return;
+            var req = conn.recv_message() catch return;
             protocol.deinit(&req, l.allocator);
 
             const entries = [_]protocol.PullResponse.EventEntry{
                 .{ .key = "evt:svc:type:0001", .value = "payload-1" },
                 .{ .key = "evt:svc:type:0002", .value = "payload-2" },
             };
-            conn.sendMessage(.{ .pull_response = .{ .events = &entries } }) catch {};
+            conn.send_message(.{ .pull_response = .{ .events = &entries } }) catch {};
         }
     }.run, .{&listener});
 
@@ -195,13 +195,13 @@ test "pull_request and pull_response over TCP" {
     const client = try dial(allocator, addr_str, io);
     defer client.destroy();
 
-    try client.sendMessage(.{ .pull_request = .{
+    try client.send_message(.{ .pull_request = .{
         .event_type = "order.created",
         .from_sequence = 5,
         .max_count = 100,
     } });
 
-    var response = try client.recvMessage();
+    var response = try client.recv_message();
     defer protocol.deinit(&response, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), response.pull_response.events.len);
@@ -219,17 +219,17 @@ test "error message over TCP" {
 
     var listener = try Listener.init(allocator, "127.0.0.1:0", io);
     defer listener.deinit();
-    const port = listener.getPort();
+    const port = listener.get_port();
 
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(l: *Listener) void {
             const conn = l.accept() catch return;
             defer conn.destroy();
 
-            var msg = conn.recvMessage() catch return;
+            var msg = conn.recv_message() catch return;
             protocol.deinit(&msg, l.allocator);
 
-            conn.sendMessage(.{ .err = .{
+            conn.send_message(.{ .err = .{
                 .code = .unauthorized_event_type,
                 .message = "contract violation",
             } }) catch {};
@@ -242,12 +242,12 @@ test "error message over TCP" {
     const client = try dial(allocator, addr_str, io);
     defer client.destroy();
 
-    try client.sendMessage(.{ .handshake = .{
+    try client.send_message(.{ .handshake = .{
         .service_name = "rogue",
         .instance_id = "x",
     } });
 
-    var response = try client.recvMessage();
+    var response = try client.recv_message();
     defer protocol.deinit(&response, allocator);
 
     try std.testing.expectEqual(protocol.ErrorCode.unauthorized_event_type, response.err.code);
@@ -264,15 +264,15 @@ test "multiple messages on same connection" {
 
     var listener = try Listener.init(allocator, "127.0.0.1:0", io);
     defer listener.deinit();
-    const port = listener.getPort();
+    const port = listener.get_port();
 
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(l: *Listener) void {
             const conn = l.accept() catch return;
             defer conn.destroy();
             for (0..3) |_| {
-                var msg = conn.recvMessage() catch return;
-                conn.sendMessage(msg) catch {};
+                var msg = conn.recv_message() catch return;
+                conn.send_message(msg) catch {};
                 protocol.deinit(&msg, l.allocator);
             }
         }
@@ -286,12 +286,12 @@ test "multiple messages on same connection" {
 
     const names = [_][]const u8{ "svc-a", "svc-b", "svc-c" };
     for (names) |name| {
-        try client.sendMessage(.{ .handshake = .{
+        try client.send_message(.{ .handshake = .{
             .service_name = name,
             .instance_id = "1",
         } });
 
-        var resp = try client.recvMessage();
+        var resp = try client.recv_message();
         defer protocol.deinit(&resp, allocator);
         try std.testing.expectEqualStrings(name, resp.handshake.service_name);
     }

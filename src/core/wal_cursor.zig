@@ -22,7 +22,7 @@ pub const WalCursor = struct {
     }
 };
 
-pub fn derivePath(allocator: std.mem.Allocator, wal_path: []const u8) ![]u8 {
+pub fn derive_path(allocator: std.mem.Allocator, wal_path: []const u8) ![]u8 {
     if (std.mem.endsWith(u8, wal_path, ".wal")) {
         const base = wal_path[0 .. wal_path.len - 4];
         return try std.fmt.allocPrint(allocator, "{s}.crumb", .{base});
@@ -31,7 +31,7 @@ pub fn derivePath(allocator: std.mem.Allocator, wal_path: []const u8) ![]u8 {
 }
 
 pub fn save(allocator: std.mem.Allocator, wal_path: []const u8, cursor: WalCursor) !void {
-    const path = try derivePath(allocator, wal_path);
+    const path = try derive_path(allocator, wal_path);
     defer allocator.free(path);
 
     const dir = IoDir.cwd();
@@ -44,7 +44,7 @@ pub fn save(allocator: std.mem.Allocator, wal_path: []const u8, cursor: WalCurso
 }
 
 pub fn load(allocator: std.mem.Allocator, wal_path: []const u8) ?WalCursor {
-    const path = derivePath(allocator, wal_path) catch return null;
+    const path = derive_path(allocator, wal_path) catch return null;
     defer allocator.free(path);
 
     const dir = IoDir.cwd();
@@ -83,14 +83,14 @@ test "save/load round-trip" {
     try std.testing.expectEqual(@as(u64, 100), loaded.?.last_sequence);
 }
 
-test "derivePath replaces .wal with .crumb" {
+test "derive_path replaces .wal with .crumb" {
     const allocator = std.testing.allocator;
 
-    const path = try derivePath(allocator, "data/events.wal");
+    const path = try derive_path(allocator, "data/events.wal");
     defer allocator.free(path);
     try std.testing.expectEqualStrings("data/events.crumb", path);
 
-    const path2 = try derivePath(allocator, "data/events");
+    const path2 = try derive_path(allocator, "data/events");
     defer allocator.free(path2);
     try std.testing.expectEqualStrings("data/events.crumb", path2);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 const sstable = @import("sstable.zig");
 const SSTInfo = sstable.SSTInfo;
@@ -24,7 +25,7 @@ pub const Manifest = struct {
             .path = try allocator.dupe(u8, path),
             .file = null,
             .write_pos = 0,
-            .live = ArrayList(SSTInfo){},
+            .live = ArrayList(SSTInfo).empty,
             .version = 0,
         };
         errdefer {
@@ -55,11 +56,15 @@ pub const Manifest = struct {
         self.allocator.free(self.path);
     }
 
-    pub fn addSSTable(self: *Manifest, info: SSTInfo) !void {
+    pub fn add_sstable(self: *Manifest, info: SSTInfo) !void {
+        assert(info.id > 0);
+        assert(info.min_seq <= info.max_seq);
+        const live_before = self.live.items.len;
+
         self.version += 1;
-        const line = try formatAdd(self.allocator, self.version, info);
+        const line = try format_add(self.allocator, self.version, info);
         defer self.allocator.free(line);
-        try self.appendLine(line);
+        try self.append_line(line);
 
         try self.live.append(self.allocator, SSTInfo{
             .id = info.id,
@@ -71,27 +76,34 @@ pub const Manifest = struct {
             .max_seq = info.max_seq,
             .file_size = info.file_size,
         });
+
+        assert(self.live.items.len == live_before + 1);
     }
 
-    pub fn atomicCompaction(
+    pub fn atomic_compaction(
         self: *Manifest,
         remove_ids: []const u64,
         new_info: SSTInfo,
     ) !void {
+        assert(remove_ids.len > 0);
+        assert(new_info.id > 0);
+        const live_before = self.live.items.len;
+
         self.version += 1;
         const ver = self.version;
 
         for (remove_ids) |id| {
-            const line = try formatDel(self.allocator, ver, id);
+            const line = try format_del(self.allocator, ver, id);
             defer self.allocator.free(line);
-            try self.appendLine(line);
+            try self.append_line(line);
         }
 
-        const add_line = try formatAdd(self.allocator, ver, new_info);
+        const add_line = try format_add(self.allocator, ver, new_info);
         defer self.allocator.free(add_line);
-        try self.appendLine(add_line);
+        try self.append_line(add_line);
 
-        if (self.file) |f| f.sync(self.io) catch {};
+        const file = self.file orelse return error.InputOutput;
+        file.sync(self.io) catch return error.SyncFailed;
 
         var i: usize = 0;
         while (i < self.live.items.len) {
@@ -120,9 +132,11 @@ pub const Manifest = struct {
             .max_seq = new_info.max_seq,
             .file_size = new_info.file_size,
         });
+
+        assert(self.live.items.len == live_before - remove_ids.len + 1);
     }
 
-    pub fn getLiveSorted(self: *const Manifest, allocator: std.mem.Allocator) ![]SSTInfo {
+    pub fn get_live_sorted(self: *const Manifest, allocator: std.mem.Allocator) ![]SSTInfo {
         const copy = try allocator.alloc(SSTInfo, self.live.items.len);
         @memcpy(copy, self.live.items);
         std.mem.sort(SSTInfo, copy, {}, struct {
@@ -134,7 +148,7 @@ pub const Manifest = struct {
         return copy;
     }
 
-    pub fn countAtLevel(self: *const Manifest, level: u32) usize {
+    pub fn count_at_level(self: *const Manifest, level: u32) usize {
         var n: usize = 0;
         for (self.live.items) |s| {
             if (s.level == level) n += 1;
@@ -142,8 +156,12 @@ pub const Manifest = struct {
         return n;
     }
 
-    pub fn getIdsAtLevel(self: *const Manifest, allocator: std.mem.Allocator, level: u32) ![]u64 {
-        var ids = ArrayList(u64){};
+    pub fn get_ids_at_level(
+        self: *const Manifest,
+        allocator: std.mem.Allocator,
+        level: u32,
+    ) ![]u64 {
+        var ids = ArrayList(u64).empty;
         for (self.live.items) |s| {
             if (s.level == level) try ids.append(allocator, s.id);
         }
@@ -161,33 +179,41 @@ pub const Manifest = struct {
         var total: usize = 0;
         while (total < buf.len) {
             var iovecs = [1][]u8{buf[total..]};
-            const n = file.readPositional(self.io, &iovecs, total) catch break;
+            const n = file.readPositional(self.io, &iovecs, total) catch return error.InputOutput;
             if (n == 0) break;
             total += n;
         }
+        assert(total <= buf.len);
 
         const data = buf[0..total];
         var line_iter = std.mem.splitScalar(u8, data, '\n');
         while (line_iter.next()) |line| {
             if (line.len == 0) continue;
-            self.applyRecord(line) catch continue;
+            try self.apply_record(line);
         }
 
         self.write_pos = file_size;
     }
 
-    fn applyRecord(self: *Manifest, line: []const u8) !void {
+    fn apply_record(self: *Manifest, line: []const u8) !void {
         var iter = std.mem.splitScalar(u8, line, ' ');
         const action = iter.next() orelse return error.InvalidFormat;
 
         if (std.mem.eql(u8, action, "ADD")) {
-            const ver = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
-            const sst_id = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
-            const level = try std.fmt.parseInt(u32, iter.next() orelse return error.InvalidFormat, 10);
-            const num_entries = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
-            const min_seq = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
-            const max_seq = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
-            const file_size = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
+            const ver_str = iter.next() orelse return error.InvalidFormat;
+            const ver = try std.fmt.parseInt(u64, ver_str, 10);
+            const sst_id_str = iter.next() orelse return error.InvalidFormat;
+            const sst_id = try std.fmt.parseInt(u64, sst_id_str, 10);
+            const level_str = iter.next() orelse return error.InvalidFormat;
+            const level = try std.fmt.parseInt(u32, level_str, 10);
+            const num_entries_str = iter.next() orelse return error.InvalidFormat;
+            const num_entries = try std.fmt.parseInt(u64, num_entries_str, 10);
+            const min_seq_str = iter.next() orelse return error.InvalidFormat;
+            const min_seq = try std.fmt.parseInt(u64, min_seq_str, 10);
+            const max_seq_str = iter.next() orelse return error.InvalidFormat;
+            const max_seq = try std.fmt.parseInt(u64, max_seq_str, 10);
+            const file_size_str = iter.next() orelse return error.InvalidFormat;
+            const file_size = try std.fmt.parseInt(u64, file_size_str, 10);
             const min_key = iter.next() orelse return error.InvalidFormat;
             const max_key = iter.rest();
 
@@ -204,8 +230,10 @@ pub const Manifest = struct {
                 .file_size = file_size,
             });
         } else if (std.mem.eql(u8, action, "DEL")) {
-            const ver = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
-            const sst_id = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
+            const ver_str = iter.next() orelse return error.InvalidFormat;
+            const ver = try std.fmt.parseInt(u64, ver_str, 10);
+            const sst_id_str = iter.next() orelse return error.InvalidFormat;
+            const sst_id = try std.fmt.parseInt(u64, sst_id_str, 10);
 
             if (ver > self.version) self.version = ver;
 
@@ -222,13 +250,13 @@ pub const Manifest = struct {
         }
     }
 
-    fn appendLine(self: *Manifest, line: []const u8) !void {
+    fn append_line(self: *Manifest, line: []const u8) !void {
         const file = self.file orelse return error.InputOutput;
         file.writePositionalAll(self.io, line, self.write_pos) catch return error.InputOutput;
         self.write_pos += line.len;
     }
 
-    fn formatAdd(allocator: std.mem.Allocator, version: u64, info: SSTInfo) ![]u8 {
+    fn format_add(allocator: std.mem.Allocator, version: u64, info: SSTInfo) ![]u8 {
         return try std.fmt.allocPrint(allocator, "ADD {} {} {} {} {} {} {} {s} {s}\n", .{
             version,
             info.id,
@@ -242,7 +270,7 @@ pub const Manifest = struct {
         });
     }
 
-    fn formatDel(allocator: std.mem.Allocator, version: u64, sst_id: u64) ![]u8 {
+    fn format_del(allocator: std.mem.Allocator, version: u64, sst_id: u64) ![]u8 {
         return try std.fmt.allocPrint(allocator, "DEL {} {}\n", .{ version, sst_id });
     }
 };
@@ -262,7 +290,7 @@ test "manifest add and reload round-trip" {
         var m = try Manifest.init(allocator, path, io);
         defer m.deinit();
 
-        try m.addSSTable(.{
+        try m.add_sstable(.{
             .id = 1,
             .level = 0,
             .min_key = "aaa",
@@ -273,7 +301,7 @@ test "manifest add and reload round-trip" {
             .file_size = 4096,
         });
 
-        try m.addSSTable(.{
+        try m.add_sstable(.{
             .id = 2,
             .level = 0,
             .min_key = "bbb",
@@ -311,7 +339,7 @@ test "manifest atomic compaction" {
     defer m.deinit();
 
     for (1..4) |i| {
-        try m.addSSTable(.{
+        try m.add_sstable(.{
             .id = i,
             .level = 0,
             .min_key = "a",
@@ -322,10 +350,10 @@ test "manifest atomic compaction" {
             .file_size = 4096,
         });
     }
-    try std.testing.expectEqual(@as(usize, 3), m.countAtLevel(0));
+    try std.testing.expectEqual(@as(usize, 3), m.count_at_level(0));
 
     const remove_ids = [_]u64{ 1, 2, 3 };
-    try m.atomicCompaction(&remove_ids, .{
+    try m.atomic_compaction(&remove_ids, .{
         .id = 4,
         .level = 1,
         .min_key = "a",
@@ -336,8 +364,8 @@ test "manifest atomic compaction" {
         .file_size = 12000,
     });
 
-    try std.testing.expectEqual(@as(usize, 0), m.countAtLevel(0));
-    try std.testing.expectEqual(@as(usize, 1), m.countAtLevel(1));
+    try std.testing.expectEqual(@as(usize, 0), m.count_at_level(0));
+    try std.testing.expectEqual(@as(usize, 1), m.count_at_level(1));
     try std.testing.expectEqual(@as(usize, 1), m.live.items.len);
     try std.testing.expectEqual(@as(u64, 4), m.live.items[0].id);
 }
@@ -357,7 +385,7 @@ test "manifest reload after compaction" {
         var m = try Manifest.init(allocator, path, io);
         defer m.deinit();
 
-        try m.addSSTable(.{
+        try m.add_sstable(.{
             .id = 1,
             .level = 0,
             .min_key = "a",
@@ -367,7 +395,7 @@ test "manifest reload after compaction" {
             .max_seq = 50,
             .file_size = 2000,
         });
-        try m.addSSTable(.{
+        try m.add_sstable(.{
             .id = 2,
             .level = 0,
             .min_key = "n",
@@ -379,7 +407,7 @@ test "manifest reload after compaction" {
         });
 
         const remove = [_]u64{ 1, 2 };
-        try m.atomicCompaction(&remove, .{
+        try m.atomic_compaction(&remove, .{
             .id = 3,
             .level = 1,
             .min_key = "a",
@@ -401,7 +429,7 @@ test "manifest reload after compaction" {
     }
 }
 
-test "manifest getLiveSorted" {
+test "manifest get_live_sorted" {
     const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
@@ -415,7 +443,7 @@ test "manifest getLiveSorted" {
     var m = try Manifest.init(allocator, path, io);
     defer m.deinit();
 
-    try m.addSSTable(.{
+    try m.add_sstable(.{
         .id = 1,
         .level = 0,
         .min_key = "a",
@@ -425,7 +453,7 @@ test "manifest getLiveSorted" {
         .max_seq = 10,
         .file_size = 100,
     });
-    try m.addSSTable(.{
+    try m.add_sstable(.{
         .id = 2,
         .level = 1,
         .min_key = "a",
@@ -435,7 +463,7 @@ test "manifest getLiveSorted" {
         .max_seq = 20,
         .file_size = 200,
     });
-    try m.addSSTable(.{
+    try m.add_sstable(.{
         .id = 3,
         .level = 0,
         .min_key = "a",
@@ -446,7 +474,7 @@ test "manifest getLiveSorted" {
         .file_size = 50,
     });
 
-    const sorted = try m.getLiveSorted(allocator);
+    const sorted = try m.get_live_sorted(allocator);
     defer allocator.free(sorted);
 
     try std.testing.expectEqual(@as(u64, 3), sorted[0].id);

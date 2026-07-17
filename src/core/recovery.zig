@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 const breadcrumb_mod = @import("breadcrumb.zig");
 const contract_mod = @import("contract.zig");
@@ -20,12 +21,12 @@ pub const RecoveryTask = struct {
 
 /// Pure computation: given dependency contracts and known breadcrumbs, produce
 /// a list of recovery tasks describing what data needs to be fetched from peers.
-pub fn computeRecoveryPlan(
+pub fn compute_recovery_plan(
     allocator: std.mem.Allocator,
     contracts: []const DependencyContract,
     breadcrumbs: []const Breadcrumb,
 ) !ArrayList(RecoveryTask) {
-    var tasks = ArrayList(RecoveryTask){};
+    var tasks = ArrayList(RecoveryTask).empty;
     errdefer {
         for (tasks.items) |*t| t.deinit(allocator);
         tasks.deinit(allocator);
@@ -44,6 +45,7 @@ pub fn computeRecoveryPlan(
             }
 
             const from_seq: u64 = if (found) |bc| bc.last_sequence + 1 else 0;
+            if (found) |bc| assert(from_seq > bc.last_sequence);
 
             try tasks.append(allocator, RecoveryTask{
                 .peer_address = try allocator.dupe(u8, contract.peer_address),
@@ -54,10 +56,14 @@ pub fn computeRecoveryPlan(
         }
     }
 
+    var event_types_total: usize = 0;
+    for (contracts) |contract| event_types_total += contract.event_types.len;
+    assert(tasks.items.len == event_types_total);
+
     return tasks;
 }
 
-test "computeRecoveryPlan with no breadcrumbs creates tasks from seq 0" {
+test "compute_recovery_plan with no breadcrumbs creates tasks from seq 0" {
     const allocator = std.testing.allocator;
 
     const contracts = [_]DependencyContract{
@@ -71,7 +77,7 @@ test "computeRecoveryPlan with no breadcrumbs creates tasks from seq 0" {
 
     const breadcrumbs = [_]Breadcrumb{};
 
-    var tasks = try computeRecoveryPlan(allocator, &contracts, &breadcrumbs);
+    var tasks = try compute_recovery_plan(allocator, &contracts, &breadcrumbs);
     defer {
         for (tasks.items) |*t| t.deinit(allocator);
         tasks.deinit(allocator);
@@ -84,7 +90,7 @@ test "computeRecoveryPlan with no breadcrumbs creates tasks from seq 0" {
     try std.testing.expectEqual(@as(u64, 0), tasks.items[1].from_sequence);
 }
 
-test "computeRecoveryPlan with partial breadcrumbs fills gaps" {
+test "compute_recovery_plan with partial breadcrumbs fills gaps" {
     const allocator = std.testing.allocator;
 
     const contracts = [_]DependencyContract{
@@ -106,7 +112,7 @@ test "computeRecoveryPlan with partial breadcrumbs fills gaps" {
         },
     };
 
-    var tasks = try computeRecoveryPlan(allocator, &contracts, &breadcrumbs);
+    var tasks = try compute_recovery_plan(allocator, &contracts, &breadcrumbs);
     defer {
         for (tasks.items) |*t| t.deinit(allocator);
         tasks.deinit(allocator);
@@ -121,7 +127,7 @@ test "computeRecoveryPlan with partial breadcrumbs fills gaps" {
     try std.testing.expectEqual(@as(u64, 0), tasks.items[1].from_sequence);
 }
 
-test "computeRecoveryPlan with multiple contracts" {
+test "compute_recovery_plan with multiple contracts" {
     const allocator = std.testing.allocator;
 
     const contracts = [_]DependencyContract{
@@ -156,7 +162,7 @@ test "computeRecoveryPlan with multiple contracts" {
         },
     };
 
-    var tasks = try computeRecoveryPlan(allocator, &contracts, &breadcrumbs);
+    var tasks = try compute_recovery_plan(allocator, &contracts, &breadcrumbs);
     defer {
         for (tasks.items) |*t| t.deinit(allocator);
         tasks.deinit(allocator);
@@ -169,13 +175,13 @@ test "computeRecoveryPlan with multiple contracts" {
     try std.testing.expectEqualStrings("10.0.0.6:4200", tasks.items[1].peer_address);
 }
 
-test "computeRecoveryPlan with no contracts returns empty" {
+test "compute_recovery_plan with no contracts returns empty" {
     const allocator = std.testing.allocator;
 
     const contracts = [_]DependencyContract{};
     const breadcrumbs = [_]Breadcrumb{};
 
-    var tasks = try computeRecoveryPlan(allocator, &contracts, &breadcrumbs);
+    var tasks = try compute_recovery_plan(allocator, &contracts, &breadcrumbs);
     defer tasks.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), tasks.items.len);

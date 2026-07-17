@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 pub const EventValue = struct {
     sequence: u64,
@@ -25,7 +26,13 @@ pub const EventValue = struct {
     }
 
     pub fn serialize(self: *const EventValue, allocator: std.mem.Allocator) ![]u8 {
-        return try std.fmt.allocPrint(allocator, "{}|{}|{}|{s}|{s}|{s}", .{
+        // The origin_service and event_type fields are delimiter-separated, so
+        // they must never contain the delimiter; payload length is encoded, so
+        // the payload may.
+        assert(std.mem.indexOfScalar(u8, self.origin_service, '|') == null);
+        assert(std.mem.indexOfScalar(u8, self.event_type, '|') == null);
+
+        const serialized = try std.fmt.allocPrint(allocator, "{}|{}|{}|{s}|{s}|{s}", .{
             self.sequence,
             self.timestamp,
             self.payload.len,
@@ -33,13 +40,18 @@ pub const EventValue = struct {
             self.event_type,
             self.payload,
         });
+        assert(serialized.len >= 5 + self.payload.len);
+        return serialized;
     }
 
     pub fn deserialize(allocator: std.mem.Allocator, data: []const u8) !EventValue {
         var iter = std.mem.splitSequence(u8, data, "|");
-        const sequence = try std.fmt.parseInt(u64, iter.next() orelse return error.InvalidFormat, 10);
-        const timestamp = try std.fmt.parseInt(i64, iter.next() orelse return error.InvalidFormat, 10);
-        const payload_len = try std.fmt.parseInt(usize, iter.next() orelse return error.InvalidFormat, 10);
+        const sequence_str = iter.next() orelse return error.InvalidFormat;
+        const sequence = try std.fmt.parseInt(u64, sequence_str, 10);
+        const timestamp_str = iter.next() orelse return error.InvalidFormat;
+        const timestamp = try std.fmt.parseInt(i64, timestamp_str, 10);
+        const payload_len_str = iter.next() orelse return error.InvalidFormat;
+        const payload_len = try std.fmt.parseInt(usize, payload_len_str, 10);
         const origin_service = iter.next() orelse return error.InvalidFormat;
         const event_type = iter.next() orelse return error.InvalidFormat;
         const payload_raw = iter.rest();
@@ -76,7 +88,14 @@ pub const KeyValuePair = struct {
 test "serialize/deserialize round-trip with origin_service" {
     const allocator = std.testing.allocator;
 
-    var ev = try EventValue.init(allocator, 42, "order-service", "order.created", "{\"id\":123}", 1700000000);
+    var ev = try EventValue.init(
+        allocator,
+        42,
+        "order-service",
+        "order.created",
+        "{\"id\":123}",
+        1700000000,
+    );
     defer ev.deinit(allocator);
 
     const serialized = try ev.serialize(allocator);

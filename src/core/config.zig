@@ -56,10 +56,10 @@ pub fn load(allocator: Allocator, path: []const u8, io: Io) !LoadedConfig {
 
     _ = try file.readPositionalAll(io, data, 0);
 
-    return loadFromSlice(allocator, data);
+    return load_from_slice(allocator, data);
 }
 
-pub fn loadFromSlice(allocator: Allocator, data: []const u8) !LoadedConfig {
+pub fn load_from_slice(allocator: Allocator, data: []const u8) !LoadedConfig {
     const parsed = try std.json.parseFromSlice(ServiceConfig, allocator, data, .{
         .allocate = .alloc_always,
     });
@@ -67,7 +67,12 @@ pub fn loadFromSlice(allocator: Allocator, data: []const u8) !LoadedConfig {
 
     const cfg = parsed.value;
 
-    var identity = try ServiceIdentity.init(allocator, cfg.service_name, cfg.instance_id, cfg.listen_address);
+    var identity = try ServiceIdentity.init(
+        allocator,
+        cfg.service_name,
+        cfg.instance_id,
+        cfg.listen_address,
+    );
     errdefer identity.deinit(allocator);
 
     const contracts = try allocator.alloc(DependencyContract, cfg.contracts.len);
@@ -138,7 +143,7 @@ test "parse valid config" {
         \\}
     ;
 
-    var cfg = try loadFromSlice(allocator, json);
+    var cfg = try load_from_slice(allocator, json);
     defer cfg.deinit();
 
     try std.testing.expectEqualStrings("order-service", cfg.identity.name);
@@ -168,7 +173,7 @@ test "empty contracts array is valid" {
         \\}
     ;
 
-    var cfg = try loadFromSlice(allocator, json);
+    var cfg = try load_from_slice(allocator, json);
     defer cfg.deinit();
 
     try std.testing.expectEqualStrings("standalone", cfg.identity.name);
@@ -188,7 +193,7 @@ test "missing required fields produce an error" {
         \\}
     ;
 
-    const result = loadFromSlice(allocator, json);
+    const result = load_from_slice(allocator, json);
     try std.testing.expect(std.meta.isError(result));
 }
 
@@ -216,7 +221,7 @@ test "multiple contracts parsed correctly" {
         \\}
     ;
 
-    var cfg = try loadFromSlice(allocator, json);
+    var cfg = try load_from_slice(allocator, json);
     defer cfg.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), cfg.contracts.len);

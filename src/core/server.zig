@@ -23,13 +23,13 @@ const log = std.log.scoped(.server);
 
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-fn handleSignal(_: std.posix.SIG) callconv(.c) void {
+fn handle_signal(_: std.posix.SIG) callconv(.c) void {
     shutdown_requested.store(true, .release);
 }
 
-pub inline fn registerSignalHandlers() void {
+pub inline fn register_signal_handlers() void {
     const act = std.posix.Sigaction{
-        .handler = .{ .handler = handleSignal },
+        .handler = .{ .handler = handle_signal },
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
@@ -72,14 +72,18 @@ pub const Server = struct {
     /// Run startup recovery: compute recovery plan from breadcrumbs,
     /// connect to each peer, send PullRequest, ingest responses,
     /// update breadcrumbs.
-    pub fn runRecovery(self: *Server) !void {
+    pub fn run_recovery(self: *Server) !void {
         var breadcrumbs = try self.store.get_breadcrumbs();
         defer {
             for (breadcrumbs.items) |*bc| bc.deinit(self.allocator);
             breadcrumbs.deinit(self.allocator);
         }
 
-        var tasks = try recovery_mod.computeRecoveryPlan(self.allocator, self.contracts, breadcrumbs.items);
+        var tasks = try recovery_mod.compute_recovery_plan(
+            self.allocator,
+            self.contracts,
+            breadcrumbs.items,
+        );
         defer {
             for (tasks.items) |*t| t.deinit(self.allocator);
             tasks.deinit(self.allocator);
@@ -94,31 +98,38 @@ pub const Server = struct {
         var errors_skipped: usize = 0;
 
         for (tasks.items) |task| {
-            self.executeRecoveryTask(task, &total_ingested) catch {
+            self.execute_recovery_task(task, &total_ingested) catch {
                 errors_skipped += 1;
                 continue;
             };
         }
 
-        log.info("recovery complete: {d} events ingested, {d} tasks skipped", .{ total_ingested, errors_skipped });
+        log.info("recovery complete: {d} events ingested, {d} tasks skipped", .{
+            total_ingested,
+            errors_skipped,
+        });
     }
 
-    fn executeRecoveryTask(self: *Server, task: recovery_mod.RecoveryTask, total_ingested: *usize) !void {
+    fn execute_recovery_task(
+        self: *Server,
+        task: recovery_mod.RecoveryTask,
+        total_ingested: *usize,
+    ) !void {
         const conn = try transport.dial(self.allocator, task.peer_address, self.io);
         defer conn.destroy();
 
-        try conn.sendMessage(.{ .handshake = .{
+        try conn.send_message(.{ .handshake = .{
             .service_name = self.identity.name,
             .instance_id = self.identity.instance_id,
         } });
 
-        try conn.sendMessage(.{ .pull_request = .{
+        try conn.send_message(.{ .pull_request = .{
             .event_type = task.event_type,
             .from_sequence = task.from_sequence,
             .max_count = 0,
         } });
 
-        var response = try conn.recvMessage();
+        var response = try conn.recv_message();
         defer protocol.deinit(&response, self.allocator);
 
         switch (response) {
@@ -126,11 +137,21 @@ pub const Server = struct {
                 var highest_seq: u64 = if (task.from_sequence > 0) task.from_sequence - 1 else 0;
 
                 for (pr.events) |entry| {
-                    var ev = EventValue.deserialize(self.allocator, entry.value) catch continue;
+                    var ev = EventValue.deserialize(self.allocator, entry.value) catch |err| {
+                        log.warn("recovery: corrupt event from {s}: {}", .{
+                            task.peer_address,
+                            err,
+                        });
+                        continue;
+                    };
 
                     if (ev.sequence > highest_seq) highest_seq = ev.sequence;
 
-                    self.store.ingest_event(ev) catch {
+                    self.store.ingest_event(ev) catch |err| {
+                        log.warn("recovery: rejected event from {s}: {}", .{
+                            task.peer_address,
+                            err,
+                        });
                         ev.deinit(self.allocator);
                         continue;
                     };
@@ -147,7 +168,7 @@ pub const Server = struct {
                         .peer_address = task.peer_address,
                         .updated_at = now,
                     };
-                    self.store.put_breadcrumb(bc, highest_seq, self.identity.name, now) catch {};
+                    try self.store.put_breadcrumb(bc, highest_seq, self.identity.name, now);
                 }
             },
             .err => |e| {
@@ -158,8 +179,8 @@ pub const Server = struct {
         }
     }
 
-    pub fn handleConnection(self: *Server, conn: *transport.Connection) void {
-        var hs_msg = conn.recvMessage() catch return;
+    pub fn handle_connection(self: *Server, conn: *transport.Connection) void {
+        var hs_msg = conn.recv_message() catch return;
 
         switch (hs_msg) {
             .handshake => |h| {
@@ -168,20 +189,22 @@ pub const Server = struct {
             },
             else => {
                 protocol.deinit(&hs_msg, self.allocator);
-                conn.sendMessage(.{ .err = .{
+                conn.send_message(.{ .err = .{
                     .code = .invalid_message,
                     .message = "expected handshake",
-                } }) catch {};
+                } }) catch |err| {
+                    log.warn("failed to send error reply: {}", .{err});
+                };
                 return;
             },
         }
 
         while (true) {
-            var msg = conn.recvMessage() catch return;
+            var msg = conn.recv_message() catch return;
 
             switch (msg) {
                 .pull_request => |req| {
-                    self.servePullRequest(conn, req) catch {
+                    self.serve_pull_request(conn, req) catch {
                         protocol.deinit(&msg, self.allocator);
                         return;
                     };
@@ -190,31 +213,42 @@ pub const Server = struct {
                 .put_event => |pe| {
                     const result = self.store.put_event_local(pe.event_type, pe.payload) catch {
                         protocol.deinit(&msg, self.allocator);
-                        conn.sendMessage(.{ .err = .{
+                        conn.send_message(.{ .err = .{
                             .code = .internal_error,
                             .message = "failed to store event",
                         } }) catch return;
                         continue;
                     };
                     protocol.deinit(&msg, self.allocator);
-                    conn.sendMessage(.{ .put_event_response = .{
+                    conn.send_message(.{ .put_event_response = .{
                         .sequence = result.sequence,
                         .timestamp = result.timestamp,
                     } }) catch return;
                 },
                 else => {
                     protocol.deinit(&msg, self.allocator);
-                    conn.sendMessage(.{ .err = .{
+                    conn.send_message(.{ .err = .{
                         .code = .invalid_message,
                         .message = "unexpected message type",
-                    } }) catch {};
+                    } }) catch |err| {
+                        log.warn("failed to send error reply: {}", .{err});
+                        return;
+                    };
                 },
             }
         }
     }
 
-    fn servePullRequest(self: *Server, conn: *transport.Connection, req: protocol.PullRequest) !void {
-        var events = try self.store.query_events(self.identity.name, req.event_type, req.from_sequence);
+    fn serve_pull_request(
+        self: *Server,
+        conn: *transport.Connection,
+        req: protocol.PullRequest,
+    ) !void {
+        var events = try self.store.query_events(
+            self.identity.name,
+            req.event_type,
+            req.from_sequence,
+        );
         defer {
             for (events.items) |*v| v.deinit(self.allocator);
             events.deinit(self.allocator);
@@ -231,7 +265,12 @@ pub const Server = struct {
         }
 
         for (events.items) |*ev| {
-            const key = try store_mod.makeEventKey(self.allocator, ev.origin_service, ev.event_type, ev.sequence);
+            const key = try store_mod.make_event_key(
+                self.allocator,
+                ev.origin_service,
+                ev.event_type,
+                ev.sequence,
+            );
             errdefer self.allocator.free(key);
             const value = try ev.serialize(self.allocator);
 
@@ -239,7 +278,7 @@ pub const Server = struct {
             built += 1;
         }
 
-        try conn.sendMessage(.{ .pull_response = .{ .events = entries[0..built] } });
+        try conn.send_message(.{ .pull_response = .{ .events = entries[0..built] } });
     }
 
     pub fn serve(self: *Server) !void {
@@ -251,7 +290,7 @@ pub const Server = struct {
                 log.warn("accept error: {}", .{err});
                 continue;
             };
-            self.handleConnection(conn);
+            self.handle_connection(conn);
             conn.destroy();
         }
     }
@@ -274,7 +313,7 @@ test "recovery ingests events from peer" {
     // Start a mock peer that serves events
     var peer_listener = try transport.Listener.init(allocator, "127.0.0.1:0", io);
     defer peer_listener.deinit();
-    const peer_port = peer_listener.getPort();
+    const peer_port = peer_listener.get_port();
 
     const peer_addr = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{peer_port});
     defer allocator.free(peer_addr);
@@ -286,19 +325,25 @@ test "recovery ingests events from peer" {
             defer conn.destroy();
 
             // Receive handshake
-            var hs = conn.recvMessage() catch return;
+            var hs = conn.recv_message() catch return;
             protocol.deinit(&hs, l.allocator);
 
             // Receive pull request
-            var req = conn.recvMessage() catch return;
+            var req = conn.recv_message() catch return;
             protocol.deinit(&req, l.allocator);
 
             // Send 2 events
             const entries = [_]protocol.PullResponse.EventEntry{
-                .{ .key = "evt:order-service:order.created:0000000000000001", .value = "1|100|2|order-service|order.created|{}" },
-                .{ .key = "evt:order-service:order.created:0000000000000002", .value = "2|200|2|order-service|order.created|{}" },
+                .{
+                    .key = "evt:order-service:order.created:0000000000000001",
+                    .value = "1|100|2|order-service|order.created|{}",
+                },
+                .{
+                    .key = "evt:order-service:order.created:0000000000000002",
+                    .value = "2|200|2|order-service|order.created|{}",
+                },
             };
-            conn.sendMessage(.{ .pull_response = .{ .events = &entries } }) catch {};
+            conn.send_message(.{ .pull_response = .{ .events = &entries } }) catch {};
         }
     }.run, .{&peer_listener});
 
@@ -330,7 +375,7 @@ test "recovery ingests events from peer" {
     var srv = try Server.init(allocator, &event_store, identity, &contracts, io);
     defer srv.deinit();
 
-    try srv.runRecovery();
+    try srv.run_recovery();
 
     peer_thread.join();
 
@@ -345,7 +390,7 @@ test "recovery ingests events from peer" {
     try std.testing.expectEqual(@as(u64, 2), results.items[1].sequence);
 }
 
-test "handleConnection serves PullRequest" {
+test "handle_connection serves PullRequest" {
     const allocator = std.testing.allocator;
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -369,7 +414,14 @@ test "handleConnection serves PullRequest" {
     for (1..4) |i| {
         const payload = try std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{i});
         defer allocator.free(payload);
-        const ev = try EventValue.init(allocator, i, "my-service", "order.created", payload, @intCast(i * 100));
+        const ev = try EventValue.init(
+            allocator,
+            i,
+            "my-service",
+            "order.created",
+            payload,
+            @intCast(i * 100),
+        );
         try event_store.put_event(ev);
     }
 
@@ -382,14 +434,14 @@ test "handleConnection serves PullRequest" {
     var srv = try Server.init(allocator, &event_store, identity, &.{}, io);
     defer srv.deinit();
 
-    const port = srv.listener.getPort();
+    const port = srv.listener.get_port();
 
     // Server thread: accept one connection and handle it
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(s: *Server) void {
             const conn = s.listener.accept() catch return;
             defer conn.destroy();
-            s.handleConnection(conn);
+            s.handle_connection(conn);
         }
     }.run, .{&srv});
 
@@ -399,18 +451,18 @@ test "handleConnection serves PullRequest" {
 
     const client = try transport.dial(allocator, addr_str, io);
 
-    try client.sendMessage(.{ .handshake = .{
+    try client.send_message(.{ .handshake = .{
         .service_name = "test-client",
         .instance_id = "c-1",
     } });
 
-    try client.sendMessage(.{ .pull_request = .{
+    try client.send_message(.{ .pull_request = .{
         .event_type = "order.created",
         .from_sequence = 0,
         .max_count = 0,
     } });
 
-    var response = try client.recvMessage();
+    var response = try client.recv_message();
     defer protocol.deinit(&response, allocator);
 
     try std.testing.expectEqual(@as(usize, 3), response.pull_response.events.len);
@@ -465,7 +517,7 @@ test "recovery skips unreachable peers" {
     defer srv.deinit();
 
     // Should not error — unreachable peers are skipped
-    try srv.runRecovery();
+    try srv.run_recovery();
 
     // Store should have no events (nothing was ingested)
     var results = try event_store.query_events("order-service", "order.created", 0);
@@ -473,7 +525,7 @@ test "recovery skips unreachable peers" {
     try std.testing.expectEqual(@as(usize, 0), results.items.len);
 }
 
-test "handleConnection accepts PutEvent and returns sequence" {
+test "handle_connection accepts PutEvent and returns sequence" {
     const allocator = std.testing.allocator;
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -500,13 +552,13 @@ test "handleConnection accepts PutEvent and returns sequence" {
     var srv = try Server.init(allocator, &event_store, identity, &.{}, io);
     defer srv.deinit();
 
-    const port = srv.listener.getPort();
+    const port = srv.listener.get_port();
 
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(s: *Server) void {
             const conn = s.listener.accept() catch return;
             defer conn.destroy();
-            s.handleConnection(conn);
+            s.handle_connection(conn);
         }
     }.run, .{&srv});
 
@@ -515,18 +567,18 @@ test "handleConnection accepts PutEvent and returns sequence" {
 
     const client = try transport.dial(allocator, addr_str, io);
 
-    try client.sendMessage(.{ .handshake = .{
+    try client.send_message(.{ .handshake = .{
         .service_name = "test-client",
         .instance_id = "c-1",
     } });
 
     for (0..3) |_| {
-        try client.sendMessage(.{ .put_event = .{
+        try client.send_message(.{ .put_event = .{
             .event_type = "order.created",
             .payload = "{\"item\":\"widget\"}",
         } });
 
-        var response = try client.recvMessage();
+        var response = try client.recv_message();
         defer protocol.deinit(&response, allocator);
 
         try std.testing.expect(response.put_event_response.sequence > 0);

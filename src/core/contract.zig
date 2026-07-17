@@ -9,18 +9,16 @@ pub const DependencyContract = struct {
     retention_hint: ?u64,
 
     /// Returns true if this contract covers the given breadcrumb's source_service and event_type.
-    pub fn matchesBreadcrumb(self: *const DependencyContract, bc: Breadcrumb) bool {
-        if (!std.mem.eql(u8, self.source_service, bc.source_service)) return false;
-        for (self.event_types) |et| {
-            if (std.mem.eql(u8, et, bc.event_type)) return true;
-        }
-        return false;
+    pub fn matches_breadcrumb(self: *const DependencyContract, bc: Breadcrumb) bool {
+        return self.matches_event(bc.source_service, bc.event_type);
     }
 
     /// Returns true if this contract covers the given (origin, event_type) pair.
-    /// NOTE: This is teh same logic as matchesBreadcrumb with different arguments
-    /// maybe this can be refactored
-    pub fn matchesEvent(self: *const DependencyContract, origin: []const u8, event_type: []const u8) bool {
+    pub fn matches_event(
+        self: *const DependencyContract,
+        origin: []const u8,
+        event_type: []const u8,
+    ) bool {
         if (!std.mem.eql(u8, self.source_service, origin)) return false;
         for (self.event_types) |et| {
             if (std.mem.eql(u8, et, event_type)) return true;
@@ -29,7 +27,7 @@ pub const DependencyContract = struct {
     }
 };
 
-test "matchesBreadcrumb matches correct source and type" {
+test "matches_breadcrumb matches correct source and type" {
     const contract = DependencyContract{
         .source_service = "order-service",
         .event_types = &[_][]const u8{ "order.created", "order.updated" },
@@ -44,7 +42,7 @@ test "matchesBreadcrumb matches correct source and type" {
         .peer_address = "10.0.0.5:4200",
         .updated_at = 100,
     };
-    try std.testing.expect(contract.matchesBreadcrumb(matching));
+    try std.testing.expect(contract.matches_breadcrumb(matching));
 
     const matching2 = Breadcrumb{
         .source_service = "order-service",
@@ -53,10 +51,10 @@ test "matchesBreadcrumb matches correct source and type" {
         .peer_address = "10.0.0.5:4200",
         .updated_at = 200,
     };
-    try std.testing.expect(contract.matchesBreadcrumb(matching2));
+    try std.testing.expect(contract.matches_breadcrumb(matching2));
 }
 
-test "matchesBreadcrumb rejects wrong source" {
+test "matches_breadcrumb rejects wrong source" {
     const contract = DependencyContract{
         .source_service = "order-service",
         .event_types = &[_][]const u8{"order.created"},
@@ -71,10 +69,10 @@ test "matchesBreadcrumb rejects wrong source" {
         .peer_address = "10.0.0.5:4200",
         .updated_at = 100,
     };
-    try std.testing.expect(!contract.matchesBreadcrumb(wrong_source));
+    try std.testing.expect(!contract.matches_breadcrumb(wrong_source));
 }
 
-test "matchesBreadcrumb rejects wrong event type" {
+test "matches_breadcrumb rejects wrong event type" {
     const contract = DependencyContract{
         .source_service = "order-service",
         .event_types = &[_][]const u8{"order.created"},
@@ -89,10 +87,10 @@ test "matchesBreadcrumb rejects wrong event type" {
         .peer_address = "10.0.0.5:4200",
         .updated_at = 100,
     };
-    try std.testing.expect(!contract.matchesBreadcrumb(wrong_type));
+    try std.testing.expect(!contract.matches_breadcrumb(wrong_type));
 }
 
-test "matchesEvent matches correct origin and type" {
+test "matches_event matches correct origin and type" {
     const contract = DependencyContract{
         .source_service = "order-service",
         .event_types = &[_][]const u8{ "order.created", "order.updated" },
@@ -100,11 +98,11 @@ test "matchesEvent matches correct origin and type" {
         .retention_hint = null,
     };
 
-    try std.testing.expect(contract.matchesEvent("order-service", "order.created"));
-    try std.testing.expect(contract.matchesEvent("order-service", "order.updated"));
+    try std.testing.expect(contract.matches_event("order-service", "order.created"));
+    try std.testing.expect(contract.matches_event("order-service", "order.updated"));
 }
 
-test "matchesEvent rejects wrong origin" {
+test "matches_event rejects wrong origin" {
     const contract = DependencyContract{
         .source_service = "order-service",
         .event_types = &[_][]const u8{"order.created"},
@@ -112,10 +110,10 @@ test "matchesEvent rejects wrong origin" {
         .retention_hint = null,
     };
 
-    try std.testing.expect(!contract.matchesEvent("user-service", "order.created"));
+    try std.testing.expect(!contract.matches_event("user-service", "order.created"));
 }
 
-test "matchesEvent rejects wrong event type" {
+test "matches_event rejects wrong event type" {
     const contract = DependencyContract{
         .source_service = "order-service",
         .event_types = &[_][]const u8{"order.created"},
@@ -123,5 +121,5 @@ test "matchesEvent rejects wrong event type" {
         .retention_hint = null,
     };
 
-    try std.testing.expect(!contract.matchesEvent("order-service", "order.deleted"));
+    try std.testing.expect(!contract.matches_event("order-service", "order.deleted"));
 }

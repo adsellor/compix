@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 const sstable = @import("sstable.zig");
 const RawEntry = sstable.RawEntry;
@@ -16,7 +17,7 @@ pub const MergeIterator = struct {
         current_key: ?[]u8,
         current_value: ?[]u8,
 
-        fn freeCurrentEntry(self: *Source, allocator: std.mem.Allocator) void {
+        fn free_current_entry(self: *Source, allocator: std.mem.Allocator) void {
             if (self.current_key) |k| allocator.free(k);
             if (self.current_value) |v| allocator.free(v);
             self.current_key = null;
@@ -29,12 +30,13 @@ pub const MergeIterator = struct {
         readers: []*SSTableReader,
         sst_ids: []const u64,
     ) !MergeIterator {
+        assert(readers.len == sst_ids.len);
         const sources = try allocator.alloc(Source, readers.len);
         errdefer allocator.free(sources);
 
         for (readers, 0..) |reader, i| {
             sources[i] = Source{
-                .iter = reader.rawIterator(),
+                .iter = reader.raw_iterator(),
                 .sst_id = sst_ids[i],
                 .current_key = null,
                 .current_value = null,
@@ -54,7 +56,7 @@ pub const MergeIterator = struct {
 
     pub fn deinit(self: *MergeIterator) void {
         for (self.sources) |*s| {
-            s.freeCurrentEntry(self.allocator);
+            s.free_current_entry(self.allocator);
             s.iter.deinit();
         }
         if (self.result_buf) |buf| self.allocator.free(buf);
@@ -117,7 +119,7 @@ pub const MergeIterator = struct {
     }
 
     fn advance(self: *MergeIterator, source: *Source) !void {
-        source.freeCurrentEntry(self.allocator);
+        source.free_current_entry(self.allocator);
         if (try source.iter.next()) |entry| {
             source.current_key = try self.allocator.dupe(u8, entry.key);
             source.current_value = try self.allocator.dupe(u8, entry.value);
@@ -125,11 +127,11 @@ pub const MergeIterator = struct {
     }
 };
 
-pub fn collectMerged(
+pub fn collect_merged(
     allocator: std.mem.Allocator,
     merge_iter: *MergeIterator,
 ) ![]RawEntry {
-    var result = ArrayList(RawEntry){};
+    var result = ArrayList(RawEntry).empty;
     errdefer {
         for (result.items) |e| {
             allocator.free(e.key);
@@ -139,6 +141,10 @@ pub fn collectMerged(
     }
 
     while (try merge_iter.next()) |entry| {
+        if (result.items.len > 0) {
+            const prev = result.items[result.items.len - 1].key;
+            assert(std.mem.order(u8, prev, entry.key) == .lt);
+        }
         try result.append(allocator, RawEntry{
             .key = try allocator.dupe(u8, entry.key),
             .value = try allocator.dupe(u8, entry.value),
@@ -166,7 +172,7 @@ test "merge_iterator single source" {
         .{ .key = "b", .value = "2|0|2|s|e|{}" },
         .{ .key = "c", .value = "3|0|2|s|e|{}" },
     };
-    _ = try sstable.writeSSTable(allocator, path, io, &entries);
+    _ = try sstable.write_sstable(allocator, path, io, &entries);
 
     var reader = try SSTableReader.open(allocator, path, io);
     defer reader.deinit();
@@ -206,14 +212,14 @@ test "merge_iterator deduplication newest wins" {
         .{ .key = "b", .value = "2|0|2|s|e|{}" },
         .{ .key = "c", .value = "3|0|2|s|e|{}" },
     };
-    _ = try sstable.writeSSTable(allocator, path1, io, &entries1);
+    _ = try sstable.write_sstable(allocator, path1, io, &entries1);
 
     // SST 2 (newer): b=20, d=40
     const entries2 = [_]sstable.RawEntry{
         .{ .key = "b", .value = "20|0|2|s|e|{}" },
         .{ .key = "d", .value = "40|0|2|s|e|{}" },
     };
-    _ = try sstable.writeSSTable(allocator, path2, io, &entries2);
+    _ = try sstable.write_sstable(allocator, path2, io, &entries2);
 
     var r1 = try SSTableReader.open(allocator, path1, io);
     defer r1.deinit();
@@ -226,7 +232,7 @@ test "merge_iterator deduplication newest wins" {
     var merge = try MergeIterator.init(allocator, &readers, &ids);
     defer merge.deinit();
 
-    const collected = try collectMerged(allocator, &merge);
+    const collected = try collect_merged(allocator, &merge);
     defer {
         for (collected) |e| {
             allocator.free(e.key);

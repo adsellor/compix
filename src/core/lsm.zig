@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 
 const event = @import("event.zig");
@@ -25,9 +26,24 @@ const WriteAheadLog = wal_mod.WriteAheadLog;
 const Io = std.Io;
 const IoDir = Io.Dir;
 
-const FLUSH_SIZE_BYTES: usize = 16 * 1024 * 1024; // 16 MB
-const FLUSH_COUNT: usize = 50_000;
-const L0_COMPACTION_TRIGGER: usize = 4;
+const flush_bytes_max: u64 = 16 * 1024 * 1024;
+const flush_count_max: u32 = 50_000;
+const compaction_trigger_l0: u32 = 4;
+
+comptime {
+    assert(flush_bytes_max > 0);
+    assert(flush_count_max > 0);
+    assert(compaction_trigger_l0 >= 2);
+}
+
+/// An open SSTable kept resident so reads never reopen or reparse table files.
+/// The list mirrors manifest.live exactly, sorted newest-first (level ascending,
+/// then id descending) so the first key hit is the freshest value.
+const CachedTable = struct {
+    id: u64,
+    level: u32,
+    reader: *SSTableReader,
+};
 
 pub const LSMEngine = struct {
     allocator: std.mem.Allocator,
@@ -35,12 +51,15 @@ pub const LSMEngine = struct {
     wal: *WriteAheadLog,
     active_memtable: *Memtable,
     manifest: *Manifest,
+    tables: ArrayList(CachedTable),
     base_path: []const u8,
     wal_path: []const u8,
     next_sst_id: u64,
 
     pub fn init(allocator: std.mem.Allocator, wal_path: []const u8, io: Io) !LSMEngine {
-        const base = try deriveBase(allocator, wal_path);
+        assert(wal_path.len > 0);
+
+        const base = try derive_base(allocator, wal_path);
         errdefer allocator.free(base);
 
         const owned_wal_path = try allocator.dupe(u8, wal_path);
@@ -72,19 +91,31 @@ pub const LSMEngine = struct {
 
         _ = try wal_ptr.replay(mt_ptr);
 
-        return LSMEngine{
+        var self = LSMEngine{
             .allocator = allocator,
             .io = io,
             .wal = wal_ptr,
             .active_memtable = mt_ptr,
             .manifest = manifest_ptr,
+            .tables = ArrayList(CachedTable).empty,
             .base_path = base,
             .wal_path = owned_wal_path,
             .next_sst_id = next_id,
         };
+        errdefer self.close_tables();
+
+        const sorted = try manifest_ptr.get_live_sorted(allocator);
+        defer allocator.free(sorted);
+        for (sorted) |info| {
+            try self.open_table(info.level, info.id);
+        }
+
+        assert(self.tables.items.len == self.manifest.live.items.len);
+        return self;
     }
 
     pub fn deinit(self: *LSMEngine) void {
+        self.close_tables();
         self.active_memtable.deinit();
         self.allocator.destroy(self.active_memtable);
         self.wal.deinit();
@@ -95,12 +126,63 @@ pub const LSMEngine = struct {
         self.allocator.free(self.wal_path);
     }
 
+    fn close_tables(self: *LSMEngine) void {
+        for (self.tables.items) |t| {
+            t.reader.deinit();
+            self.allocator.destroy(t.reader);
+        }
+        self.tables.deinit(self.allocator);
+        self.tables = ArrayList(CachedTable).empty;
+    }
+
+    /// Opens the table file and inserts it into the cache, keeping the
+    /// newest-first order (level ascending, id descending within a level).
+    fn open_table(self: *LSMEngine, level: u32, id: u64) !void {
+        assert(id > 0);
+        const path = try self.sst_path(level, id);
+        defer self.allocator.free(path);
+
+        const reader = try self.allocator.create(SSTableReader);
+        errdefer self.allocator.destroy(reader);
+        reader.* = try SSTableReader.open(self.allocator, path, self.io);
+        errdefer reader.deinit();
+
+        var insert_at: usize = self.tables.items.len;
+        for (self.tables.items, 0..) |t, i| {
+            const goes_before = level < t.level or (level == t.level and id > t.id);
+            if (goes_before) {
+                insert_at = i;
+                break;
+            }
+        }
+        try self.tables.insert(self.allocator, insert_at, CachedTable{
+            .id = id,
+            .level = level,
+            .reader = reader,
+        });
+    }
+
+    fn remove_table(self: *LSMEngine, id: u64) void {
+        for (self.tables.items, 0..) |t, i| {
+            if (t.id == id) {
+                t.reader.deinit();
+                self.allocator.destroy(t.reader);
+                _ = self.tables.orderedRemove(i);
+                return;
+            }
+        }
+        unreachable;
+    }
+
     pub fn put(self: *LSMEngine, key: []const u8, value: EventValue) !void {
+        assert(key.len > 0);
+
         try self.wal.append_event(key, value);
         try self.active_memtable.insert(key, value);
+        assert(self.active_memtable.count() > 0);
 
-        if (self.active_memtable.size_bytes >= FLUSH_SIZE_BYTES or
-            self.active_memtable.count() >= FLUSH_COUNT)
+        if (self.active_memtable.size_bytes >= flush_bytes_max or
+            self.active_memtable.count() >= flush_count_max)
         {
             try self.flush();
         }
@@ -111,65 +193,46 @@ pub const LSMEngine = struct {
     }
 
     pub fn get(self: *LSMEngine, allocator: std.mem.Allocator, key: []const u8) !?EventValue {
+        assert(key.len > 0);
+
         if (try self.active_memtable.get(allocator, key)) |v| return v;
 
-        const sorted = try self.manifest.getLiveSorted(self.allocator);
-        defer self.allocator.free(sorted);
-
-        for (sorted) |info| {
-            const sst_path = try self.sstPath(info.level, info.id);
-            defer self.allocator.free(sst_path);
-
-            var reader = SSTableReader.open(self.allocator, sst_path, self.io) catch continue;
-            defer reader.deinit();
-
-            if (try reader.get(allocator, key)) |v| return v;
+        for (self.tables.items) |t| {
+            if (try t.reader.get(allocator, key)) |v| return v;
         }
 
         return null;
     }
 
     pub fn contains(self: *LSMEngine, key: []const u8) !bool {
+        assert(key.len > 0);
+
         if (self.active_memtable.contains(key)) return true;
 
-        const sorted = try self.manifest.getLiveSorted(self.allocator);
-        defer self.allocator.free(sorted);
-
-        for (sorted) |info| {
-            const sst_path = try self.sstPath(info.level, info.id);
-            defer self.allocator.free(sst_path);
-
-            var reader = SSTableReader.open(self.allocator, sst_path, self.io) catch continue;
-            defer reader.deinit();
-
-            if (try reader.contains(key)) return true;
+        for (self.tables.items) |t| {
+            if (try t.reader.contains(key)) return true;
         }
 
         return false;
     }
 
-    pub fn scan_prefix(self: *LSMEngine, prefix: []const u8, results: *ArrayList(KeyValuePair)) !void {
-        var mt_results = ArrayList(KeyValuePair){};
+    pub fn scan_prefix(
+        self: *LSMEngine,
+        prefix: []const u8,
+        results: *ArrayList(KeyValuePair),
+    ) !void {
+        var mt_results = ArrayList(KeyValuePair).empty;
         try self.active_memtable.scan_prefix(prefix, &mt_results);
         defer mt_results.deinit(self.allocator);
 
-        var sst_results = ArrayList(KeyValuePair){};
+        var sst_results = ArrayList(KeyValuePair).empty;
         defer {
             for (sst_results.items) |*item| item.deinit(self.allocator);
             sst_results.deinit(self.allocator);
         }
 
-        const sorted = try self.manifest.getLiveSorted(self.allocator);
-        defer self.allocator.free(sorted);
-
-        for (sorted) |info| {
-            const sst_path = try self.sstPath(info.level, info.id);
-            defer self.allocator.free(sst_path);
-
-            var reader = SSTableReader.open(self.allocator, sst_path, self.io) catch continue;
-            defer reader.deinit();
-
-            try reader.scan_prefix(prefix, &sst_results);
+        for (self.tables.items) |t| {
+            try t.reader.scan_prefix(prefix, &sst_results);
         }
 
         var seen = std.StringHashMap(void).init(self.allocator);
@@ -180,13 +243,8 @@ pub const LSMEngine = struct {
             try seen.put(item.key, {});
         }
 
-        var sst_seen = std.StringHashMap(void).init(self.allocator);
-        defer sst_seen.deinit();
-
         for (sst_results.items) |*item| {
-            const in_mt = seen.get(item.key) != null;
-            const in_sst = sst_seen.get(item.key) != null;
-            if (!in_mt and !in_sst) {
+            if (seen.get(item.key) == null) {
                 try results.append(self.allocator, KeyValuePair{
                     .key = try self.allocator.dupe(u8, item.key),
                     .value = EventValue{
@@ -197,28 +255,30 @@ pub const LSMEngine = struct {
                         .origin_service = try self.allocator.dupe(u8, item.value.origin_service),
                     },
                 });
-                try sst_seen.put(item.key, {});
+                try seen.put(item.key, {});
             }
         }
     }
 
-    pub fn memtableCount(self: *const LSMEngine) usize {
+    pub fn memtable_count(self: *const LSMEngine) usize {
         return self.active_memtable.count();
     }
 
-    pub fn sstableCount(self: *const LSMEngine) usize {
-        return self.manifest.live.items.len;
+    pub fn sstable_count(self: *const LSMEngine) usize {
+        assert(self.tables.items.len == self.manifest.live.items.len);
+        return self.tables.items.len;
     }
 
     pub fn flush(self: *LSMEngine) !void {
         if (self.active_memtable.count() == 0) return;
+        const tables_before = self.tables.items.len;
 
         const frozen = self.active_memtable;
         const new_mt = try self.allocator.create(Memtable);
         new_mt.* = Memtable.init(self.allocator);
         self.active_memtable = new_mt;
 
-        var raw_entries = ArrayList(RawEntry){};
+        var raw_entries = ArrayList(RawEntry).empty;
         defer {
             for (raw_entries.items) |e| {
                 self.allocator.free(e.key);
@@ -238,23 +298,53 @@ pub const LSMEngine = struct {
                 .value = serialized,
             });
         }
+        assert(raw_entries.items.len == frozen.count());
 
         const sst_id = self.next_sst_id;
         self.next_sst_id += 1;
 
-        const sst_path = try self.sstPath(0, sst_id);
-        defer self.allocator.free(sst_path);
+        try self.write_and_register(0, sst_id, raw_entries.items);
+        try self.wal.truncate();
 
-        const footer = try sstable.writeSSTable(self.allocator, sst_path, self.io, raw_entries.items);
+        frozen.deinit();
+        self.allocator.destroy(frozen);
 
-        const min_key = if (raw_entries.items.len > 0) raw_entries.items[0].key else "";
-        const max_key = if (raw_entries.items.len > 0) raw_entries.items[raw_entries.items.len - 1].key else "";
+        assert(self.active_memtable.count() == 0);
+        assert(self.tables.items.len == tables_before + 1);
+        assert(self.tables.items.len == self.manifest.live.items.len);
 
-        const file_size = footer.index_offset + footer.index_size + sstable.FOOTER_SIZE;
+        if (self.manifest.count_at_level(0) >= compaction_trigger_l0) {
+            try self.compact_level(0);
+        }
+    }
 
-        try self.manifest.addSSTable(.{
+    /// Writes entries as a new SSTable, records it in the manifest, and caches
+    /// an open reader for it. Entries must be sorted by key ascending.
+    fn write_and_register(
+        self: *LSMEngine,
+        level: u32,
+        sst_id: u64,
+        entries: []const RawEntry,
+    ) !void {
+        if (entries.len > 1) {
+            const first = entries[0].key;
+            const last = entries[entries.len - 1].key;
+            assert(std.mem.order(u8, first, last) != .gt);
+        }
+
+        const path = try self.sst_path(level, sst_id);
+        defer self.allocator.free(path);
+
+        const footer = try sstable.write_sstable(self.allocator, path, self.io, entries);
+        assert(footer.num_entries == entries.len);
+
+        const min_key = if (entries.len > 0) entries[0].key else "";
+        const max_key = if (entries.len > 0) entries[entries.len - 1].key else "";
+        const file_size = footer.index_offset + footer.index_size + sstable.footer_size;
+
+        try self.manifest.add_sstable(.{
             .id = sst_id,
-            .level = 0,
+            .level = level,
             .min_key = min_key,
             .max_key = max_key,
             .num_entries = footer.num_entries,
@@ -263,51 +353,27 @@ pub const LSMEngine = struct {
             .file_size = file_size,
         });
 
-        try self.wal.truncate();
-
-        frozen.deinit();
-        self.allocator.destroy(frozen);
-
-        if (self.manifest.countAtLevel(0) >= L0_COMPACTION_TRIGGER) {
-            self.compactLevel(0) catch {};
-        }
+        try self.open_table(level, sst_id);
     }
 
-    pub fn compactLevel(self: *LSMEngine, level: u32) !void {
-        const ids = try self.manifest.getIdsAtLevel(self.allocator, level);
-        defer self.allocator.free(ids);
-        if (ids.len < 2) return;
+    pub fn compact_level(self: *LSMEngine, level: u32) !void {
+        var readers_list = ArrayList(*SSTableReader).empty;
+        defer readers_list.deinit(self.allocator);
+        var ids_list = ArrayList(u64).empty;
+        defer ids_list.deinit(self.allocator);
 
-        var readers_list = ArrayList(*SSTableReader){};
-        defer {
-            for (readers_list.items) |r| {
-                r.deinit();
-                self.allocator.destroy(r);
+        for (self.tables.items) |t| {
+            if (t.level == level) {
+                try readers_list.append(self.allocator, t.reader);
+                try ids_list.append(self.allocator, t.id);
             }
-            readers_list.deinit(self.allocator);
         }
+        if (ids_list.items.len < 2) return;
 
-        for (ids) |id| {
-            const p = try self.sstPath(level, id);
-            defer self.allocator.free(p);
-            const rdr = try self.allocator.create(SSTableReader);
-            rdr.* = SSTableReader.open(self.allocator, p, self.io) catch {
-                self.allocator.destroy(rdr);
-                continue;
-            };
-            try readers_list.append(self.allocator, rdr);
-        }
-
-        if (readers_list.items.len < 2) return;
-
-        var merge = try MergeIterator.init(
-            self.allocator,
-            readers_list.items,
-            ids,
-        );
+        var merge = try MergeIterator.init(self.allocator, readers_list.items, ids_list.items);
         defer merge.deinit();
 
-        const merged = try merge_iter_mod.collectMerged(self.allocator, &merge);
+        const merged = try merge_iter_mod.collect_merged(self.allocator, &merge);
         defer {
             for (merged) |e| {
                 self.allocator.free(e.key);
@@ -318,71 +384,59 @@ pub const LSMEngine = struct {
 
         if (merged.len == 0) return;
 
+        const tables_before = self.tables.items.len;
         const new_id = self.next_sst_id;
         self.next_sst_id += 1;
         const new_level = level + 1;
 
-        const new_path = try self.sstPath(new_level, new_id);
+        const new_path = try self.sst_path(new_level, new_id);
         defer self.allocator.free(new_path);
 
-        const footer = try sstable.writeSSTable(self.allocator, new_path, self.io, merged);
+        const footer = try sstable.write_sstable(self.allocator, new_path, self.io, merged);
+        const file_size = footer.index_offset + footer.index_size + sstable.footer_size;
 
-        const min_key = merged[0].key;
-        const max_key = merged[merged.len - 1].key;
-        const file_size = footer.index_offset + footer.index_size + sstable.FOOTER_SIZE;
-
-        try self.manifest.atomicCompaction(ids, .{
+        try self.manifest.atomic_compaction(ids_list.items, .{
             .id = new_id,
             .level = new_level,
-            .min_key = min_key,
-            .max_key = max_key,
+            .min_key = merged[0].key,
+            .max_key = merged[merged.len - 1].key,
             .num_entries = footer.num_entries,
             .min_seq = footer.min_seq,
             .max_seq = footer.max_seq,
             .file_size = file_size,
         });
 
-        for (readers_list.items) |r| {
-            r.deinit();
-            self.allocator.destroy(r);
-        }
-        readers_list.items.len = 0;
+        for (ids_list.items) |id| self.remove_table(id);
+        try self.open_table(new_level, new_id);
 
-        for (ids) |id| {
-            const old_path = try self.sstPath(level, id);
+        assert(self.tables.items.len == tables_before - ids_list.items.len + 1);
+        assert(self.tables.items.len == self.manifest.live.items.len);
+        assert(self.manifest.count_at_level(level) == 0);
+
+        for (ids_list.items) |id| {
+            const old_path = try self.sst_path(level, id);
             defer self.allocator.free(old_path);
-            IoDir.cwd().deleteFile(self.io, old_path) catch {};
+            try IoDir.cwd().deleteFile(self.io, old_path);
         }
     }
 
-    fn sstPath(self: *const LSMEngine, level: u32, id: u64) ![]const u8 {
-        return try std.fmt.allocPrint(self.allocator, "{s}_L{d}_{d:0>8}.sst", .{ self.base_path, level, id });
+    fn sst_path(self: *const LSMEngine, level: u32, id: u64) ![]const u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}_L{d}_{d:0>8}.sst", .{
+            self.base_path,
+            level,
+            id,
+        });
     }
 
-    fn deriveBase(allocator: std.mem.Allocator, wal_path: []const u8) ![]const u8 {
+    fn derive_base(allocator: std.mem.Allocator, wal_path: []const u8) ![]const u8 {
         if (std.mem.endsWith(u8, wal_path, ".wal")) {
             return try allocator.dupe(u8, wal_path[0 .. wal_path.len - 4]);
         }
         return try allocator.dupe(u8, wal_path);
     }
-
-    pub fn destroyData(self: *LSMEngine) void {
-        for (self.manifest.live.items) |info| {
-            const p = self.sstPath(info.level, info.id) catch continue;
-            defer self.allocator.free(p);
-            IoDir.cwd().deleteFile(self.io, p) catch {};
-        }
-        if (self.manifest.path.len > 0) {
-            IoDir.cwd().deleteFile(self.io, self.manifest.path) catch {};
-        }
-        IoDir.cwd().deleteFile(self.io, self.wal_path) catch {};
-        const crumb_path = std.fmt.allocPrint(self.allocator, "{s}.crumb", .{self.base_path}) catch return;
-        defer self.allocator.free(crumb_path);
-        IoDir.cwd().deleteFile(self.io, crumb_path) catch {};
-    }
 };
 
-fn cleanupTestLSM(allocator: std.mem.Allocator, io: Io, base: []const u8) void {
+fn cleanup_test_lsm(allocator: std.mem.Allocator, io: Io, base: []const u8) void {
     const wal_path = std.fmt.allocPrint(allocator, "{s}.wal", .{base}) catch return;
     defer allocator.free(wal_path);
     const crumb = std.fmt.allocPrint(allocator, "{s}.crumb", .{base}) catch return;
@@ -396,7 +450,11 @@ fn cleanupTestLSM(allocator: std.mem.Allocator, io: Io, base: []const u8) void {
 
     for (0..20) |i| {
         for (0..3) |lvl| {
-            const p = std.fmt.allocPrint(allocator, "{s}_L{d}_{d:0>8}.sst", .{ base, lvl, i + 1 }) catch continue;
+            const p = std.fmt.allocPrint(allocator, "{s}_L{d}_{d:0>8}.sst", .{
+                base,
+                lvl,
+                i + 1,
+            }) catch continue;
             defer allocator.free(p);
             IoDir.cwd().deleteFile(io, p) catch {};
         }
@@ -411,8 +469,8 @@ test "lsm basic put and get" {
     const io = threaded.io();
 
     const base = "data/test_lsm_basic";
-    cleanupTestLSM(allocator, io, base);
-    defer cleanupTestLSM(allocator, io, base);
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
 
     var lsm = try LSMEngine.init(allocator, "data/test_lsm_basic.wal", io);
     defer lsm.deinit();
@@ -436,8 +494,8 @@ test "lsm scan_prefix" {
     const io = threaded.io();
 
     const base = "data/test_lsm_scan";
-    cleanupTestLSM(allocator, io, base);
-    defer cleanupTestLSM(allocator, io, base);
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
 
     var lsm = try LSMEngine.init(allocator, "data/test_lsm_scan.wal", io);
     defer lsm.deinit();
@@ -455,7 +513,7 @@ test "lsm scan_prefix" {
         try lsm.put(key, val);
     }
 
-    var results = ArrayList(KeyValuePair){};
+    var results = ArrayList(KeyValuePair).empty;
     try lsm.scan_prefix("a:", &results);
     defer {
         for (results.items) |*item| item.deinit(allocator);
@@ -473,8 +531,8 @@ test "lsm contains" {
     const io = threaded.io();
 
     const base = "data/test_lsm_contains";
-    cleanupTestLSM(allocator, io, base);
-    defer cleanupTestLSM(allocator, io, base);
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
 
     var lsm = try LSMEngine.init(allocator, "data/test_lsm_contains.wal", io);
     defer lsm.deinit();
@@ -494,8 +552,8 @@ test "lsm wal replay recovery" {
     const io = threaded.io();
 
     const base = "data/test_lsm_recovery";
-    cleanupTestLSM(allocator, io, base);
-    defer cleanupTestLSM(allocator, io, base);
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
 
     {
         var lsm = try LSMEngine.init(allocator, "data/test_lsm_recovery.wal", io);
@@ -531,8 +589,8 @@ test "lsm manual flush writes sstable" {
     const io = threaded.io();
 
     const base = "data/test_lsm_flush";
-    cleanupTestLSM(allocator, io, base);
-    defer cleanupTestLSM(allocator, io, base);
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
 
     var lsm = try LSMEngine.init(allocator, "data/test_lsm_flush.wal", io);
     defer lsm.deinit();
@@ -545,18 +603,18 @@ test "lsm manual flush writes sstable" {
     }
 
     try std.testing.expectEqual(@as(usize, 100), lsm.active_memtable.count());
-    try std.testing.expectEqual(@as(usize, 0), lsm.sstableCount());
+    try std.testing.expectEqual(@as(usize, 0), lsm.sstable_count());
 
     try lsm.flush();
 
     try std.testing.expectEqual(@as(usize, 0), lsm.active_memtable.count());
-    try std.testing.expectEqual(@as(usize, 1), lsm.sstableCount());
+    try std.testing.expectEqual(@as(usize, 1), lsm.sstable_count());
 
     var val = (try lsm.get(allocator, "flush:k00050")).?;
     defer val.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 50), val.sequence);
 
-    var results = ArrayList(KeyValuePair){};
+    var results = ArrayList(KeyValuePair).empty;
     try lsm.scan_prefix("flush:", &results);
     defer {
         for (results.items) |*item| item.deinit(allocator);
@@ -573,8 +631,8 @@ test "lsm cross-flush read" {
     const io = threaded.io();
 
     const base = "data/test_lsm_crossflush";
-    cleanupTestLSM(allocator, io, base);
-    defer cleanupTestLSM(allocator, io, base);
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
 
     var lsm = try LSMEngine.init(allocator, "data/test_lsm_crossflush.wal", io);
     defer lsm.deinit();
@@ -602,7 +660,7 @@ test "lsm cross-flush read" {
     defer v8.deinit(allocator);
     try std.testing.expectEqual(@as(u64, 8), v8.sequence);
 
-    var results = ArrayList(KeyValuePair){};
+    var results = ArrayList(KeyValuePair).empty;
     try lsm.scan_prefix("cf:", &results);
     defer {
         for (results.items) |*item| item.deinit(allocator);
@@ -619,8 +677,8 @@ test "lsm flush and recovery" {
     const io = threaded.io();
 
     const base = "data/test_lsm_flush_recovery";
-    cleanupTestLSM(allocator, io, base);
-    defer cleanupTestLSM(allocator, io, base);
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
 
     {
         var lsm = try LSMEngine.init(allocator, "data/test_lsm_flush_recovery.wal", io);
@@ -654,4 +712,45 @@ test "lsm flush and recovery" {
         defer v7.deinit(allocator);
         try std.testing.expectEqual(@as(u64, 7), v7.sequence);
     }
+}
+
+test "lsm compaction merges L0 tables and reads survive" {
+    const allocator = std.testing.allocator;
+
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const base = "data/test_lsm_compaction";
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
+
+    var lsm = try LSMEngine.init(allocator, "data/test_lsm_compaction.wal", io);
+    defer lsm.deinit();
+
+    // Four flushes trip the L0 compaction trigger; keys overlap so the newest
+    // sequence must win after the merge.
+    for (0..4) |round| {
+        for (1..6) |i| {
+            const key = try std.fmt.allocPrint(allocator, "c:k{}", .{i});
+            defer allocator.free(key);
+            const val = try EventValue.init(allocator, round * 10 + i, "svc", "evt", "{}", 0);
+            try lsm.put(key, val);
+        }
+        try lsm.flush();
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), lsm.sstable_count());
+
+    var v1 = (try lsm.get(allocator, "c:k1")).?;
+    defer v1.deinit(allocator);
+    try std.testing.expectEqual(@as(u64, 31), v1.sequence);
+
+    var results = ArrayList(KeyValuePair).empty;
+    try lsm.scan_prefix("c:", &results);
+    defer {
+        for (results.items) |*item| item.deinit(allocator);
+        results.deinit(allocator);
+    }
+    try std.testing.expectEqual(@as(usize, 5), results.items.len);
 }

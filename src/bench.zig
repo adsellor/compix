@@ -34,10 +34,15 @@ const BenchLog = struct {
     buf: ArrayList(u8),
 
     fn init() BenchLog {
-        return .{ .buf = ArrayList(u8){} };
+        return .{ .buf = ArrayList(u8).empty };
     }
 
-    fn appendFmt(self: *BenchLog, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+    fn append_fmt(
+        self: *BenchLog,
+        allocator: std.mem.Allocator,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) void {
         const s = std.fmt.allocPrint(allocator, fmt, args) catch return;
         defer allocator.free(s);
         self.buf.appendSlice(allocator, s) catch {};
@@ -45,18 +50,44 @@ const BenchLog = struct {
 
     fn section(self: *BenchLog, allocator: std.mem.Allocator, name: []const u8) void {
         std.debug.print("\n[{s}]\n", .{name});
-        self.appendFmt(allocator, "\n### {s}\n\n| Benchmark | Ops | Time (us) | Ops/s |\n|:----------|----:|----------:|------:|\n", .{name});
+        self.append_fmt(
+            allocator,
+            "\n### {s}\n\n| Benchmark | Ops | Time (us) | Ops/s |\n" ++
+                "|:----------|----:|----------:|------:|\n",
+            .{name},
+        );
     }
 
-    fn result(self: *BenchLog, allocator: std.mem.Allocator, label: []const u8, count: usize, us: u64) void {
+    fn result(
+        self: *BenchLog,
+        allocator: std.mem.Allocator,
+        label: []const u8,
+        count: usize,
+        us: u64,
+    ) void {
         const ops_per_sec: u64 = if (us > 0) @intCast((@as(u128, count) * 1_000_000) / us) else 0;
-        std.debug.print("  {s:<40} {d:>8} ops in {d:>8} us  ({d:>10} ops/s)\n", .{ label, count, us, ops_per_sec });
-        self.appendFmt(allocator, "| {s} | {d} | {d} | {d} |\n", .{ label, count, us, ops_per_sec });
+        std.debug.print("  {s:<40} {d:>8} ops in {d:>8} us  ({d:>10} ops/s)\n", .{
+            label,
+            count,
+            us,
+            ops_per_sec,
+        });
+        self.append_fmt(allocator, "| {s} | {d} | {d} | {d} |\n", .{
+            label,
+            count,
+            us,
+            ops_per_sec,
+        });
     }
 
-    fn note(self: *BenchLog, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+    fn note(
+        self: *BenchLog,
+        allocator: std.mem.Allocator,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) void {
         std.debug.print(fmt, args);
-        self.appendFmt(allocator, fmt, args);
+        self.append_fmt(allocator, fmt, args);
     }
 
     fn write_file(self: *BenchLog, allocator: std.mem.Allocator) !void {
@@ -75,7 +106,8 @@ const BenchLog = struct {
         const md = day.calculateMonthDay();
         const ds = es.getDaySeconds();
 
-        const date_str = try std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
+        const date_fmt = "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}";
+        const date_str = try std.fmt.allocPrint(allocator, date_fmt, .{
             day.year,
             @intFromEnum(md.month),
             md.day_index + 1,
@@ -85,7 +117,8 @@ const BenchLog = struct {
         });
         defer allocator.free(date_str);
 
-        const file_name = try std.fmt.allocPrint(allocator, "bench/results-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.md", .{
+        const file_fmt = "bench/results-{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}.md";
+        const file_name = try std.fmt.allocPrint(allocator, file_fmt, .{
             day.year,
             @intFromEnum(md.month),
             md.day_index + 1,
@@ -95,7 +128,11 @@ const BenchLog = struct {
         });
         defer allocator.free(file_name);
 
-        const header = try std.fmt.allocPrint(allocator, "# Bench Results — {s} UTC\n", .{date_str});
+        const header = try std.fmt.allocPrint(
+            allocator,
+            "# Bench Results — {s} UTC\n",
+            .{date_str},
+        );
         defer allocator.free(header);
 
         const file = try dir.createFile(io, file_name, .{ .truncate = true, .read = false });
@@ -147,7 +184,12 @@ fn bench_wal_append(allocator: std.mem.Allocator, log: *BenchLog) !void {
 
     try wal_log.flush();
     const end = time_mod.Instant.now(io);
-    log.result(allocator, "wal.append_event (5k writes + async sync)", count, elapsed_us(start, end));
+    log.result(
+        allocator,
+        "wal.append_event (5k writes + async sync)",
+        count,
+        elapsed_us(start, end),
+    );
 }
 
 fn bench_wal_replay(allocator: std.mem.Allocator, log: *BenchLog) !void {
@@ -215,7 +257,11 @@ fn bench_radix_insert(allocator: std.mem.Allocator, log: *BenchLog) !void {
     }
 
     for (0..count) |i| {
-        keys[i] = try std.fmt.allocPrint(allocator, "{s}:r{}:op", .{ services[i % services.len], i });
+        keys[i] = try std.fmt.allocPrint(
+            allocator,
+            "{s}:r{}:op",
+            .{ services[i % services.len], i },
+        );
         const et = try allocator.dupe(u8, event_types[i % event_types.len]);
         const pl = try allocator.dupe(u8, "{\"i\":1}");
         const os = try allocator.dupe(u8, "bench-service");
@@ -358,7 +404,7 @@ fn bench_scan_prefix(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const start = time_mod.Instant.now(io);
     for (0..scans) |i| {
         const prefix = services[i % services.len];
-        var results = ArrayList(KeyValuePair){};
+        var results = ArrayList(KeyValuePair).empty;
         try tree.scan_prefix(prefix, &results);
         total_results += results.items.len;
         for (results.items) |*item| item.deinit(allocator);
@@ -385,13 +431,18 @@ fn bench_scan_prefix_selectivity(allocator: std.mem.Allocator, log: *BenchLog) !
     {
         const start = time_mod.Instant.now(io);
         for (0..50) |_| {
-            var results = ArrayList(KeyValuePair){};
+            var results = ArrayList(KeyValuePair).empty;
             try tree.scan_prefix("sel:", &results);
             for (results.items) |*item| item.deinit(allocator);
             results.deinit(allocator);
         }
         const end = time_mod.Instant.now(io);
-        log.result(allocator, "scan_prefix wide  (50x, ~10k hits each)", 50, elapsed_us(start, end));
+        log.result(
+            allocator,
+            "scan_prefix wide  (50x, ~10k hits each)",
+            50,
+            elapsed_us(start, end),
+        );
     }
 
     {
@@ -407,13 +458,18 @@ fn bench_scan_prefix_selectivity(allocator: std.mem.Allocator, log: *BenchLog) !
 
         const start = time_mod.Instant.now(io);
         for (0..narrow_count) |i| {
-            var results = ArrayList(KeyValuePair){};
+            var results = ArrayList(KeyValuePair).empty;
             try tree.scan_prefix(prefixes[i], &results);
             for (results.items) |*item| item.deinit(allocator);
             results.deinit(allocator);
         }
         const end = time_mod.Instant.now(io);
-        log.result(allocator, "scan_prefix narrow (10k x ~1 hit each)", narrow_count, elapsed_us(start, end));
+        log.result(
+            allocator,
+            "scan_prefix narrow (10k x ~1 hit each)",
+            narrow_count,
+            elapsed_us(start, end),
+        );
     }
 }
 
@@ -431,7 +487,11 @@ fn cleanupBenchLSM(allocator: std.mem.Allocator, io: Io, base: []const u8) void 
 
     for (0..20) |i| {
         for (0..3) |lvl| {
-            const p = std.fmt.allocPrint(allocator, "{s}_L{d}_{d:0>8}.sst", .{ base, lvl, i + 1 }) catch continue;
+            const p = std.fmt.allocPrint(
+                allocator,
+                "{s}_L{d}_{d:0>8}.sst",
+                .{ base, lvl, i + 1 },
+            ) catch continue;
             defer allocator.free(p);
             IoDir.cwd().deleteFile(io, p) catch {};
         }
@@ -439,6 +499,9 @@ fn cleanupBenchLSM(allocator: std.mem.Allocator, io: Io, base: []const u8) void 
 }
 
 const IoDir = Io.Dir;
+
+const stress_services = [_][]const u8{ "auth", "payment", "inventory", "shipping", "analytics" };
+const stress_operations_total: usize = 10_000;
 
 fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const wal_path = "data/bench_stress.wal";
@@ -453,13 +516,28 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
     var event_store = try EventStore.init(allocator, wal_path, io, .{});
     defer event_store.deinit();
 
-    const total_operations: usize = 10_000;
-    const services = [_][]const u8{ "auth", "payment", "inventory", "shipping", "analytics" };
-    const event_type_names = [_][]const u8{ "created", "updated", "deleted", "processed", "failed" };
+    try bench_store_stress_writes(allocator, log, &event_store, io);
+    try bench_store_stress_reads(allocator, log, &event_store, io);
+    try bench_store_stress_scans(allocator, log, &event_store, io);
+}
+
+fn bench_store_stress_writes(
+    allocator: std.mem.Allocator,
+    log: *BenchLog,
+    event_store: *EventStore,
+    io: Io,
+) !void {
+    const event_type_names = [_][]const u8{
+        "created",
+        "updated",
+        "deleted",
+        "processed",
+        "failed",
+    };
 
     const write_start = time_mod.Instant.now(io);
-    for (0..total_operations) |i| {
-        const svc = services[i % services.len];
+    for (0..stress_operations_total) |i| {
+        const svc = stress_services[i % stress_services.len];
         const etn = event_type_names[i % event_type_names.len];
 
         const key = try std.fmt.allocPrint(allocator, "{s}:r{}:operation", .{ svc, i });
@@ -475,12 +553,31 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
         );
         defer allocator.free(payload);
 
-        const value = try EventValue.init(allocator, i + 5000, "test-service", full_event_type, payload, timestamp_ns());
+        const value = try EventValue.init(
+            allocator,
+            i + 5000,
+            "test-service",
+            full_event_type,
+            payload,
+            timestamp_ns(),
+        );
         try event_store.put(key, value);
     }
     const write_end = time_mod.Instant.now(io);
-    log.result(allocator, "store.put durable (10k synced writes)", total_operations, elapsed_us(write_start, write_end));
+    log.result(
+        allocator,
+        "store.put durable (10k synced writes)",
+        stress_operations_total,
+        elapsed_us(write_start, write_end),
+    );
+}
 
+fn bench_store_stress_reads(
+    allocator: std.mem.Allocator,
+    log: *BenchLog,
+    event_store: *EventStore,
+    io: Io,
+) !void {
     const read_count: usize = 1_000;
     var read_keys = try allocator.alloc([]u8, read_count);
     defer {
@@ -488,8 +585,8 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
         allocator.free(read_keys);
     }
     for (0..read_count) |i| {
-        const idx = i * (total_operations / read_count);
-        const svc = services[idx % services.len];
+        const idx = i * (stress_operations_total / read_count);
+        const svc = stress_services[idx % stress_services.len];
         read_keys[i] = try std.fmt.allocPrint(allocator, "{s}:r{}:operation", .{ svc, idx });
     }
 
@@ -503,64 +600,65 @@ fn bench_store_stress(allocator: std.mem.Allocator, log: *BenchLog) !void {
         }
     }
     const read_end = time_mod.Instant.now(io);
-    log.result(allocator, "store.get (1k point reads)", read_count, elapsed_us(read_start, read_end));
+    log.result(
+        allocator,
+        "store.get (1k point reads)",
+        read_count,
+        elapsed_us(read_start, read_end),
+    );
     std.debug.assert(found == read_count);
+}
 
+fn bench_store_stress_scans(
+    allocator: std.mem.Allocator,
+    log: *BenchLog,
+    event_store: *EventStore,
+    io: Io,
+) !void {
     const scan_start = time_mod.Instant.now(io);
     var total_scan_results: usize = 0;
-    for (services) |svc| {
+    for (stress_services) |svc| {
         var results = try event_store.scan_range(svc);
         total_scan_results += results.items.len;
         for (results.items) |*item| item.deinit(allocator);
         results.deinit(allocator);
     }
     const scan_end = time_mod.Instant.now(io);
-    log.result(allocator, "store.scan_range (5 prefix scans)", services.len, elapsed_us(scan_start, scan_end));
+    log.result(
+        allocator,
+        "store.scan_range (5 prefix scans)",
+        stress_services.len,
+        elapsed_us(scan_start, scan_end),
+    );
     log.note(allocator, "\n    total scan results: {}\n", .{total_scan_results});
-    log.note(allocator, "    memtable entries: {}\n", .{event_store.lsm.memtableCount()});
+    log.note(allocator, "    memtable entries: {}\n", .{event_store.lsm.memtable_count()});
 }
 
 fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !void {
-    const io = Io.Threaded.global_single_threaded.io();
-    {
-        const count: usize = 50_000;
-        const msg = Message{ .handshake = .{
+    try bench_protocol_round_trip(
+        allocator,
+        log,
+        "protocol handshake encode+decode (50k)",
+        50_000,
+        Message{ .handshake = .{
             .service_name = "order-service",
             .instance_id = "node-1",
-        } };
+        } },
+    );
 
-        const start = time_mod.Instant.now(io);
-        for (0..count) |_| {
-            const frame = try protocol.encode(allocator, msg);
-            var decoded = try protocol.decode(allocator, frame);
-            protocol.deinit(&decoded, allocator);
-            allocator.free(frame);
-        }
-        const end = time_mod.Instant.now(io);
-        log.result(allocator, "protocol handshake encode+decode (50k)", count, elapsed_us(start, end));
-    }
-
-    {
-        const count: usize = 50_000;
-        const msg = Message{ .pull_request = .{
+    try bench_protocol_round_trip(
+        allocator,
+        log,
+        "protocol pull_request encode+decode (50k)",
+        50_000,
+        Message{ .pull_request = .{
             .event_type = "order.created",
             .from_sequence = 42,
             .max_count = 100,
-        } };
-
-        const start = time_mod.Instant.now(io);
-        for (0..count) |_| {
-            const frame = try protocol.encode(allocator, msg);
-            var decoded = try protocol.decode(allocator, frame);
-            protocol.deinit(&decoded, allocator);
-            allocator.free(frame);
-        }
-        const end = time_mod.Instant.now(io);
-        log.result(allocator, "protocol pull_request encode+decode (50k)", count, elapsed_us(start, end));
-    }
+        } },
+    );
 
     {
-        const count: usize = 10_000;
         var entries: [10]protocol.PullResponse.EventEntry = undefined;
         for (&entries, 0..) |*e, i| {
             e.* = .{
@@ -573,47 +671,63 @@ fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !v
             allocator.free(e.value);
         };
 
-        const msg = Message{ .pull_response = .{ .events = &entries } };
-
-        const start = time_mod.Instant.now(io);
-        for (0..count) |_| {
-            const frame = try protocol.encode(allocator, msg);
-            var decoded = try protocol.decode(allocator, frame);
-            protocol.deinit(&decoded, allocator);
-            allocator.free(frame);
-        }
-        const end = time_mod.Instant.now(io);
-        log.result(allocator, "protocol pull_response(10 events) enc+dec (10k)", count, elapsed_us(start, end));
+        try bench_protocol_round_trip(
+            allocator,
+            log,
+            "protocol pull_response(10 events) enc+dec (10k)",
+            10_000,
+            Message{ .pull_response = .{ .events = &entries } },
+        );
     }
 
-    {
-        const count: usize = 1_000;
-        const entries_list = try allocator.alloc(protocol.PullResponse.EventEntry, 100);
-        defer allocator.free(entries_list);
+    try bench_protocol_pull_response_large(allocator, log);
+}
 
-        for (entries_list, 0..) |*e, i| {
-            e.* = .{
-                .key = try std.fmt.allocPrint(allocator, "evt:svc:type:{x:0>16}", .{i + 1}),
-                .value = try std.fmt.allocPrint(allocator, "{}|100|24|svc|type|{{\"data\":\"payload-{}\"}}", .{ i + 1, i + 1 }),
-            };
-        }
-        defer for (entries_list) |e| {
-            allocator.free(e.key);
-            allocator.free(e.value);
+fn bench_protocol_pull_response_large(allocator: std.mem.Allocator, log: *BenchLog) !void {
+    const entries_list = try allocator.alloc(protocol.PullResponse.EventEntry, 100);
+    defer allocator.free(entries_list);
+
+    for (entries_list, 0..) |*e, i| {
+        e.* = .{
+            .key = try std.fmt.allocPrint(allocator, "evt:svc:type:{x:0>16}", .{i + 1}),
+            .value = try std.fmt.allocPrint(
+                allocator,
+                "{}|100|24|svc|type|{{\"data\":\"payload-{}\"}}",
+                .{ i + 1, i + 1 },
+            ),
         };
-
-        const msg = Message{ .pull_response = .{ .events = entries_list } };
-
-        const start = time_mod.Instant.now(io);
-        for (0..count) |_| {
-            const frame = try protocol.encode(allocator, msg);
-            var decoded = try protocol.decode(allocator, frame);
-            protocol.deinit(&decoded, allocator);
-            allocator.free(frame);
-        }
-        const end = time_mod.Instant.now(io);
-        log.result(allocator, "protocol pull_response(100 events) enc+dec (1k)", count, elapsed_us(start, end));
     }
+    defer for (entries_list) |e| {
+        allocator.free(e.key);
+        allocator.free(e.value);
+    };
+
+    try bench_protocol_round_trip(
+        allocator,
+        log,
+        "protocol pull_response(100 events) enc+dec (1k)",
+        1_000,
+        Message{ .pull_response = .{ .events = entries_list } },
+    );
+}
+
+fn bench_protocol_round_trip(
+    allocator: std.mem.Allocator,
+    log: *BenchLog,
+    label: []const u8,
+    count: usize,
+    msg: Message,
+) !void {
+    const io = Io.Threaded.global_single_threaded.io();
+    const start = time_mod.Instant.now(io);
+    for (0..count) |_| {
+        const frame = try protocol.encode(allocator, msg);
+        var decoded = try protocol.decode(allocator, frame);
+        protocol.deinit(&decoded, allocator);
+        allocator.free(frame);
+    }
+    const end = time_mod.Instant.now(io);
+    log.result(allocator, label, count, elapsed_us(start, end));
 }
 
 fn bench_transport_handshake(allocator: std.mem.Allocator, log: *BenchLog) !void {
@@ -623,7 +737,7 @@ fn bench_transport_handshake(allocator: std.mem.Allocator, log: *BenchLog) !void
 
     var listener = try transport.Listener.init(allocator, "127.0.0.1:0", io);
     defer listener.deinit();
-    const port = listener.getPort();
+    const port = listener.get_port();
 
     const count: usize = 500;
 
@@ -632,8 +746,8 @@ fn bench_transport_handshake(allocator: std.mem.Allocator, log: *BenchLog) !void
             for (0..n) |_| {
                 const conn = l.accept() catch return;
                 defer conn.destroy();
-                var msg = conn.recvMessage() catch return;
-                conn.sendMessage(msg) catch {};
+                var msg = conn.recv_message() catch return;
+                conn.send_message(msg) catch {};
                 protocol.deinit(&msg, l.allocator);
             }
         }
@@ -645,18 +759,23 @@ fn bench_transport_handshake(allocator: std.mem.Allocator, log: *BenchLog) !void
     const start = time_mod.Instant.now(io);
     for (0..count) |_| {
         const conn = try transport.dial(allocator, addr_str, io);
-        try conn.sendMessage(.{ .handshake = .{
+        try conn.send_message(.{ .handshake = .{
             .service_name = "bench-service",
             .instance_id = "bench-1",
         } });
-        var resp = try conn.recvMessage();
+        var resp = try conn.recv_message();
         protocol.deinit(&resp, allocator);
         conn.destroy();
     }
     const end = time_mod.Instant.now(io);
 
     server_thread.join();
-    log.result(allocator, "transport dial+handshake round-trip (500)", count, elapsed_us(start, end));
+    log.result(
+        allocator,
+        "transport dial+handshake round-trip (500)",
+        count,
+        elapsed_us(start, end),
+    );
 }
 
 fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog) !void {
@@ -666,7 +785,7 @@ fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog)
 
     var listener = try transport.Listener.init(allocator, "127.0.0.1:0", io);
     defer listener.deinit();
-    const port = listener.getPort();
+    const port = listener.get_port();
 
     const rounds: usize = 500;
     const events_per_response: usize = 20;
@@ -674,8 +793,16 @@ fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog)
     var entries: [events_per_response]protocol.PullResponse.EventEntry = undefined;
     for (&entries, 0..) |*e, i| {
         e.* = .{
-            .key = try std.fmt.allocPrint(allocator, "evt:order-svc:order.created:{x:0>16}", .{i + 1}),
-            .value = try std.fmt.allocPrint(allocator, "{}|100|2|order-svc|order.created|{{}}", .{i + 1}),
+            .key = try std.fmt.allocPrint(
+                allocator,
+                "evt:order-svc:order.created:{x:0>16}",
+                .{i + 1},
+            ),
+            .value = try std.fmt.allocPrint(
+                allocator,
+                "{}|100|2|order-svc|order.created|{{}}",
+                .{i + 1},
+            ),
         };
     }
     defer for (&entries) |e| {
@@ -684,18 +811,22 @@ fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog)
     };
 
     const server_thread = try std.Thread.spawn(.{}, struct {
-        fn run(l: *transport.Listener, n: usize, evts: []const protocol.PullResponse.EventEntry) void {
+        fn run(
+            l: *transport.Listener,
+            n: usize,
+            evts: []const protocol.PullResponse.EventEntry,
+        ) void {
             const conn = l.accept() catch return;
             defer conn.destroy();
 
             // Receive handshake
-            var hs = conn.recvMessage() catch return;
+            var hs = conn.recv_message() catch return;
             protocol.deinit(&hs, l.allocator);
 
             for (0..n) |_| {
-                var req = conn.recvMessage() catch return;
+                var req = conn.recv_message() catch return;
                 protocol.deinit(&req, l.allocator);
-                conn.sendMessage(.{ .pull_response = .{ .events = evts } }) catch return;
+                conn.send_message(.{ .pull_response = .{ .events = evts } }) catch return;
             }
         }
     }.run, .{ &listener, rounds, &entries });
@@ -706,7 +837,7 @@ fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog)
     const conn = try transport.dial(allocator, addr_str, io);
     defer conn.destroy();
 
-    try conn.sendMessage(.{ .handshake = .{
+    try conn.send_message(.{ .handshake = .{
         .service_name = "bench-client",
         .instance_id = "bc-1",
     } });
@@ -714,20 +845,25 @@ fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog)
     var total_events: usize = 0;
     const start = time_mod.Instant.now(io);
     for (0..rounds) |_| {
-        try conn.sendMessage(.{ .pull_request = .{
+        try conn.send_message(.{ .pull_request = .{
             .event_type = "order.created",
             .from_sequence = 0,
             .max_count = 0,
         } });
 
-        var resp = try conn.recvMessage();
+        var resp = try conn.recv_message();
         total_events += resp.pull_response.events.len;
         protocol.deinit(&resp, allocator);
     }
     const end = time_mod.Instant.now(io);
 
     server_thread.join();
-    log.result(allocator, "transport pull req+resp (500 rounds, 20 events each)", rounds, elapsed_us(start, end));
+    log.result(
+        allocator,
+        "transport pull req+resp (500 rounds, 20 events each)",
+        rounds,
+        elapsed_us(start, end),
+    );
     log.note(allocator, "    total events transferred: {}\n", .{total_events});
 }
 
@@ -738,7 +874,7 @@ fn bench_transport_message_burst(allocator: std.mem.Allocator, log: *BenchLog) !
 
     var listener = try transport.Listener.init(allocator, "127.0.0.1:0", io);
     defer listener.deinit();
-    const port = listener.getPort();
+    const port = listener.get_port();
 
     const count: usize = 5_000;
 
@@ -748,8 +884,8 @@ fn bench_transport_message_burst(allocator: std.mem.Allocator, log: *BenchLog) !
             const conn = l.accept() catch return;
             defer conn.destroy();
             for (0..n) |_| {
-                var msg = conn.recvMessage() catch return;
-                conn.sendMessage(msg) catch {};
+                var msg = conn.recv_message() catch return;
+                conn.send_message(msg) catch {};
                 protocol.deinit(&msg, l.allocator);
             }
         }
@@ -763,18 +899,23 @@ fn bench_transport_message_burst(allocator: std.mem.Allocator, log: *BenchLog) !
 
     const start = time_mod.Instant.now(io);
     for (0..count) |i| {
-        try conn.sendMessage(.{ .pull_request = .{
+        try conn.send_message(.{ .pull_request = .{
             .event_type = "order.created",
             .from_sequence = i,
             .max_count = 100,
         } });
-        var resp = try conn.recvMessage();
+        var resp = try conn.recv_message();
         protocol.deinit(&resp, allocator);
     }
     const end = time_mod.Instant.now(io);
 
     server_thread.join();
-    log.result(allocator, "transport message echo on single conn (5k)", count, elapsed_us(start, end));
+    log.result(
+        allocator,
+        "transport message echo on single conn (5k)",
+        count,
+        elapsed_us(start, end),
+    );
 }
 
 fn bench_memtable_insert(allocator: std.mem.Allocator, log: *BenchLog) !void {
@@ -860,7 +1001,7 @@ fn bench_sstable_write(allocator: std.mem.Allocator, log: *BenchLog) !void {
     }
 
     const start = time_mod.Instant.now(io);
-    _ = try sstable.writeSSTable(allocator, path, io, entries);
+    _ = try sstable.write_sstable(allocator, path, io, entries);
     const end = time_mod.Instant.now(io);
 
     log.result(allocator, "sstable.write (10k entries)", count, elapsed_us(start, end));
@@ -898,7 +1039,7 @@ fn bench_sstable_read(allocator: std.mem.Allocator, log: *BenchLog) !void {
         keys[i] = k;
     }
 
-    _ = try sstable.writeSSTable(allocator, path, io, entries);
+    _ = try sstable.write_sstable(allocator, path, io, entries);
 
     var reader = try sstable.SSTableReader.open(allocator, path, io);
     defer reader.deinit();
@@ -958,7 +1099,12 @@ fn bench_lsm_put_get(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const read_end = time_mod.Instant.now(io);
 
     std.debug.assert(found == read_count);
-    log.result(allocator, "lsm.get (5k reads, in-memtable)", read_count, elapsed_us(read_start, read_end));
+    log.result(
+        allocator,
+        "lsm.get (5k reads, in-memtable)",
+        read_count,
+        elapsed_us(read_start, read_end),
+    );
 }
 
 fn bench_lsm_flush(allocator: std.mem.Allocator, log: *BenchLog) !void {
@@ -978,7 +1124,14 @@ fn bench_lsm_flush(allocator: std.mem.Allocator, log: *BenchLog) !void {
     for (0..count) |i| {
         const key = try std.fmt.allocPrint(allocator, "flush:k{d:0>8}", .{i});
         defer allocator.free(key);
-        const val = try EventValue.init(allocator, i + 1, "svc", "evt", "{\"data\":\"some payload\"}", 0);
+        const val = try EventValue.init(
+            allocator,
+            i + 1,
+            "svc",
+            "evt",
+            "{\"data\":\"some payload\"}",
+            0,
+        );
         try lsm.put(key, val);
     }
 
@@ -987,7 +1140,7 @@ fn bench_lsm_flush(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const end = time_mod.Instant.now(io);
 
     log.result(allocator, "lsm.flush (10k entries -> SSTable)", 1, elapsed_us(start, end));
-    log.note(allocator, "    SSTable count after flush: {}\n", .{lsm.sstableCount()});
+    log.note(allocator, "    SSTable count after flush: {}\n", .{lsm.sstable_count()});
 
     // Read after flush (from SSTable)
     var found: usize = 0;
@@ -1004,7 +1157,12 @@ fn bench_lsm_flush(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const read_end = time_mod.Instant.now(io);
 
     std.debug.assert(found == 1_000);
-    log.result(allocator, "lsm.get after flush (1k reads from SSTable)", 1_000, elapsed_us(read_start, read_end));
+    log.result(
+        allocator,
+        "lsm.get after flush (1k reads from SSTable)",
+        1_000,
+        elapsed_us(read_start, read_end),
+    );
 }
 
 fn bench_lsm_scan(allocator: std.mem.Allocator, log: *BenchLog) !void {
@@ -1046,7 +1204,7 @@ fn bench_lsm_scan(allocator: std.mem.Allocator, log: *BenchLog) !void {
     const start = time_mod.Instant.now(io);
     for (0..scans) |i| {
         const prefix = services[i % services.len];
-        var results = ArrayList(KeyValuePair){};
+        var results = ArrayList(KeyValuePair).empty;
         try lsm.scan_prefix(prefix, &results);
         total_results += results.items.len;
         for (results.items) |*item| item.deinit(allocator);
@@ -1054,12 +1212,17 @@ fn bench_lsm_scan(allocator: std.mem.Allocator, log: *BenchLog) !void {
     }
     const end = time_mod.Instant.now(io);
 
-    log.result(allocator, "lsm.scan_prefix (50 scans, cross memtable+SST)", scans, elapsed_us(start, end));
+    log.result(
+        allocator,
+        "lsm.scan_prefix (50 scans, cross memtable+SST)",
+        scans,
+        elapsed_us(start, end),
+    );
     log.note(allocator, "    total matched results: {}\n", .{total_results});
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

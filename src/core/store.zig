@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 
 const lsm_mod = @import("lsm.zig");
@@ -15,13 +16,29 @@ const EventValue = event.EventValue;
 const KeyValuePair = event.KeyValuePair;
 const Breadcrumb = breadcrumb_mod.Breadcrumb;
 
-pub const EVENT_PREFIX = "evt:";
+pub const event_prefix = "evt:";
 
-pub fn makeEventKey(allocator: std.mem.Allocator, origin: []const u8, event_type: []const u8, sequence: u64) ![]const u8 {
-    return try std.fmt.allocPrint(allocator, "evt:{s}:{s}:{x:0>16}", .{ origin, event_type, sequence });
+pub fn make_event_key(
+    allocator: std.mem.Allocator,
+    origin: []const u8,
+    event_type: []const u8,
+    sequence: u64,
+) ![]const u8 {
+    assert(origin.len > 0);
+    const key = try std.fmt.allocPrint(allocator, "evt:{s}:{s}:{x:0>16}", .{
+        origin,
+        event_type,
+        sequence,
+    });
+    assert(std.mem.startsWith(u8, key, event_prefix));
+    return key;
 }
 
-pub fn makeEventPrefix(allocator: std.mem.Allocator, origin: []const u8, event_type: []const u8) ![]const u8 {
+pub fn make_event_prefix(
+    allocator: std.mem.Allocator,
+    origin: []const u8,
+    event_type: []const u8,
+) ![]const u8 {
     return try std.fmt.allocPrint(allocator, "evt:{s}:{s}:", .{ origin, event_type });
 }
 
@@ -43,7 +60,12 @@ pub const EventStore = struct {
     next_sequence: u64,
     io: Io,
 
-    pub fn init(allocator: std.mem.Allocator, wal_path: []const u8, io: Io, config: Config) !EventStore {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        wal_path: []const u8,
+        io: Io,
+        config: Config,
+    ) !EventStore {
         const lsm_ptr = try allocator.create(LSMEngine);
         errdefer allocator.destroy(lsm_ptr);
 
@@ -55,7 +77,7 @@ pub const EventStore = struct {
             const prefix = try std.fmt.allocPrint(allocator, "evt:{s}:", .{id});
             defer allocator.free(prefix);
 
-            var local_events = ArrayList(KeyValuePair){};
+            var local_events = ArrayList(KeyValuePair).empty;
             try lsm_ptr.scan_prefix(prefix, &local_events);
             defer {
                 for (local_events.items) |*item| item.deinit(allocator);
@@ -92,49 +114,64 @@ pub const EventStore = struct {
     }
 
     pub fn scan_range(self: *EventStore, prefix: []const u8) !ArrayList(KeyValuePair) {
-        var results = ArrayList(KeyValuePair){};
+        var results = ArrayList(KeyValuePair).empty;
         try self.lsm.scan_prefix(prefix, &results);
         return results;
     }
 
-    pub fn get_stats(self: *const EventStore) void {
-        std.debug.print("Store Statistics:\n", .{});
-        std.debug.print("Memtable entries: {}\n", .{self.lsm.memtableCount()});
-        std.debug.print("SSTable count: {}\n", .{self.lsm.sstableCount()});
-    }
-
-    pub fn put_breadcrumb(self: *EventStore, bc: Breadcrumb, local_sequence: u64, self_service: []const u8, timestamp: i64) !void {
-        const key = try Breadcrumb.makeKey(self.allocator, bc.source_service, bc.event_type);
+    pub fn put_breadcrumb(
+        self: *EventStore,
+        bc: Breadcrumb,
+        local_sequence: u64,
+        self_service: []const u8,
+        timestamp: i64,
+    ) !void {
+        const key = try Breadcrumb.make_key(self.allocator, bc.source_service, bc.event_type);
         defer self.allocator.free(key);
 
-        const ev = try bc.toEventValue(self.allocator, local_sequence, self_service, timestamp);
+        const ev = try bc.to_event_value(self.allocator, local_sequence, self_service, timestamp);
         try self.put(key, ev);
     }
 
-    pub fn get_breadcrumb(self: *EventStore, source_service: []const u8, event_type: []const u8) !?Breadcrumb {
-        const key = try Breadcrumb.makeKey(self.allocator, source_service, event_type);
+    pub fn get_breadcrumb(
+        self: *EventStore,
+        source_service: []const u8,
+        event_type: []const u8,
+    ) !?Breadcrumb {
+        const key = try Breadcrumb.make_key(self.allocator, source_service, event_type);
         defer self.allocator.free(key);
 
         if (try self.get(key)) |ev_c| {
             var ev = ev_c;
             defer ev.deinit(self.allocator);
-            return try Breadcrumb.fromWalEntry(self.allocator, key, ev);
+            return try Breadcrumb.from_wal_entry(self.allocator, key, ev);
         }
 
         return null;
     }
 
     pub fn put_event(self: *EventStore, value: EventValue) !void {
-        const key = try makeEventKey(self.allocator, value.origin_service, value.event_type, value.sequence);
+        const key = try make_event_key(
+            self.allocator,
+            value.origin_service,
+            value.event_type,
+            value.sequence,
+        );
         defer self.allocator.free(key);
         try self.put(key, value);
     }
 
-    pub fn put_event_local(self: *EventStore, event_type: []const u8, payload: []const u8) !PutResult {
+    pub fn put_event_local(
+        self: *EventStore,
+        event_type: []const u8,
+        payload: []const u8,
+    ) !PutResult {
         const id = self.identity orelse return error.NoIdentity;
+        assert(id.len > 0);
 
         self.next_sequence += 1;
         const seq = self.next_sequence;
+        assert(seq > 0);
         const now: i64 = @intCast(time_mod.Instant.now(self.io).timestamp.sec);
 
         var ev = try EventValue.init(self.allocator, seq, id, event_type, payload, now);
@@ -145,10 +182,15 @@ pub const EventStore = struct {
     }
 
     pub fn ingest_event(self: *EventStore, value: EventValue) !void {
-        if (!self.isAllowedByContract(value.origin_service, value.event_type))
+        if (!self.is_allowed_by_contract(value.origin_service, value.event_type))
             return error.UnauthorizedOrigin;
 
-        const key = try makeEventKey(self.allocator, value.origin_service, value.event_type, value.sequence);
+        const key = try make_event_key(
+            self.allocator,
+            value.origin_service,
+            value.event_type,
+            value.sequence,
+        );
         defer self.allocator.free(key);
         if (try self.lsm.contains(key)) {
             var v = value;
@@ -159,23 +201,32 @@ pub const EventStore = struct {
         try self.put(key, value);
     }
 
-    fn isAllowedByContract(self: *const EventStore, origin: []const u8, event_type: []const u8) bool {
+    fn is_allowed_by_contract(
+        self: *const EventStore,
+        origin: []const u8,
+        event_type: []const u8,
+    ) bool {
         if (self.identity == null) return true;
         if (std.mem.eql(u8, origin, self.identity.?)) return true;
         for (self.contracts) |contract| {
-            if (contract.matchesEvent(origin, event_type)) return true;
+            if (contract.matches_event(origin, event_type)) return true;
         }
         return false;
     }
 
-    pub fn query_events(self: *EventStore, origin: []const u8, event_type: []const u8, from_sequence: u64) !ArrayList(EventValue) {
-        const prefix = try makeEventPrefix(self.allocator, origin, event_type);
+    pub fn query_events(
+        self: *EventStore,
+        origin: []const u8,
+        event_type: []const u8,
+        from_sequence: u64,
+    ) !ArrayList(EventValue) {
+        const prefix = try make_event_prefix(self.allocator, origin, event_type);
         defer self.allocator.free(prefix);
 
         var scan_results = try self.scan_range(prefix);
         defer scan_results.deinit(self.allocator);
 
-        var results = ArrayList(EventValue){};
+        var results = ArrayList(EventValue).empty;
         errdefer {
             for (results.items) |*v| v.deinit(self.allocator);
             results.deinit(self.allocator);
@@ -196,11 +247,18 @@ pub const EventStore = struct {
             }
         }.lessThan);
 
+        for (results.items) |v| assert(v.sequence >= from_sequence);
+        if (results.items.len > 1) {
+            for (results.items[1..], 0..) |v, i| {
+                assert(results.items[i].sequence <= v.sequence);
+            }
+        }
+
         return results;
     }
 
     pub fn get_breadcrumbs(self: *EventStore) !ArrayList(Breadcrumb) {
-        var scan_results = try self.scan_range(breadcrumb_mod.KEY_PREFIX);
+        var scan_results = try self.scan_range(breadcrumb_mod.key_prefix);
         defer {
             for (scan_results.items) |*item| {
                 item.deinit(self.allocator);
@@ -208,14 +266,14 @@ pub const EventStore = struct {
             scan_results.deinit(self.allocator);
         }
 
-        var breadcrumbs = ArrayList(Breadcrumb){};
+        var breadcrumbs = ArrayList(Breadcrumb).empty;
         errdefer {
             for (breadcrumbs.items) |*bc| bc.deinit(self.allocator);
             breadcrumbs.deinit(self.allocator);
         }
 
         for (scan_results.items) |item| {
-            if (try Breadcrumb.fromWalEntry(self.allocator, item.key, item.value)) |bc| {
+            if (try Breadcrumb.from_wal_entry(self.allocator, item.key, item.value)) |bc| {
                 try breadcrumbs.append(self.allocator, bc);
             }
         }
@@ -225,6 +283,7 @@ pub const EventStore = struct {
 };
 
 test {
+    _ = @import("radix.zig");
     _ = @import("wal.zig");
     _ = @import("wal_cursor.zig");
     _ = @import("breadcrumb.zig");
@@ -244,9 +303,7 @@ test {
 }
 
 test "basic operations" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -260,10 +317,26 @@ test "basic operations" {
         event_type: []const u8,
         payload: []const u8,
     }{
-        .{ .key = "user-service:u123:profile", .event_type = "user.registered", .payload = "{\"email\":\"john@example.com\"}" },
-        .{ .key = "user-service:u124:profile", .event_type = "user.registered", .payload = "{\"email\":\"jane@example.com\"}" },
-        .{ .key = "order-service:o456:order", .event_type = "order.created", .payload = "{\"amount\":99.99,\"user\":\"u123\"}" },
-        .{ .key = "user-service:u123:settings", .event_type = "user.updated", .payload = "{\"theme\":\"dark\"}" },
+        .{
+            .key = "user-service:u123:profile",
+            .event_type = "user.registered",
+            .payload = "{\"email\":\"john@example.com\"}",
+        },
+        .{
+            .key = "user-service:u124:profile",
+            .event_type = "user.registered",
+            .payload = "{\"email\":\"jane@example.com\"}",
+        },
+        .{
+            .key = "order-service:o456:order",
+            .event_type = "order.created",
+            .payload = "{\"amount\":99.99,\"user\":\"u123\"}",
+        },
+        .{
+            .key = "user-service:u123:settings",
+            .event_type = "user.updated",
+            .payload = "{\"theme\":\"dark\"}",
+        },
     };
 
     for (sample_events, 0..) |sample, i| {
@@ -292,9 +365,7 @@ test "basic operations" {
 }
 
 test "bulk inserts" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -341,9 +412,7 @@ test "bulk inserts" {
 }
 
 test "range scans" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -357,14 +426,37 @@ test "range scans" {
         event_type: []const u8,
         payload: []const u8,
     }{
-        .{ .key = "user-service:u123:profile", .event_type = "user.registered", .payload = "{\"email\":\"john@example.com\"}" },
-        .{ .key = "user-service:u124:profile", .event_type = "user.registered", .payload = "{\"email\":\"jane@example.com\"}" },
-        .{ .key = "order-service:o456:order", .event_type = "order.created", .payload = "{\"amount\":99.99,\"user\":\"u123\"}" },
-        .{ .key = "user-service:u123:settings", .event_type = "user.updated", .payload = "{\"theme\":\"dark\"}" },
+        .{
+            .key = "user-service:u123:profile",
+            .event_type = "user.registered",
+            .payload = "{\"email\":\"john@example.com\"}",
+        },
+        .{
+            .key = "user-service:u124:profile",
+            .event_type = "user.registered",
+            .payload = "{\"email\":\"jane@example.com\"}",
+        },
+        .{
+            .key = "order-service:o456:order",
+            .event_type = "order.created",
+            .payload = "{\"amount\":99.99,\"user\":\"u123\"}",
+        },
+        .{
+            .key = "user-service:u123:settings",
+            .event_type = "user.updated",
+            .payload = "{\"theme\":\"dark\"}",
+        },
     };
 
     for (sample_events, 0..) |sample, i| {
-        const value = try EventValue.init(allocator, i + 2000, "test-service", sample.event_type, sample.payload, @truncate(time_mod.Instant.now(io).timestamp.nsec));
+        const value = try EventValue.init(
+            allocator,
+            i + 2000,
+            "test-service",
+            sample.event_type,
+            sample.payload,
+            @truncate(time_mod.Instant.now(io).timestamp.nsec),
+        );
         try event_store.put(sample.key, value);
     }
 
@@ -395,15 +487,18 @@ test "range scans" {
 }
 
 test "concurrent simulation" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
     const io = threaded.io();
 
-    var event_store = try EventStore.init(allocator, "data/test_concurrent_simulation.wal", io, .{});
+    var event_store = try EventStore.init(
+        allocator,
+        "data/test_concurrent_simulation.wal",
+        io,
+        .{},
+    );
     defer event_store.deinit();
 
     const operations = [_]struct {
@@ -412,13 +507,38 @@ test "concurrent simulation" {
         event_type: []const u8,
         payload: []const u8,
     }{
-        .{ .operation_type = "write", .key = "session:s1:login", .event_type = "user.login", .payload = "{\"user\":\"alice\",\"ip\":\"192.168.1.1\"}" },
-        .{ .operation_type = "write", .key = "cart:c1:add", .event_type = "cart.item_added", .payload = "{\"item\":\"laptop\",\"qty\":1}" },
+        .{
+            .operation_type = "write",
+            .key = "session:s1:login",
+            .event_type = "user.login",
+            .payload = "{\"user\":\"alice\",\"ip\":\"192.168.1.1\"}",
+        },
+        .{
+            .operation_type = "write",
+            .key = "cart:c1:add",
+            .event_type = "cart.item_added",
+            .payload = "{\"item\":\"laptop\",\"qty\":1}",
+        },
         .{ .operation_type = "read", .key = "session:s1:login", .event_type = "", .payload = "" },
-        .{ .operation_type = "write", .key = "session:s1:logout", .event_type = "user.logout", .payload = "{\"duration\":3600}" },
-        .{ .operation_type = "write", .key = "cart:c1:checkout", .event_type = "cart.checkout", .payload = "{\"total\":1299.99}" },
+        .{
+            .operation_type = "write",
+            .key = "session:s1:logout",
+            .event_type = "user.logout",
+            .payload = "{\"duration\":3600}",
+        },
+        .{
+            .operation_type = "write",
+            .key = "cart:c1:checkout",
+            .event_type = "cart.checkout",
+            .payload = "{\"total\":1299.99}",
+        },
         .{ .operation_type = "read", .key = "cart:c1:add", .event_type = "", .payload = "" },
-        .{ .operation_type = "write", .key = "session:s2:login", .event_type = "user.login", .payload = "{\"user\":\"bob\",\"ip\":\"192.168.1.2\"}" },
+        .{
+            .operation_type = "write",
+            .key = "session:s2:login",
+            .event_type = "user.login",
+            .payload = "{\"user\":\"bob\",\"ip\":\"192.168.1.2\"}",
+        },
     };
 
     var sequence: u64 = 3000;
@@ -427,7 +547,14 @@ test "concurrent simulation" {
 
     for (operations) |op| {
         if (std.mem.eql(u8, op.operation_type, "write")) {
-            const value = try EventValue.init(allocator, sequence, "test-service", op.event_type, op.payload, @truncate(time_mod.Instant.now(io).timestamp.nsec));
+            const value = try EventValue.init(
+                allocator,
+                sequence,
+                "test-service",
+                op.event_type,
+                op.payload,
+                @truncate(time_mod.Instant.now(io).timestamp.nsec),
+            );
             try event_store.put(op.key, value);
             writes_performed += 1;
             sequence += 1;
@@ -454,9 +581,7 @@ test "concurrent simulation" {
 }
 
 test "persistence recovery" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -473,9 +598,21 @@ test "persistence recovery" {
         event_type: []const u8,
         payload: []const u8,
     }{
-        .{ .key = "user:alice", .event_type = "user.registered", .payload = "{\"email\":\"alice@example.com\",\"instance\":1}" },
-        .{ .key = "order:12345", .event_type = "order.created", .payload = "{\"amount\":99.99,\"user\":\"alice\"}" },
-        .{ .key = "session:alice-s1", .event_type = "user.login", .payload = "{\"user\":\"alice\",\"ip\":\"192.168.1.1\"}" },
+        .{
+            .key = "user:alice",
+            .event_type = "user.registered",
+            .payload = "{\"email\":\"alice@example.com\",\"instance\":1}",
+        },
+        .{
+            .key = "order:12345",
+            .event_type = "order.created",
+            .payload = "{\"amount\":99.99,\"user\":\"alice\"}",
+        },
+        .{
+            .key = "session:alice-s1",
+            .event_type = "user.login",
+            .payload = "{\"user\":\"alice\",\"ip\":\"192.168.1.1\"}",
+        },
     };
 
     for (instance1_events, 0..) |test_event, i| {
@@ -495,9 +632,21 @@ test "persistence recovery" {
         event_type: []const u8,
         payload: []const u8,
     }{
-        .{ .key = "user:bob", .event_type = "user.registered", .payload = "{\"email\":\"bob@example.com\",\"instance\":2}" },
-        .{ .key = "order:67890", .event_type = "order.created", .payload = "{\"amount\":149.99,\"user\":\"bob\"}" },
-        .{ .key = "session:bob-s1", .event_type = "user.login", .payload = "{\"user\":\"bob\",\"ip\":\"192.168.1.2\"}" },
+        .{
+            .key = "user:bob",
+            .event_type = "user.registered",
+            .payload = "{\"email\":\"bob@example.com\",\"instance\":2}",
+        },
+        .{
+            .key = "order:67890",
+            .event_type = "order.created",
+            .payload = "{\"amount\":149.99,\"user\":\"bob\"}",
+        },
+        .{
+            .key = "session:bob-s1",
+            .event_type = "user.login",
+            .payload = "{\"user\":\"bob\",\"ip\":\"192.168.1.2\"}",
+        },
     };
 
     for (instance2_events, 0..) |test_event, i| {
@@ -544,9 +693,7 @@ test "persistence recovery" {
 }
 
 test "edge cases" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -574,17 +721,32 @@ test "edge cases" {
         return error.EmptyValueNotFound;
     }
 
-    const long_key = try std.fmt.allocPrint(allocator, "edge:very:long:key:with:many:segments:and:even:more:segments:to:make:it:really:long:{}", .{time_mod.Instant.now(io).timestamp.nsec});
+    const long_key = try std.fmt.allocPrint(
+        allocator,
+        "edge:very:long:key:with:many:segments:and:even:more:" ++
+            "segments:to:make:it:really:long:{}",
+        .{time_mod.Instant.now(io).timestamp.nsec},
+    );
     defer allocator.free(long_key);
 
     const long_payload = try std.fmt.allocPrint(
         allocator,
-        "{{\"description\":\"This is a very long payload designed to test how the system handles large amounts of data in a single event. It contains multiple sentences and should stress test the serialization and storage mechanisms.\",\"data\":[{}]}}",
+        "{{\"description\":\"This is a very long payload designed to test how the system " ++
+            "handles large amounts of data in a single event. It contains multiple " ++
+            "sentences and should stress test the serialization and storage " ++
+            "mechanisms.\",\"data\":[{}]}}",
         .{time_mod.Instant.now(io).timestamp.nsec},
     );
     defer allocator.free(long_payload);
 
-    const long_value = try EventValue.init(allocator, 6001, "test-service", "test.long_data", long_payload, @truncate(time_mod.Instant.now(io).timestamp.nsec));
+    const long_value = try EventValue.init(
+        allocator,
+        6001,
+        "test-service",
+        "test.long_data",
+        long_payload,
+        @truncate(time_mod.Instant.now(io).timestamp.nsec),
+    );
     try event_store.put(long_key, long_value);
 
     if (try event_store.get(long_key)) |fv_c| {
@@ -658,9 +820,7 @@ test "edge cases" {
 }
 
 test "put_breadcrumb and get_breadcrumb round-trip" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -699,9 +859,7 @@ test "put_breadcrumb and get_breadcrumb round-trip" {
 }
 
 test "get_breadcrumbs returns all breadcrumbs" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -745,9 +903,7 @@ test "get_breadcrumbs returns all breadcrumbs" {
 }
 
 test "breadcrumbs and domain events coexist" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -763,7 +919,14 @@ test "breadcrumbs and domain events coexist" {
         Io.Dir.cwd().deleteFile(io, "data/test_bc_coexist.crumb") catch {};
     }
 
-    const domain_ev = try EventValue.init(allocator, 1, "my-service", "user.registered", "{\"email\":\"test@test.com\"}", 100);
+    const domain_ev = try EventValue.init(
+        allocator,
+        1,
+        "my-service",
+        "user.registered",
+        "{\"email\":\"test@test.com\"}",
+        100,
+    );
     try event_store.put("user-service:u1:profile", domain_ev);
 
     const bc = Breadcrumb{
@@ -798,9 +961,7 @@ test "breadcrumbs and domain events coexist" {
 }
 
 test "breadcrumb survives WAL replay" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -844,9 +1005,7 @@ test "breadcrumb survives WAL replay" {
 }
 
 test "put_event and query_events basic" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -865,7 +1024,14 @@ test "put_event and query_events basic" {
     for (1..6) |i| {
         const payload = try std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{i});
         defer allocator.free(payload);
-        const ev = try EventValue.init(allocator, i, "order-service", "order.created", payload, @intCast(i * 100));
+        const ev = try EventValue.init(
+            allocator,
+            i,
+            "order-service",
+            "order.created",
+            payload,
+            @intCast(i * 100),
+        );
         try store.put_event(ev);
     }
 
@@ -882,9 +1048,7 @@ test "put_event and query_events basic" {
 }
 
 test "query_events filters by from_sequence" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -901,7 +1065,14 @@ test "query_events filters by from_sequence" {
     }
 
     for (1..11) |i| {
-        const ev = try EventValue.init(allocator, i, "order-service", "order.created", "{}", @intCast(i * 100));
+        const ev = try EventValue.init(
+            allocator,
+            i,
+            "order-service",
+            "order.created",
+            "{}",
+            @intCast(i * 100),
+        );
         try store.put_event(ev);
     }
 
@@ -916,9 +1087,7 @@ test "query_events filters by from_sequence" {
 }
 
 test "query_events isolates by origin and event_type" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -935,15 +1104,36 @@ test "query_events isolates by origin and event_type" {
     }
 
     for (1..4) |i| {
-        const ev = try EventValue.init(allocator, i, "order-service", "order.created", "{}", @intCast(i));
+        const ev = try EventValue.init(
+            allocator,
+            i,
+            "order-service",
+            "order.created",
+            "{}",
+            @intCast(i),
+        );
         try store.put_event(ev);
     }
     for (1..3) |i| {
-        const ev = try EventValue.init(allocator, i, "user-service", "user.registered", "{}", @intCast(i));
+        const ev = try EventValue.init(
+            allocator,
+            i,
+            "user-service",
+            "user.registered",
+            "{}",
+            @intCast(i),
+        );
         try store.put_event(ev);
     }
     for (1..3) |i| {
-        const ev = try EventValue.init(allocator, i, "order-service", "order.updated", "{}", @intCast(i));
+        const ev = try EventValue.init(
+            allocator,
+            i,
+            "order-service",
+            "order.updated",
+            "{}",
+            @intCast(i),
+        );
         try store.put_event(ev);
     }
 
@@ -974,9 +1164,7 @@ test "query_events isolates by origin and event_type" {
 }
 
 test "query_events does not leak into breadcrumbs or arbitrary keys" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1017,9 +1205,7 @@ test "query_events does not leak into breadcrumbs or arbitrary keys" {
 }
 
 test "put_event survives WAL replay" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1033,7 +1219,14 @@ test "put_event survives WAL replay" {
         defer store.deinit();
 
         for (1..4) |i| {
-            const ev = try EventValue.init(allocator, i, "order-service", "order.created", "{}", @intCast(i));
+            const ev = try EventValue.init(
+                allocator,
+                i,
+                "order-service",
+                "order.created",
+                "{}",
+                @intCast(i),
+            );
             try store.put_event(ev);
         }
     }
@@ -1057,9 +1250,7 @@ test "put_event survives WAL replay" {
 }
 
 test "ingest_event accepts events matching a declared contract" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1097,9 +1288,7 @@ test "ingest_event accepts events matching a declared contract" {
 }
 
 test "ingest_event rejects events from undeclared origins" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1132,9 +1321,7 @@ test "ingest_event rejects events from undeclared origins" {
 }
 
 test "ingest_event rejects events with undeclared event types" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1167,9 +1354,7 @@ test "ingest_event rejects events with undeclared event types" {
 }
 
 test "ingest_event silently deduplicates same (origin, type, sequence)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1195,10 +1380,24 @@ test "ingest_event silently deduplicates same (origin, type, sequence)" {
         Io.Dir.cwd().deleteFile(io, "data/test_ingest_dedup.crumb") catch {};
     }
 
-    const ev1 = try EventValue.init(allocator, 1, "order-service", "order.created", "{\"first\":true}", 100);
+    const ev1 = try EventValue.init(
+        allocator,
+        1,
+        "order-service",
+        "order.created",
+        "{\"first\":true}",
+        100,
+    );
     try store.ingest_event(ev1);
 
-    const ev2 = try EventValue.init(allocator, 1, "order-service", "order.created", "{\"second\":true}", 200);
+    const ev2 = try EventValue.init(
+        allocator,
+        1,
+        "order-service",
+        "order.created",
+        "{\"second\":true}",
+        200,
+    );
     try store.ingest_event(ev2);
 
     var results = try store.query_events("order-service", "order.created", 0);
@@ -1212,9 +1411,7 @@ test "ingest_event silently deduplicates same (origin, type, sequence)" {
 }
 
 test "ingest_event allows local origin events (origin == identity)" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1245,9 +1442,7 @@ test "ingest_event allows local origin events (origin == identity)" {
 }
 
 test "ingest_event with no identity set accepts everything" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1275,9 +1470,7 @@ test "ingest_event with no identity set accepts everything" {
 }
 
 test "put_event_local assigns monotonic sequences" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1316,9 +1509,7 @@ test "put_event_local assigns monotonic sequences" {
 }
 
 test "put_event_local rejects when no identity" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();
@@ -1337,9 +1528,7 @@ test "put_event_local rejects when no identity" {
 }
 
 test "put_event_local sequence survives WAL replay" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.testing.allocator;
 
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
     defer threaded.deinit();

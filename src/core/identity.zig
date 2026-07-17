@@ -28,7 +28,12 @@ pub const ServiceIdentity = struct {
 test "ServiceIdentity init and deinit" {
     const allocator = std.testing.allocator;
 
-    var identity = try ServiceIdentity.init(allocator, "user-service", "host-abc-123", "127.0.0.1:4200");
+    var identity = try ServiceIdentity.init(
+        allocator,
+        "user-service",
+        "host-abc-123",
+        "127.0.0.1:4200",
+    );
     defer identity.deinit(allocator);
 
     try std.testing.expectEqualStrings("user-service", identity.name);

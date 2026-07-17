@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 const event = @import("event.zig");
 const EventValue = event.EventValue;
@@ -17,11 +18,11 @@ pub const Entry = struct {
 pub const Memtable = struct {
     entries: ArrayList(Entry),
     allocator: std.mem.Allocator,
-    size_bytes: usize,
+    size_bytes: u64,
 
     pub fn init(allocator: std.mem.Allocator) Memtable {
         return Memtable{
-            .entries = ArrayList(Entry){},
+            .entries = ArrayList(Entry).empty,
             .allocator = allocator,
             .size_bytes = 0,
         };
@@ -38,11 +39,11 @@ pub const Memtable = struct {
         return self.entries.items.len;
     }
 
-    fn estimateEntrySize(key: []const u8, value: *const EventValue) usize {
+    fn estimate_entry_size(key: []const u8, value: *const EventValue) u64 {
         return key.len + value.event_type.len + value.payload.len + value.origin_service.len + 64;
     }
 
-    fn findIndex(self: *const Memtable, key: []const u8) struct { index: usize, found: bool } {
+    fn find_index(self: *const Memtable, key: []const u8) struct { index: usize, found: bool } {
         const items = self.entries.items;
         var lo: usize = 0;
         var hi: usize = items.len;
@@ -54,19 +55,23 @@ pub const Memtable = struct {
                 .eq => return .{ .index = mid, .found = true },
             }
         }
+        assert(lo <= items.len);
         return .{ .index = lo, .found = false };
     }
 
     pub fn insert(self: *Memtable, key: []const u8, value: EventValue) !void {
-        const result = self.findIndex(key);
+        assert(key.len > 0);
+        const count_before = self.entries.items.len;
+
+        const result = self.find_index(key);
         if (result.found) {
-            const old_size = estimateEntrySize(
+            const old_size = estimate_entry_size(
                 self.entries.items[result.index].key,
                 &self.entries.items[result.index].value,
             );
             self.entries.items[result.index].value.deinit(self.allocator);
             self.entries.items[result.index].value = value;
-            const new_size = estimateEntrySize(key, &value);
+            const new_size = estimate_entry_size(key, &value);
             if (new_size >= old_size) {
                 self.size_bytes += new_size - old_size;
             } else {
@@ -79,13 +84,27 @@ pub const Memtable = struct {
                 .key = owned_key,
                 .value = value,
             });
-            self.size_bytes += estimateEntrySize(key, &value);
+            self.size_bytes += estimate_entry_size(key, &value);
+        }
+
+        if (result.found) {
+            assert(self.entries.items.len == count_before);
+        } else {
+            assert(self.entries.items.len == count_before + 1);
+        }
+        if (result.index > 0) {
+            const prev = self.entries.items[result.index - 1].key;
+            assert(std.mem.order(u8, prev, key) == .lt);
+        }
+        if (result.index + 1 < self.entries.items.len) {
+            const next = self.entries.items[result.index + 1].key;
+            assert(std.mem.order(u8, key, next) == .lt);
         }
     }
 
     /// Returns an owned copy of the value. Caller must deinit.
     pub fn get(self: *const Memtable, allocator: std.mem.Allocator, key: []const u8) !?EventValue {
-        const result = self.findIndex(key);
+        const result = self.find_index(key);
         if (!result.found) return null;
         const orig = &self.entries.items[result.index].value;
         return EventValue{
@@ -98,16 +117,20 @@ pub const Memtable = struct {
     }
 
     pub fn contains(self: *const Memtable, key: []const u8) bool {
-        return self.findIndex(key).found;
+        return self.find_index(key).found;
     }
 
-    pub fn getPtr(self: *const Memtable, key: []const u8) ?*const EventValue {
-        const result = self.findIndex(key);
+    pub fn get_ptr(self: *const Memtable, key: []const u8) ?*const EventValue {
+        const result = self.find_index(key);
         if (!result.found) return null;
         return &self.entries.items[result.index].value;
     }
 
-    pub fn scan_prefix(self: *const Memtable, prefix: []const u8, results: *ArrayList(KeyValuePair)) !void {
+    pub fn scan_prefix(
+        self: *const Memtable,
+        prefix: []const u8,
+        results: *ArrayList(KeyValuePair),
+    ) !void {
         var lo: usize = 0;
         var hi: usize = self.entries.items.len;
         while (lo < hi) {
@@ -225,7 +248,7 @@ test "memtable scan_prefix" {
         try mt.insert(p.k, val);
     }
 
-    var results = ArrayList(KeyValuePair){};
+    var results = ArrayList(KeyValuePair).empty;
     try mt.scan_prefix("a:", &results);
     defer {
         for (results.items) |*item| item.deinit(allocator);
