@@ -1,0 +1,17 @@
+{
+  "service_name": "backup-process-test",
+  "instance_id": "node-1",
+  "listen_address": "127.0.0.1:0",
+  "wal_path": "data/process_backup_target.wal",
+  "client_secret": "0123456789abcdef0123456789abcdef",
+  "credentials": [
+    {
+      "service_name": "backup-test-client",
+      "secret": "abcdef0123456789abcdef0123456789",
+      "permissions": ["append"]
+    }
+  ],
+  "stream_capacity": 4096,
+  "stream_id_bytes_capacity": 4194304,
+  "contracts": []
+}

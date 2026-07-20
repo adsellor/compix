@@ -7,10 +7,6 @@
     zig-overlay.url = "github:mitchellh/zig-overlay";
     zls.url = "github:zigtools/zls";
 
-    flake-compat = {
-      url = "github:edolstra/flake-compat";
-      flake = false;
-    };
   };
 
   outputs = inputs @ {

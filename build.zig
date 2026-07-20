@@ -4,9 +4,10 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = b.addModule("compix", .{
-        .root_source_file = b.path("src/root.zig"),
+    _ = b.addModule("compix_driver", .{
+        .root_source_file = b.path("src/driver.zig"),
         .target = target,
+        .optimize = optimize,
     });
 
     const exe = b.addExecutable(.{
@@ -15,9 +16,6 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "compix", .module = mod },
-            },
         }),
     });
     b.installArtifact(exe);
@@ -28,11 +26,11 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
 
-    // store.zig is the test root: its top-level test block imports every core
-    // module, so this single target runs the whole suite.
+    // test.zig keeps the driver and core files in one Zig module while the
+    // store's top-level test block imports every core module.
     const store_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/core/store.zig"),
+            .root_source_file = b.path("src/test.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -40,6 +38,42 @@ pub fn build(b: *std.Build) void {
     const run_store_tests = b.addRunArtifact(store_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_store_tests.step);
+
+    const backup_process = b.addExecutable(.{
+        .name = "backup-process-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/backup_process_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const prepare_backup = b.addRunArtifact(backup_process);
+    prepare_backup.addArg("prepare");
+    const backup_command = b.addRunArtifact(exe);
+    backup_command.addArgs(&.{ "backup", source_config_path, archive_path });
+    backup_command.step.dependOn(&prepare_backup.step);
+    const restore_command = b.addRunArtifact(exe);
+    restore_command.addArgs(&.{ "restore", target_config_path, archive_path });
+    restore_command.step.dependOn(&backup_command.step);
+    const verify_command = b.addRunArtifact(exe);
+    verify_command.addArgs(&.{ "verify", target_config_path });
+    verify_command.step.dependOn(&restore_command.step);
+    const check_backup = b.addRunArtifact(backup_process);
+    check_backup.addArg("check");
+    check_backup.step.dependOn(&verify_command.step);
+    test_step.dependOn(&check_backup.step);
+
+    const cluster_process = b.addExecutable(.{
+        .name = "cluster-process-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cluster_process_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_cluster_process = b.addRunArtifact(cluster_process);
+    run_cluster_process.addArtifactArg(exe);
+    test_step.dependOn(&run_cluster_process.step);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench",
@@ -54,3 +88,7 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run performance benchmarks");
     bench_step.dependOn(&run_bench.step);
 }
+
+const source_config_path = "test/backup_source.json";
+const target_config_path = "test/backup_target.json";
+const archive_path = "data/process_backup_archive";

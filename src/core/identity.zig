@@ -1,9 +1,40 @@
 const std = @import("std");
+const limits = @import("limits.zig");
 
 pub const ServiceIdentity = struct {
     name: []const u8,
     instance_id: []const u8,
     listen_address: []const u8,
+
+    pub const InitOptions = struct {
+        name: []const u8,
+        instance_id: []const u8,
+        listen_address: []const u8,
+    };
+
+    pub fn init_in_place(
+        target: *ServiceIdentity,
+        allocator: std.mem.Allocator,
+        options: InitOptions,
+    ) !void {
+        if (options.name.len > limits.service_name_length_max) return error.ServiceNameTooLong;
+        if (options.instance_id.len > limits.instance_id_length_max)
+            return error.InstanceIdTooLong;
+        if (options.listen_address.len > limits.peer_address_length_max)
+            return error.AddressTooLong;
+
+        const owned_name = try allocator.dupe(u8, options.name);
+        errdefer allocator.free(owned_name);
+        const owned_instance_id = try allocator.dupe(u8, options.instance_id);
+        errdefer allocator.free(owned_instance_id);
+        const owned_listen_address = try allocator.dupe(u8, options.listen_address);
+
+        target.* = .{
+            .name = owned_name,
+            .instance_id = owned_instance_id,
+            .listen_address = owned_listen_address,
+        };
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -11,11 +42,13 @@ pub const ServiceIdentity = struct {
         instance_id: []const u8,
         listen_address: []const u8,
     ) !ServiceIdentity {
-        return ServiceIdentity{
-            .name = try allocator.dupe(u8, name),
-            .instance_id = try allocator.dupe(u8, instance_id),
-            .listen_address = try allocator.dupe(u8, listen_address),
-        };
+        var target: ServiceIdentity = undefined;
+        try init_in_place(&target, allocator, .{
+            .name = name,
+            .instance_id = instance_id,
+            .listen_address = listen_address,
+        });
+        return target;
     }
 
     pub fn deinit(self: *ServiceIdentity, allocator: std.mem.Allocator) void {

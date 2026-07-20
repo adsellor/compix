@@ -1,22 +1,55 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const ArrayList = std.ArrayList;
 const event = @import("event.zig");
+const limits = @import("limits.zig");
 const EventValue = event.EventValue;
-const KeyValuePair = event.KeyValuePair;
 
 const Io = std.Io;
 const IoFile = Io.File;
 const IoDir = Io.Dir;
 
 pub const magic_number: u32 = 0xC0BEEF55;
-pub const footer_size: u32 = 48;
+pub const format_version: u16 = 1;
+pub const checksum_size: u32 = 16;
+pub const footer_size: u32 = 96;
 pub const block_size_target: u32 = 4096;
+const writer_path_capacity: u32 = limits.wal_path_length_max + 68;
+
+pub const FaultPoint = enum {
+    after_index_write,
+    after_footer_write,
+    after_file_sync,
+    after_rename,
+    after_directory_sync,
+};
+
+pub const FaultInjector = struct {
+    fail_after_entry: ?u64 = null,
+    fail_at: ?FaultPoint = null,
+    entries_written: u64 = 0,
+    triggered: bool = false,
+
+    fn after_entry(self: *FaultInjector) !void {
+        self.entries_written += 1;
+        if (self.fail_after_entry == self.entries_written) return self.fail();
+    }
+
+    fn check(self: *FaultInjector, point: FaultPoint) !void {
+        if (self.fail_at != point) return;
+        return self.fail();
+    }
+
+    fn fail(self: *FaultInjector) error{InjectedSSTableFault} {
+        self.triggered = true;
+        return error.InjectedSSTableFault;
+    }
+};
 
 comptime {
     // Footer layout: [8B index_offset][4B index_size][4B num_blocks]
-    // [8B num_entries][8B min_seq][8B max_seq][4B magic][4B padding].
-    assert(footer_size == 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4);
+    // [8B num_entries][8B min_seq][8B max_seq][4B magic][2B version]
+    // [2B flags][16B data checksum][16B index checksum][16B footer checksum].
+    assert(footer_size == 8 + 4 + 4 + 8 + 8 + 8 + 4 + 2 + 2 + 3 * checksum_size);
     assert(block_size_target > 0);
 }
 
@@ -27,12 +60,8 @@ pub const Footer = struct {
     num_entries: u64,
     min_seq: u64,
     max_seq: u64,
-};
-
-pub const IndexEntry = struct {
-    first_key: []const u8,
-    block_offset: u64,
-    block_size: u32,
+    data_checksum: [checksum_size]u8,
+    index_checksum: [checksum_size]u8,
 };
 
 pub const SSTInfo = struct {
@@ -44,11 +73,7 @@ pub const SSTInfo = struct {
     min_seq: u64,
     max_seq: u64,
     file_size: u64,
-
-    pub fn deinit(self: *SSTInfo, allocator: std.mem.Allocator) void {
-        allocator.free(self.min_key);
-        allocator.free(self.max_key);
-    }
+    storage_slot: limits.SSTableIndex = std.math.maxInt(limits.SSTableIndex),
 };
 
 pub const RawEntry = struct {
@@ -56,165 +81,260 @@ pub const RawEntry = struct {
     value: []const u8,
 };
 
-pub fn write_sstable(
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    io: Io,
-    entries: []const RawEntry,
-) !Footer {
-    const dir = IoDir.cwd();
-    const file = try dir.createFile(io, path, .{ .truncate = true, .read = true });
-    defer file.close(io);
-
-    var index_entries = ArrayList(IndexEntry).empty;
-    defer {
-        for (index_entries.items) |ie| allocator.free(ie.first_key);
-        index_entries.deinit(allocator);
-    }
-
-    const blocks = try write_data_blocks(allocator, file, io, entries, &index_entries);
-
-    const index_offset = blocks.data_size;
-    const index_size = try write_index(allocator, file, io, index_entries.items, index_offset);
-
-    const footer = Footer{
-        .index_offset = index_offset,
-        .index_size = index_size,
-        .num_blocks = @intCast(index_entries.items.len),
-        .num_entries = @intCast(entries.len),
-        .min_seq = blocks.min_seq,
-        .max_seq = blocks.max_seq,
-    };
-    try write_footer(file, io, footer);
-    return footer;
-}
-
-const DataBlocks = struct {
-    data_size: u64,
-    min_seq: u64,
-    max_seq: u64,
+pub const ScanEntry = struct {
+    key: []const u8,
+    value_offset: u64,
+    value_length: limits.ByteCount,
 };
 
-/// Streams entries into fixed-target-size blocks, recording an index entry per
-/// block. Entries must be sorted by key ascending, which is asserted.
-fn write_data_blocks(
-    allocator: std.mem.Allocator,
+/// Allocation-free SSTable construction. All transient storage belongs to the
+/// caller and may be reused after `finish` returns.
+pub const StreamingWriter = struct {
     file: IoFile,
+    parent_file: IoFile,
+    final_path: [writer_path_capacity]u8,
+    final_path_length: limits.ByteCount,
+    temporary_path: [writer_path_capacity]u8,
+    temporary_path_length: limits.ByteCount,
+    file_open: bool,
+    temporary_exists: bool,
     io: Io,
-    entries: []const RawEntry,
-    index_entries: *ArrayList(IndexEntry),
-) !DataBlocks {
-    var write_offset: u64 = 0;
-    var block_start: u64 = 0;
-    var block_size: u32 = 0;
-    var first_key_in_block: ?[]const u8 = null;
-    var min_seq: u64 = std.math.maxInt(u64);
-    var max_seq: u64 = 0;
+    data_scratch: []u8,
+    index_scratch: []u8,
+    data_size: u64,
+    index_size: limits.ByteCount,
+    block_start: u64,
+    block_size: limits.ByteCount,
+    block_count: limits.CollectionCount,
+    entry_count: u64,
+    min_sequence: u64,
+    max_sequence: u64,
+    first_key: [limits.key_length_max]u8,
+    first_key_length: limits.ByteCount,
+    min_key: [limits.key_length_max]u8,
+    min_key_length: limits.ByteCount,
+    max_key: [limits.key_length_max]u8,
+    max_key_length: limits.ByteCount,
+    finished: bool,
+    data_hash: std.crypto.hash.Blake3,
+    fault_injector: ?*FaultInjector,
 
-    var prev_key: ?[]const u8 = null;
-    for (entries) |entry| {
-        assert(entry.key.len > 0);
-        if (prev_key) |prev| assert(std.mem.order(u8, prev, entry.key) != .gt);
-        prev_key = entry.key;
+    pub fn init(
+        path: []const u8,
+        io: Io,
+        data_scratch: []u8,
+        index_scratch: []u8,
+    ) !StreamingWriter {
+        if (data_scratch.len < limits.sstable_block_size_max)
+            return error.DataScratchTooSmall;
+        const parent_path = std.fs.path.dirname(path) orelse ".";
+        const parent_handle = try std.posix.openat(
+            std.posix.AT.FDCWD,
+            parent_path,
+            .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true },
+            0,
+        );
+        const parent_file: IoFile = .{
+            .handle = parent_handle,
+            .flags = .{ .nonblocking = false },
+        };
+        errdefer parent_file.close(io);
+        if (path.len + ".tmp".len > writer_path_capacity) return error.PathTooLong;
+        var final_path: [writer_path_capacity]u8 = undefined;
+        @memcpy(final_path[0..path.len], path);
+        var temporary_path: [writer_path_capacity]u8 = undefined;
+        const temporary = try std.fmt.bufPrint(&temporary_path, "{s}.tmp", .{path});
+        const file = try IoDir.cwd().createFile(io, temporary, .{
+            .exclusive = true,
+            .read = true,
+        });
+        errdefer file.close(io);
+        return .{
+            .file = file,
+            .parent_file = parent_file,
+            .final_path = final_path,
+            .final_path_length = @intCast(path.len),
+            .temporary_path = temporary_path,
+            .temporary_path_length = @intCast(temporary.len),
+            .file_open = true,
+            .temporary_exists = true,
+            .io = io,
+            .data_scratch = data_scratch,
+            .index_scratch = index_scratch,
+            .data_size = 0,
+            .index_size = 0,
+            .block_start = 0,
+            .block_size = 0,
+            .block_count = 0,
+            .entry_count = 0,
+            .min_sequence = std.math.maxInt(u64),
+            .max_sequence = 0,
+            .first_key = undefined,
+            .first_key_length = 0,
+            .min_key = undefined,
+            .min_key_length = 0,
+            .max_key = undefined,
+            .max_key_length = 0,
+            .finished = false,
+            .data_hash = std.crypto.hash.Blake3.init(.{}),
+            .fault_injector = null,
+        };
+    }
 
-        const entry_size: u32 = @intCast(4 + entry.key.len + 4 + entry.value.len);
+    pub fn abort(self: *StreamingWriter) void {
+        if (!self.finished) {
+            if (self.file_open) {
+                self.file.close(self.io);
+                self.file_open = false;
+            }
+            if (self.temporary_exists) {
+                IoDir.cwd().deleteFile(
+                    self.io,
+                    self.temporary_path[0..self.temporary_path_length],
+                ) catch |err| std.log.err("failed to remove SSTable temporary file: {}", .{err});
+                self.temporary_exists = false;
+            }
+            self.parent_file.close(self.io);
+            self.finished = true;
+        }
+    }
 
-        const seq = parse_leading_u64(entry.value);
-        if (seq < min_seq) min_seq = seq;
-        if (seq > max_seq) max_seq = seq;
+    pub fn append(self: *StreamingWriter, entry: RawEntry) !void {
+        assert(!self.finished);
+        if (entry.key.len == 0) return error.EmptyKey;
+        if (entry.key.len > limits.key_length_max) return error.KeyTooLong;
+        const entry_size = try limits.byte_count(4 + entry.key.len + 4 + entry.value.len);
+        if (entry_size > self.data_scratch.len) return error.EntryTooLarge;
 
-        if (block_size > 0 and block_size + entry_size > block_size_target) {
-            try index_entries.append(allocator, .{
-                .first_key = try allocator.dupe(u8, first_key_in_block.?),
-                .block_offset = block_start,
-                .block_size = block_size,
-            });
-            block_start = write_offset;
-            block_size = 0;
-            first_key_in_block = null;
+        if (self.entry_count > 0) {
+            const previous_key = self.max_key[0..self.max_key_length];
+            if (std.mem.order(u8, previous_key, entry.key) == .gt) return error.KeysOutOfOrder;
+        }
+        if (self.block_size > 0 and self.block_size + entry_size > block_size_target) {
+            try self.close_block();
+        }
+        if (self.block_size == 0) {
+            self.block_start = self.data_size;
+            self.first_key_length = try limits.byte_count(entry.key.len);
+            @memcpy(self.first_key[0..entry.key.len], entry.key);
         }
 
-        if (first_key_in_block == null) first_key_in_block = entry.key;
+        var position: limits.ByteCount = 0;
+        std.mem.writeInt(
+            u32,
+            self.data_scratch[position..][0..4],
+            @intCast(entry.key.len),
+            .little,
+        );
+        position += 4;
+        @memcpy(self.data_scratch[position..][0..entry.key.len], entry.key);
+        position += try limits.byte_count(entry.key.len);
+        std.mem.writeInt(
+            u32,
+            self.data_scratch[position..][0..4],
+            @intCast(entry.value.len),
+            .little,
+        );
+        position += 4;
+        @memcpy(self.data_scratch[position..][0..entry.value.len], entry.value);
+        position += try limits.byte_count(entry.value.len);
+        assert(position == entry_size);
+        try self.file.writePositionalAll(self.io, self.data_scratch[0..position], self.data_size);
+        if (self.fault_injector) |injector| try injector.after_entry();
+        self.data_hash.update(self.data_scratch[0..position]);
 
-        try write_entry(allocator, file, io, entry, write_offset);
-        write_offset += entry_size;
-        block_size += entry_size;
+        const sequence = parse_leading_u64(entry.value);
+        if (sequence < self.min_sequence) self.min_sequence = sequence;
+        if (sequence > self.max_sequence) self.max_sequence = sequence;
+        if (self.entry_count == 0) {
+            self.min_key_length = try limits.byte_count(entry.key.len);
+            @memcpy(self.min_key[0..entry.key.len], entry.key);
+        }
+        self.max_key_length = try limits.byte_count(entry.key.len);
+        @memcpy(self.max_key[0..entry.key.len], entry.key);
+        self.entry_count += 1;
+        self.data_size += entry_size;
+        self.block_size += entry_size;
     }
 
-    if (block_size > 0) {
-        try index_entries.append(allocator, .{
-            .first_key = try allocator.dupe(u8, first_key_in_block.?),
-            .block_offset = block_start,
-            .block_size = block_size,
-        });
+    fn close_block(self: *StreamingWriter) !void {
+        if (self.block_size == 0) return;
+        const record_size = 4 + self.first_key_length + 8 + 4;
+        if (record_size > self.index_scratch.len - self.index_size)
+            return error.IndexScratchTooSmall;
+        var position = self.index_size;
+        std.mem.writeInt(u32, self.index_scratch[position..][0..4], self.first_key_length, .little);
+        position += 4;
+        @memcpy(
+            self.index_scratch[position..][0..self.first_key_length],
+            self.first_key[0..self.first_key_length],
+        );
+        position += self.first_key_length;
+        std.mem.writeInt(u64, self.index_scratch[position..][0..8], self.block_start, .little);
+        position += 8;
+        std.mem.writeInt(u32, self.index_scratch[position..][0..4], self.block_size, .little);
+        position += 4;
+        self.index_size = position;
+        self.block_count += 1;
+        self.block_size = 0;
     }
 
-    if (entries.len == 0) {
-        min_seq = 0;
-        max_seq = 0;
+    pub fn finish(self: *StreamingWriter) !Footer {
+        assert(!self.finished);
+        try self.close_block();
+        try self.file.writePositionalAll(
+            self.io,
+            self.index_scratch[0..self.index_size],
+            self.data_size,
+        );
+        try self.inject_fault(.after_index_write);
+        const footer = Footer{
+            .index_offset = self.data_size,
+            .index_size = self.index_size,
+            .num_blocks = self.block_count,
+            .num_entries = self.entry_count,
+            .min_seq = if (self.entry_count == 0) 0 else self.min_sequence,
+            .max_seq = self.max_sequence,
+            .data_checksum = checksum_final(self.data_hash),
+            .index_checksum = checksum_bytes(self.index_scratch[0..self.index_size]),
+        };
+        try write_footer(self.file, self.io, footer);
+        try self.inject_fault(.after_footer_write);
+        try self.file.sync(self.io);
+        try self.inject_fault(.after_file_sync);
+        self.file.close(self.io);
+        self.file_open = false;
+        try IoDir.cwd().renamePreserve(
+            self.temporary_path[0..self.temporary_path_length],
+            IoDir.cwd(),
+            self.final_path[0..self.final_path_length],
+            self.io,
+        );
+        self.temporary_exists = false;
+        try self.inject_fault(.after_rename);
+        self.parent_file.sync(self.io) catch return error.DirectorySyncFailed;
+        try self.inject_fault(.after_directory_sync);
+        self.parent_file.close(self.io);
+        self.finished = true;
+        return footer;
     }
-    assert(min_seq <= max_seq);
 
-    return DataBlocks{
-        .data_size = write_offset,
-        .min_seq = min_seq,
-        .max_seq = max_seq,
-    };
-}
-
-/// Entry layout: [4B key_len][key][4B value_len][value].
-fn write_entry(
-    allocator: std.mem.Allocator,
-    file: IoFile,
-    io: Io,
-    entry: RawEntry,
-    write_offset: u64,
-) !void {
-    const entry_size = 4 + entry.key.len + 4 + entry.value.len;
-    const buf = try allocator.alloc(u8, entry_size);
-    defer allocator.free(buf);
-
-    var pos: usize = 0;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(entry.key.len), .little);
-    pos += 4;
-    @memcpy(buf[pos..][0..entry.key.len], entry.key);
-    pos += entry.key.len;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(entry.value.len), .little);
-    pos += 4;
-    @memcpy(buf[pos..][0..entry.value.len], entry.value);
-    assert(pos + entry.value.len == entry_size);
-
-    try file.writePositionalAll(io, buf, write_offset);
-}
-
-fn write_index(
-    allocator: std.mem.Allocator,
-    file: IoFile,
-    io: Io,
-    index_entries: []const IndexEntry,
-    index_offset: u64,
-) !u32 {
-    var write_offset = index_offset;
-    for (index_entries) |ie| {
-        const ie_size = 4 + ie.first_key.len + 8 + 4;
-        const ie_buf = try allocator.alloc(u8, ie_size);
-        defer allocator.free(ie_buf);
-        var ipos: usize = 0;
-        std.mem.writeInt(u32, ie_buf[ipos..][0..4], @intCast(ie.first_key.len), .little);
-        ipos += 4;
-        @memcpy(ie_buf[ipos..][0..ie.first_key.len], ie.first_key);
-        ipos += ie.first_key.len;
-        std.mem.writeInt(u64, ie_buf[ipos..][0..8], ie.block_offset, .little);
-        ipos += 8;
-        std.mem.writeInt(u32, ie_buf[ipos..][0..4], ie.block_size, .little);
-        ipos += 4;
-        assert(ipos == ie_size);
-        try file.writePositionalAll(io, ie_buf, write_offset);
-        write_offset += ie_size;
+    pub fn set_fault_injector(self: *StreamingWriter, injector: ?*FaultInjector) void {
+        self.fault_injector = injector;
     }
-    assert(write_offset >= index_offset);
-    return @intCast(write_offset - index_offset);
-}
+
+    fn inject_fault(self: *StreamingWriter, point: FaultPoint) !void {
+        if (self.fault_injector) |injector| try injector.check(point);
+    }
+
+    pub fn minimum_key(self: *const StreamingWriter) []const u8 {
+        return self.min_key[0..self.min_key_length];
+    }
+
+    pub fn maximum_key(self: *const StreamingWriter) []const u8 {
+        return self.max_key[0..self.max_key_length];
+    }
+};
 
 fn write_footer(file: IoFile, io: Io, footer: Footer) !void {
     var footer_buf: [footer_size]u8 = undefined;
@@ -225,21 +345,26 @@ fn write_footer(file: IoFile, io: Io, footer: Footer) !void {
     std.mem.writeInt(u64, footer_buf[24..32], footer.min_seq, .little);
     std.mem.writeInt(u64, footer_buf[32..40], footer.max_seq, .little);
     std.mem.writeInt(u32, footer_buf[40..44], magic_number, .little);
-    @memset(footer_buf[44..48], 0);
+    std.mem.writeInt(u16, footer_buf[44..46], format_version, .little);
+    std.mem.writeInt(u16, footer_buf[46..48], 0, .little);
+    @memcpy(footer_buf[48..64], &footer.data_checksum);
+    @memcpy(footer_buf[64..80], &footer.index_checksum);
+    const checksum = checksum_bytes(footer_buf[0..80]);
+    @memcpy(footer_buf[80..96], &checksum);
     try file.writePositionalAll(io, &footer_buf, footer.index_offset + footer.index_size);
 }
 
 pub const SSTableReader = struct {
     file: IoFile,
     io: Io,
-    allocator: std.mem.Allocator,
     footer: Footer,
-    index: ArrayList(IndexEntry),
-    path: []const u8,
 
-    pub fn open(allocator: std.mem.Allocator, path: []const u8, io: Io) !SSTableReader {
-        const dir = IoDir.cwd();
-        const file = dir.openFile(io, path, .{ .mode = .read_write }) catch |err| switch (err) {
+    pub fn open_uncached(path: []const u8, io: Io) !SSTableReader {
+        const file = IoDir.cwd().openFile(
+            io,
+            path,
+            .{ .mode = .read_only },
+        ) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
@@ -247,266 +372,301 @@ pub const SSTableReader = struct {
 
         const file_size = (try file.stat(io)).size;
         if (file_size < footer_size) return error.InvalidFormat;
-
-        var footer_buf: [footer_size]u8 = undefined;
-        try read_exact(file, io, &footer_buf, file_size - footer_size);
-
-        const magic = std.mem.readInt(u32, footer_buf[40..44], .little);
-        if (magic != magic_number) return error.InvalidFormat;
-
+        var footer_buffer: [footer_size]u8 = undefined;
+        try read_exact(file, io, &footer_buffer, file_size - footer_size);
+        const footer_checksum = checksum_bytes(footer_buffer[0..80]);
+        if (!std.crypto.timing_safe.eql(
+            [checksum_size]u8,
+            footer_checksum,
+            footer_buffer[80..96].*,
+        )) return error.SSTableChecksumMismatch;
+        if (std.mem.readInt(u32, footer_buffer[40..44], .little) != magic_number)
+            return error.InvalidFormat;
+        if (std.mem.readInt(u16, footer_buffer[44..46], .little) != format_version)
+            return error.UnsupportedSSTableVersion;
+        if (std.mem.readInt(u16, footer_buffer[46..48], .little) != 0)
+            return error.InvalidFormat;
         const footer = Footer{
-            .index_offset = std.mem.readInt(u64, footer_buf[0..8], .little),
-            .index_size = std.mem.readInt(u32, footer_buf[8..12], .little),
-            .num_blocks = std.mem.readInt(u32, footer_buf[12..16], .little),
-            .num_entries = std.mem.readInt(u64, footer_buf[16..24], .little),
-            .min_seq = std.mem.readInt(u64, footer_buf[24..32], .little),
-            .max_seq = std.mem.readInt(u64, footer_buf[32..40], .little),
+            .index_offset = std.mem.readInt(u64, footer_buffer[0..8], .little),
+            .index_size = std.mem.readInt(u32, footer_buffer[8..12], .little),
+            .num_blocks = std.mem.readInt(u32, footer_buffer[12..16], .little),
+            .num_entries = std.mem.readInt(u64, footer_buffer[16..24], .little),
+            .min_seq = std.mem.readInt(u64, footer_buffer[24..32], .little),
+            .max_seq = std.mem.readInt(u64, footer_buffer[32..40], .little),
+            .data_checksum = footer_buffer[48..64].*,
+            .index_checksum = footer_buffer[64..80].*,
         };
+        if (footer.index_offset + footer.index_size + footer_size != file_size)
+            return error.InvalidFormat;
+        try verify_region(file, io, 0, footer.index_offset, footer.data_checksum);
+        try verify_region(
+            file,
+            io,
+            footer.index_offset,
+            footer.index_size,
+            footer.index_checksum,
+        );
 
-        var index = try parse_index(allocator, file, io, footer);
-        errdefer {
-            for (index.items) |ie| allocator.free(ie.first_key);
-            index.deinit(allocator);
-        }
-
-        if (index.items.len != footer.num_blocks) return error.InvalidFormat;
-
-        return SSTableReader{
+        return .{
             .file = file,
             .io = io,
-            .allocator = allocator,
             .footer = footer,
-            .index = index,
-            .path = try allocator.dupe(u8, path),
         };
-    }
-
-    fn parse_index(
-        allocator: std.mem.Allocator,
-        file: IoFile,
-        io: Io,
-        footer: Footer,
-    ) !ArrayList(IndexEntry) {
-        var index = ArrayList(IndexEntry).empty;
-        errdefer {
-            for (index.items) |ie| allocator.free(ie.first_key);
-            index.deinit(allocator);
-        }
-        if (footer.index_size == 0) return index;
-
-        const index_buf = try allocator.alloc(u8, footer.index_size);
-        defer allocator.free(index_buf);
-        try read_exact(file, io, index_buf, footer.index_offset);
-
-        var off: usize = 0;
-        while (off < footer.index_size) {
-            if (off + 4 > footer.index_size) return error.InvalidFormat;
-            const key_len = std.mem.readInt(u32, index_buf[off..][0..4], .little);
-            off += 4;
-            if (off + key_len > footer.index_size) return error.InvalidFormat;
-            const first_key = try allocator.dupe(u8, index_buf[off..][0..key_len]);
-            errdefer allocator.free(first_key);
-            off += key_len;
-            if (off + 12 > footer.index_size) return error.InvalidFormat;
-            const block_offset = std.mem.readInt(u64, index_buf[off..][0..8], .little);
-            off += 8;
-            const block_size = std.mem.readInt(u32, index_buf[off..][0..4], .little);
-            off += 4;
-            try index.append(allocator, .{
-                .first_key = first_key,
-                .block_offset = block_offset,
-                .block_size = block_size,
-            });
-        }
-        assert(off == footer.index_size);
-        return index;
     }
 
     pub fn deinit(self: *SSTableReader) void {
-        for (self.index.items) |ie| self.allocator.free(ie.first_key);
-        self.index.deinit(self.allocator);
         self.file.close(self.io);
-        self.allocator.free(self.path);
     }
 
-    pub fn get(self: *SSTableReader, allocator: std.mem.Allocator, key: []const u8) !?EventValue {
-        const block_idx = self.find_block(key) orelse return null;
-        return try self.scan_block_for_key(allocator, block_idx, key);
-    }
+    const DiskIndexEntry = struct {
+        first_key: []const u8,
+        block_offset: u64,
+        block_size: limits.ByteCount,
+    };
 
-    pub fn scan_prefix(
+    fn read_disk_index_entry(
         self: *SSTableReader,
-        prefix: []const u8,
-        results: *ArrayList(KeyValuePair),
-    ) !void {
-        const start_block = self.find_block_for_prefix(prefix);
-        var block_idx = start_block;
-        while (block_idx < self.index.items.len) {
-            try self.scan_block_for_prefix(self.allocator, block_idx, prefix, results);
-            block_idx += 1;
-            if (block_idx < self.index.items.len) {
-                if (!std.mem.startsWith(u8, self.index.items[block_idx].first_key, prefix)) break;
-            }
-        }
-    }
+        cursor: *limits.ByteCount,
+        key_buffer: []u8,
+    ) !?DiskIndexEntry {
+        if (cursor.* == self.footer.index_size) return null;
+        if (cursor.* > self.footer.index_size) return error.InvalidFormat;
+        if (self.footer.index_size - cursor.* < 16) return error.InvalidFormat;
 
-    pub fn contains(self: *SSTableReader, key: []const u8) !bool {
-        const block_idx = self.find_block(key) orelse return false;
-        return self.scan_block_contains(block_idx, key);
-    }
+        const position = self.footer.index_offset + cursor.*;
+        var key_length_buffer: [4]u8 = undefined;
+        try read_exact(self.file, self.io, &key_length_buffer, position);
+        const key_length = std.mem.readInt(u32, &key_length_buffer, .little);
+        if (key_length > limits.key_length_max) return error.InvalidFormat;
+        if (key_length > key_buffer.len) return error.KeyBufferTooSmall;
+        if (cursor.* + 4 + key_length + 12 > self.footer.index_size)
+            return error.InvalidFormat;
 
-    pub fn raw_iterator(self: *SSTableReader) RawIterator {
-        return RawIterator{
-            .reader = self,
-            .block_idx = 0,
-            .block_data = null,
-            .offset = 0,
+        const first_key = key_buffer[0..key_length];
+        try read_exact(self.file, self.io, first_key, position + 4);
+        var metadata: [12]u8 = undefined;
+        try read_exact(self.file, self.io, &metadata, position + 4 + key_length);
+        cursor.* += 4 + key_length + 12;
+        return .{
+            .first_key = first_key,
+            .block_offset = std.mem.readInt(u64, metadata[0..8], .little),
+            .block_size = std.mem.readInt(u32, metadata[8..12], .little),
         };
     }
 
-    fn find_block(self: *const SSTableReader, key: []const u8) ?usize {
-        if (self.index.items.len == 0) return null;
-        var lo: usize = 0;
-        var hi: usize = self.index.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (std.mem.order(u8, self.index.items[mid].first_key, key) != .gt) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo == 0) return null;
-        return lo - 1;
-    }
-
-    fn find_block_for_prefix(self: *const SSTableReader, prefix: []const u8) usize {
-        if (self.index.items.len == 0) return 0;
-        var lo: usize = 0;
-        var hi: usize = self.index.items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (std.mem.order(u8, self.index.items[mid].first_key, prefix) == .lt) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-
-        if (lo > 0) lo -= 1;
-        return lo;
-    }
-
-    fn read_block(self: *SSTableReader, block_idx: usize) ![]u8 {
-        const ie = self.index.items[block_idx];
-        const buf = try self.allocator.alloc(u8, ie.block_size);
-        errdefer self.allocator.free(buf);
-        try read_exact(self.file, self.io, buf, ie.block_offset);
-        return buf;
-    }
-
-    fn scan_block_for_key(
+    fn find_disk_block(
         self: *SSTableReader,
-        allocator: std.mem.Allocator,
-        block_idx: usize,
         key: []const u8,
-    ) !?EventValue {
-        const data = try self.read_block(block_idx);
-        defer self.allocator.free(data);
+        key_buffer: []u8,
+    ) !?DiskIndexEntry {
+        var cursor: limits.ByteCount = 0;
+        var found: ?DiskIndexEntry = null;
+        while (try self.read_disk_index_entry(&cursor, key_buffer)) |entry| {
+            if (std.mem.order(u8, entry.first_key, key) == .gt) break;
+            found = .{
+                .first_key = "",
+                .block_offset = entry.block_offset,
+                .block_size = entry.block_size,
+            };
+        }
+        return found;
+    }
 
-        var off: usize = 0;
-        while (off < data.len) {
-            const parsed = parse_raw_entry(data, off) orelse break;
-            if (std.mem.eql(u8, parsed.key, key)) {
-                return try EventValue.deserialize(allocator, parsed.value);
+    fn read_disk_block_into(
+        self: *SSTableReader,
+        entry: DiskIndexEntry,
+        block_buffer: []u8,
+    ) ![]u8 {
+        if (entry.block_size > block_buffer.len) return error.BlockBufferTooSmall;
+        const data = block_buffer[0..entry.block_size];
+        try read_exact(self.file, self.io, data, entry.block_offset);
+        return data;
+    }
+
+    pub fn get_into(
+        self: *SSTableReader,
+        key: []const u8,
+        block_buffer: []u8,
+    ) !?EventValue {
+        var key_buffer: [limits.key_length_max]u8 = undefined;
+        const index_entry = try self.find_disk_block(key, &key_buffer) orelse return null;
+        const data = try self.read_disk_block_into(index_entry, block_buffer);
+        var offset: limits.ByteCount = 0;
+        while (offset < data.len) {
+            const parsed = parse_raw_entry(data, offset) orelse
+                return error.InvalidFormat;
+            offset = try limits.byte_count(parsed.next_offset);
+            switch (std.mem.order(u8, parsed.key, key)) {
+                .lt => {},
+                .eq => return try EventValue.deserialize_borrowed(parsed.value),
+                .gt => return null,
             }
-            off = parsed.next_offset;
         }
         return null;
     }
 
-    fn scan_block_contains(self: *SSTableReader, block_idx: usize, key: []const u8) !bool {
-        const data = try self.read_block(block_idx);
-        defer self.allocator.free(data);
-
-        var off: usize = 0;
-        while (off < data.len) {
-            const parsed = parse_raw_entry(data, off) orelse break;
-            if (std.mem.eql(u8, parsed.key, key)) return true;
-            // Keys are sorted; stop early if we've passed the target
-            if (std.mem.order(u8, parsed.key, key) == .gt) return false;
-            off = parsed.next_offset;
-        }
-        return false;
+    pub fn contains_into(
+        self: *SSTableReader,
+        key: []const u8,
+        block_buffer: []u8,
+    ) !bool {
+        return (try self.get_into(key, block_buffer)) != null;
     }
 
-    fn scan_block_for_prefix(
+    /// Advances through the checksummed data region without retaining a block
+    /// per table. This lets the LSM perform a bounded k-way scan across every
+    /// live table with only one key slot per source.
+    pub fn scan_next_key(
         self: *SSTableReader,
-        allocator: std.mem.Allocator,
-        block_idx: usize,
-        prefix: []const u8,
-        results: *ArrayList(KeyValuePair),
-    ) !void {
-        const data = try self.read_block(block_idx);
-        defer self.allocator.free(data);
+        cursor: *u64,
+        key_buffer: []u8,
+    ) !?ScanEntry {
+        if (cursor.* == self.footer.index_offset) return null;
+        if (cursor.* > self.footer.index_offset or
+            self.footer.index_offset - cursor.* < 8) return error.InvalidFormat;
+        var key_length_buffer: [4]u8 = undefined;
+        try read_exact(self.file, self.io, &key_length_buffer, cursor.*);
+        const key_length = std.mem.readInt(u32, &key_length_buffer, .little);
+        if (key_length == 0 or key_length > limits.key_length_max)
+            return error.InvalidFormat;
+        if (key_length > key_buffer.len) return error.KeyBufferTooSmall;
+        const value_length_offset = cursor.* + 4 + key_length;
+        if (value_length_offset + 4 > self.footer.index_offset)
+            return error.InvalidFormat;
+        const key = key_buffer[0..key_length];
+        try read_exact(self.file, self.io, key, cursor.* + 4);
+        var value_length_buffer: [4]u8 = undefined;
+        try read_exact(self.file, self.io, &value_length_buffer, value_length_offset);
+        const value_length = std.mem.readInt(u32, &value_length_buffer, .little);
+        if (value_length > limits.event_serialized_size_max) return error.InvalidFormat;
+        const value_offset = value_length_offset + 4;
+        if (value_offset + value_length > self.footer.index_offset)
+            return error.InvalidFormat;
+        cursor.* = value_offset + value_length;
+        return .{
+            .key = key,
+            .value_offset = value_offset,
+            .value_length = value_length,
+        };
+    }
 
-        var off: usize = 0;
-        while (off < data.len) {
-            const parsed = parse_raw_entry(data, off) orelse break;
-            if (std.mem.startsWith(u8, parsed.key, prefix)) {
-                const deserialized = try EventValue.deserialize(allocator, parsed.value);
-                errdefer {
-                    var v = deserialized;
-                    v.deinit(allocator);
+    pub fn scan_value_into(
+        self: *SSTableReader,
+        entry: ScanEntry,
+        value_buffer: []u8,
+    ) !EventValue {
+        if (entry.value_length > value_buffer.len) return error.ResultBufferTooSmall;
+        if (entry.value_offset + entry.value_length > self.footer.index_offset)
+            return error.InvalidFormat;
+        const serialized = value_buffer[0..entry.value_length];
+        try read_exact(self.file, self.io, serialized, entry.value_offset);
+        return try EventValue.deserialize_borrowed(serialized);
+    }
+
+    pub fn visit_prefix(
+        self: *SSTableReader,
+        prefix: []const u8,
+        block_buffer: []u8,
+        context: anytype,
+        comptime visit: anytype,
+    ) !event.VisitControl {
+        var key_buffer: [limits.key_length_max]u8 = undefined;
+        var index_cursor: limits.ByteCount = 0;
+        while (try self.read_disk_index_entry(&index_cursor, &key_buffer)) |index_entry| {
+            const data = try self.read_disk_block_into(index_entry, block_buffer);
+            var offset: limits.ByteCount = 0;
+            while (offset < data.len) {
+                const parsed = parse_raw_entry(data, offset) orelse
+                    return error.InvalidFormat;
+                offset = try limits.byte_count(parsed.next_offset);
+                if (std.mem.startsWith(u8, parsed.key, prefix)) {
+                    const value = try EventValue.deserialize_borrowed(parsed.value);
+                    if (try visit(context, parsed.key, value) == .stop) return .stop;
+                } else if (std.mem.order(u8, parsed.key, prefix) == .gt) {
+                    return .continue_scan;
                 }
-                try results.append(allocator, KeyValuePair{
-                    .key = try allocator.dupe(u8, parsed.key),
-                    .value = deserialized,
-                });
-            } else if (std.mem.order(u8, parsed.key, prefix) == .gt) {
-                break;
             }
-            off = parsed.next_offset;
         }
+        return .continue_scan;
     }
 };
 
-pub const RawIterator = struct {
+fn checksum_bytes(bytes: []const u8) [checksum_size]u8 {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    hash.update(bytes);
+    return checksum_final(hash);
+}
+
+fn checksum_final(hash_start: std.crypto.hash.Blake3) [checksum_size]u8 {
+    var hash = hash_start;
+    var digest: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
+    hash.final(&digest);
+    return digest[0..checksum_size].*;
+}
+
+fn verify_region(
+    file: IoFile,
+    io: Io,
+    offset: u64,
+    length: u64,
+    expected: [checksum_size]u8,
+) !void {
+    var hash = std.crypto.hash.Blake3.init(.{});
+    var scratch: [64 * 1024]u8 = undefined;
+    var consumed: u64 = 0;
+    while (consumed < length) {
+        const count: usize = @intCast(@min(@as(u64, scratch.len), length - consumed));
+        try read_exact(file, io, scratch[0..count], offset + consumed);
+        hash.update(scratch[0..count]);
+        consumed += count;
+    }
+    const actual = checksum_final(hash);
+    if (!std.crypto.timing_safe.eql([checksum_size]u8, actual, expected))
+        return error.SSTableChecksumMismatch;
+}
+
+pub const RawIteratorBuffered = struct {
     reader: *SSTableReader,
-    block_idx: usize,
-    block_data: ?[]u8,
-    offset: usize,
+    index_cursor: limits.ByteCount,
+    block_data: []u8,
+    block_offset: limits.ByteCount,
+    block_loaded: bool,
+    block_buffer: []u8,
+    index_key_buffer: [limits.key_length_max]u8,
 
-    pub fn next(self: *RawIterator) !?RawEntry {
-        while (true) {
-            if (self.block_data) |data| {
-                if (self.offset < data.len) {
-                    const parsed = parse_raw_entry(data, self.offset) orelse {
-                        //NOTE: Bad block data, need to handle this differently
-                        self.reader.allocator.free(data);
-                        self.block_data = null;
-                        self.block_idx += 1;
-                        continue;
-                    };
-                    self.offset = parsed.next_offset;
-                    return RawEntry{ .key = parsed.key, .value = parsed.value };
-                }
-                self.reader.allocator.free(data);
-                self.block_data = null;
-                self.block_idx += 1;
-            }
-
-            if (self.block_idx >= self.reader.index.items.len) return null;
-
-            self.block_data = try self.reader.read_block(self.block_idx);
-            self.offset = 0;
-        }
+    pub fn init(reader: *SSTableReader, block_buffer: []u8) RawIteratorBuffered {
+        return .{
+            .reader = reader,
+            .index_cursor = 0,
+            .block_data = block_buffer[0..0],
+            .block_offset = 0,
+            .block_loaded = false,
+            .block_buffer = block_buffer,
+            .index_key_buffer = undefined,
+        };
     }
 
-    pub fn deinit(self: *RawIterator) void {
-        if (self.block_data) |data| {
-            self.reader.allocator.free(data);
-            self.block_data = null;
+    pub fn next(self: *RawIteratorBuffered) !?RawEntry {
+        while (true) {
+            if (self.block_loaded and self.block_offset < self.block_data.len) {
+                const parsed = parse_raw_entry(
+                    self.block_data,
+                    self.block_offset,
+                ) orelse return error.InvalidFormat;
+                self.block_offset = try limits.byte_count(parsed.next_offset);
+                return .{ .key = parsed.key, .value = parsed.value };
+            }
+
+            const index_entry = try self.reader.read_disk_index_entry(
+                &self.index_cursor,
+                &self.index_key_buffer,
+            ) orelse return null;
+            self.block_data = try self.reader.read_disk_block_into(
+                index_entry,
+                self.block_buffer,
+            );
+            self.block_offset = 0;
+            self.block_loaded = true;
         }
     }
 };
@@ -514,10 +674,10 @@ pub const RawIterator = struct {
 const ParsedEntry = struct {
     key: []const u8,
     value: []const u8,
-    next_offset: usize,
+    next_offset: limits.ByteCount,
 };
 
-fn parse_raw_entry(data: []const u8, off: usize) ?ParsedEntry {
+fn parse_raw_entry(data: []const u8, off: limits.ByteCount) ?ParsedEntry {
     assert(off <= data.len);
     if (off + 4 > data.len) return null;
     const key_len = std.mem.readInt(u32, data[off..][0..4], .little);
@@ -530,7 +690,7 @@ fn parse_raw_entry(data: []const u8, off: usize) ?ParsedEntry {
     const val_start = vlen_start + 4;
     if (val_start + val_len > data.len) return null;
     const value = data[val_start..][0..val_len];
-    const next_offset = val_start + val_len;
+    const next_offset: limits.ByteCount = @intCast(val_start + val_len);
     assert(next_offset > off);
     assert(next_offset <= data.len);
     return ParsedEntry{
@@ -541,20 +701,47 @@ fn parse_raw_entry(data: []const u8, off: usize) ?ParsedEntry {
 }
 
 fn parse_leading_u64(data: []const u8) u64 {
-    var end: usize = 0;
+    var end: limits.ByteCount = 0;
     while (end < data.len and data[end] != '|') : (end += 1) {}
     return std.fmt.parseInt(u64, data[0..end], 10) catch 0;
 }
 
 fn read_exact(file: IoFile, io: Io, buf: []u8, offset: u64) !void {
-    var total: usize = 0;
+    var total: limits.ByteCount = 0;
     while (total < buf.len) {
         var iovecs = [1][]u8{buf[total..]};
         const n = file.readPositional(io, &iovecs, offset + total) catch return error.InputOutput;
         if (n == 0) return error.InvalidFormat;
-        total += n;
+        total += try limits.byte_count(n);
     }
 }
+
+fn write_test_table(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    io: Io,
+    entries: []const RawEntry,
+) !Footer {
+    const data = try allocator.alloc(u8, limits.sstable_block_size_max);
+    defer allocator.free(data);
+    const index = try allocator.alloc(u8, limits.sstable_index_size_max);
+    defer allocator.free(index);
+    var writer = try StreamingWriter.init(path, io, data, index);
+    errdefer writer.abort();
+    for (entries) |entry| try writer.append(entry);
+    return try writer.finish();
+}
+
+const TestVisitContext = struct {
+    keys: [4][]const u8 = undefined,
+    count: limits.CollectionCount = 0,
+
+    fn visit(self: *TestVisitContext, key: []const u8, _: EventValue) !event.VisitControl {
+        self.keys[self.count] = key;
+        self.count += 1;
+        return .continue_scan;
+    }
+};
 
 test "sstable write and read single entry" {
     const allocator = std.testing.allocator;
@@ -572,20 +759,19 @@ test "sstable write and read single entry" {
         .value = "1|100|2|svc|evt|{}",
     }};
 
-    const footer = try write_sstable(allocator, path, io, &entries);
+    const footer = try write_test_table(allocator, path, io, &entries);
     try std.testing.expectEqual(@as(u64, 1), footer.num_entries);
     try std.testing.expectEqual(@as(u64, 1), footer.min_seq);
 
-    var reader = try SSTableReader.open(allocator, path, io);
+    var reader = try SSTableReader.open_uncached(path, io);
     defer reader.deinit();
 
-    var val = (try reader.get(allocator, "hello")).?;
-    defer val.deinit(allocator);
+    var block_buffer: [limits.sstable_block_size_max]u8 = undefined;
+    const val = (try reader.get_into("hello", &block_buffer)).?;
     try std.testing.expectEqual(@as(u64, 1), val.sequence);
     try std.testing.expectEqualStrings("evt", val.event_type);
 
-    const miss = try reader.get(allocator, "missing");
-    try std.testing.expect(miss == null);
+    try std.testing.expect(try reader.get_into("missing", &block_buffer) == null);
 }
 
 test "sstable write and read multiple entries" {
@@ -606,35 +792,30 @@ test "sstable write and read multiple entries" {
         .{ .key = "c:1", .value = "4|400|2|svc|evt|{}" },
     };
 
-    const footer = try write_sstable(allocator, path, io, &entries);
+    const footer = try write_test_table(allocator, path, io, &entries);
     try std.testing.expectEqual(@as(u64, 4), footer.num_entries);
     try std.testing.expectEqual(@as(u64, 1), footer.min_seq);
     try std.testing.expectEqual(@as(u64, 4), footer.max_seq);
 
-    var reader = try SSTableReader.open(allocator, path, io);
+    var reader = try SSTableReader.open_uncached(path, io);
     defer reader.deinit();
+    var block_buffer: [limits.sstable_block_size_max]u8 = undefined;
 
     {
-        var val = (try reader.get(allocator, "b:1")).?;
-        defer val.deinit(allocator);
+        const val = (try reader.get_into("b:1", &block_buffer)).?;
         try std.testing.expectEqual(@as(u64, 3), val.sequence);
     }
     {
-        var val = (try reader.get(allocator, "c:1")).?;
-        defer val.deinit(allocator);
+        const val = (try reader.get_into("c:1", &block_buffer)).?;
         try std.testing.expectEqual(@as(u64, 4), val.sequence);
     }
-    try std.testing.expect(try reader.get(allocator, "z:1") == null);
+    try std.testing.expect(try reader.get_into("z:1", &block_buffer) == null);
 
-    var results = ArrayList(KeyValuePair).empty;
-    try reader.scan_prefix("a:", &results);
-    defer {
-        for (results.items) |*item| item.deinit(allocator);
-        results.deinit(allocator);
-    }
-    try std.testing.expectEqual(@as(usize, 2), results.items.len);
-    try std.testing.expectEqualStrings("a:1", results.items[0].key);
-    try std.testing.expectEqualStrings("a:2", results.items[1].key);
+    var context = TestVisitContext{};
+    _ = try reader.visit_prefix("a:", &block_buffer, &context, TestVisitContext.visit);
+    try std.testing.expectEqual(@as(limits.CollectionCount, 2), context.count);
+    try std.testing.expectEqualStrings("a:1", context.keys[0]);
+    try std.testing.expectEqualStrings("a:2", context.keys[1]);
 }
 
 test "sstable raw iterator" {
@@ -654,13 +835,13 @@ test "sstable raw iterator" {
         .{ .key = "k3", .value = "3|0|2|s|e|{}" },
     };
 
-    _ = try write_sstable(allocator, path, io, &entries);
+    _ = try write_test_table(allocator, path, io, &entries);
 
-    var reader = try SSTableReader.open(allocator, path, io);
+    var reader = try SSTableReader.open_uncached(path, io);
     defer reader.deinit();
 
-    var iter = reader.raw_iterator();
-    defer iter.deinit();
+    var block_buffer: [limits.sstable_block_size_max]u8 = undefined;
+    var iter = RawIteratorBuffered.init(&reader, &block_buffer);
 
     const e1 = (try iter.next()).?;
     try std.testing.expectEqualStrings("k1", e1.key);
@@ -687,13 +868,149 @@ test "sstable contains" {
         .{ .key = "beta", .value = "2|0|2|s|e|{}" },
     };
 
-    _ = try write_sstable(allocator, path, io, &entries);
+    _ = try write_test_table(allocator, path, io, &entries);
 
-    var reader = try SSTableReader.open(allocator, path, io);
+    var reader = try SSTableReader.open_uncached(path, io);
     defer reader.deinit();
+    var block_buffer: [limits.sstable_block_size_max]u8 = undefined;
 
-    try std.testing.expect(try reader.contains("alpha"));
-    try std.testing.expect(try reader.contains("beta"));
-    try std.testing.expect(!try reader.contains("gamma"));
-    try std.testing.expect(!try reader.contains("a"));
+    try std.testing.expect(try reader.contains_into("alpha", &block_buffer));
+    try std.testing.expect(try reader.contains_into("beta", &block_buffer));
+    try std.testing.expect(!try reader.contains_into("gamma", &block_buffer));
+    try std.testing.expect(!try reader.contains_into("a", &block_buffer));
+}
+
+test "sstable startup verification rejects data index and footer mutations" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "data/test_sst_checksums.sst";
+    IoDir.cwd().deleteFile(io, path) catch {};
+    defer IoDir.cwd().deleteFile(io, path) catch {};
+    const entries = [_]RawEntry{
+        .{ .key = "alpha", .value = "1|0|2|s|e|one" },
+        .{ .key = "beta", .value = "2|0|2|s|e|two" },
+    };
+    const footer = try write_test_table(allocator, path, io, &entries);
+    const file_size = footer.index_offset + footer.index_size + footer_size;
+    const positions = [_]u64{ 0, footer.index_offset, file_size - 1 };
+    for (positions) |position| {
+        {
+            const file = try IoDir.cwd().openFile(io, path, .{ .mode = .read_write });
+            defer file.close(io);
+            var byte: [1]u8 = undefined;
+            try read_exact(file, io, &byte, position);
+            byte[0] ^= 1;
+            try file.writePositionalAll(io, &byte, position);
+            try file.sync(io);
+        }
+        try std.testing.expectError(
+            error.SSTableChecksumMismatch,
+            SSTableReader.open_uncached(path, io),
+        );
+        {
+            const file = try IoDir.cwd().openFile(io, path, .{ .mode = .read_write });
+            defer file.close(io);
+            var byte: [1]u8 = undefined;
+            try read_exact(file, io, &byte, position);
+            byte[0] ^= 1;
+            try file.writePositionalAll(io, &byte, position);
+            try file.sync(io);
+        }
+    }
+    var reader = try SSTableReader.open_uncached(path, io);
+    reader.deinit();
+}
+
+test "aborted sstable construction never publishes its final name" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "data/test_sst_abort.sst";
+    const temporary_path = "data/test_sst_abort.sst.tmp";
+    IoDir.cwd().deleteFile(io, path) catch {};
+    IoDir.cwd().deleteFile(io, temporary_path) catch {};
+    defer IoDir.cwd().deleteFile(io, path) catch {};
+    defer IoDir.cwd().deleteFile(io, temporary_path) catch {};
+    const data = try allocator.alloc(u8, limits.sstable_block_size_max);
+    defer allocator.free(data);
+    const index = try allocator.alloc(u8, limits.sstable_index_size_max);
+    defer allocator.free(index);
+    var writer = try StreamingWriter.init(path, io, data, index);
+    try writer.append(.{ .key = "key", .value = "1|0|2|s|e|value" });
+    writer.abort();
+    try std.testing.expectError(
+        error.FileNotFound,
+        IoDir.cwd().openFile(io, path, .{ .mode = .read_only }),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        IoDir.cwd().openFile(io, temporary_path, .{ .mode = .read_only }),
+    );
+}
+
+test "sstable publication faults leave no partial final table" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const data = try allocator.alloc(u8, limits.sstable_block_size_max);
+    defer allocator.free(data);
+    const index = try allocator.alloc(u8, limits.sstable_index_size_max);
+    defer allocator.free(index);
+    const points = [_]?FaultPoint{
+        null,
+        .after_index_write,
+        .after_footer_write,
+        .after_file_sync,
+        .after_rename,
+        .after_directory_sync,
+    };
+    for (points, 0..) |point, point_index| {
+        var path_buffer: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(
+            &path_buffer,
+            "data/test_sst_fault_{d}.sst",
+            .{point_index},
+        );
+        var temporary_buffer: [132]u8 = undefined;
+        const temporary = try std.fmt.bufPrint(&temporary_buffer, "{s}.tmp", .{path});
+        IoDir.cwd().deleteFile(io, path) catch {};
+        IoDir.cwd().deleteFile(io, temporary) catch {};
+        defer IoDir.cwd().deleteFile(io, path) catch {};
+        defer IoDir.cwd().deleteFile(io, temporary) catch {};
+        var writer = try StreamingWriter.init(path, io, data, index);
+        var injector: FaultInjector = if (point) |selected|
+            .{ .fail_at = selected }
+        else
+            .{ .fail_after_entry = 1 };
+        writer.set_fault_injector(&injector);
+        if (point == null) {
+            try std.testing.expectError(
+                error.InjectedSSTableFault,
+                writer.append(.{ .key = "key", .value = "1|0|2|s|e|value" }),
+            );
+        } else {
+            try writer.append(.{ .key = "key", .value = "1|0|2|s|e|value" });
+            try std.testing.expectError(error.InjectedSSTableFault, writer.finish());
+        }
+        try std.testing.expect(injector.triggered);
+        writer.abort();
+        const published = point == .after_rename or point == .after_directory_sync;
+        if (published) {
+            var reader = try SSTableReader.open_uncached(path, io);
+            reader.deinit();
+        } else {
+            try std.testing.expectError(
+                error.FileNotFound,
+                IoDir.cwd().openFile(io, path, .{ .mode = .read_only }),
+            );
+        }
+        try std.testing.expectError(
+            error.FileNotFound,
+            IoDir.cwd().openFile(io, temporary, .{ .mode = .read_only }),
+        );
+    }
 }

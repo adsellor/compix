@@ -1,354 +1,409 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const ArrayList = std.ArrayList;
 const event = @import("event.zig");
+const fixed = @import("fixed.zig");
+const limits = @import("limits.zig");
 const EventValue = event.EventValue;
-const KeyValuePair = event.KeyValuePair;
 
-pub const key_length_max: u32 = 4096;
+const root_index: limits.NodeIndex = 0;
 
 comptime {
-    assert(key_length_max > 0);
-    assert(key_length_max <= 64 * 1024);
+    assert(limits.key_length_max > 0);
+    assert(limits.radix_nodes_max >= 2 * limits.memtable_entries_max + 1);
 }
 
 pub const RadixNode = struct {
     key_fragment: []const u8,
-    value: ?EventValue = null,
-    children: ArrayList(*RadixNode),
+    value: ?EventValue,
+    first_child: ?limits.NodeIndex,
+    next_sibling: ?limits.NodeIndex,
     is_terminal: bool,
-    allocator: std.mem.Allocator,
+};
 
-    pub fn init(allocator: std.mem.Allocator, key_fragment: []const u8) !*RadixNode {
-        const node = try allocator.create(RadixNode);
-        node.* = RadixNode{
-            .key_fragment = try allocator.dupe(u8, key_fragment),
-            .children = ArrayList(*RadixNode).empty,
-            .is_terminal = false,
-            .allocator = allocator,
-        };
-        return node;
-    }
+const ChildMatch = struct {
+    index: limits.NodeIndex,
+    common_length: limits.ByteCount,
+};
 
-    /// Frees the subtree's fields and descendants; the node itself is not destroyed.
-    /// Iterative (no recursion, no allocation): repeatedly detaches and frees a leaf.
-    pub fn deinit(self: *RadixNode) void {
-        const allocator = self.allocator;
-        while (self.children.items.len > 0) {
-            var leaf_parent = self;
-            while (leaf_parent.children.items[leaf_parent.children.items.len - 1]
-                .children.items.len > 0)
-            {
-                leaf_parent = leaf_parent.children.items[leaf_parent.children.items.len - 1];
-            }
-            const leaf = leaf_parent.children.pop().?;
-            assert(leaf.children.items.len == 0);
-            allocator.free(leaf.key_fragment);
-            if (leaf.value) |*value| value.deinit(allocator);
-            leaf.children.deinit(allocator);
-            allocator.destroy(leaf);
-        }
-        allocator.free(self.key_fragment);
-        if (self.value) |*value| value.deinit(allocator);
-        self.children.deinit(allocator);
-    }
+const ScanFrame = struct {
+    next_child: ?limits.NodeIndex,
+    key_length_before: limits.ByteCount,
 };
 
 pub const RadixTree = struct {
-    root: *RadixNode,
     allocator: std.mem.Allocator,
-    size: usize,
+    nodes: fixed.List(RadixNode),
+    node_storage: []RadixNode,
+    bytes: fixed.ByteArena,
+    byte_storage: []u8,
+    size: limits.NodeCount,
 
     pub fn init(allocator: std.mem.Allocator) !RadixTree {
-        const root = try RadixNode.init(allocator, "");
-        return RadixTree{
-            .root = root,
+        const node_storage = try allocator.alloc(RadixNode, limits.radix_nodes_max);
+        errdefer allocator.free(node_storage);
+        const byte_storage = try allocator.alloc(u8, limits.memtable_bytes_max);
+        errdefer allocator.free(byte_storage);
+        var nodes = try fixed.List(RadixNode).init(node_storage);
+        try nodes.append(.{
+            .key_fragment = "",
+            .value = null,
+            .first_child = null,
+            .next_sibling = null,
+            .is_terminal = false,
+        });
+        return .{
             .allocator = allocator,
+            .nodes = nodes,
+            .node_storage = node_storage,
+            .bytes = try fixed.ByteArena.init(byte_storage),
+            .byte_storage = byte_storage,
             .size = 0,
         };
     }
 
     pub fn deinit(self: *RadixTree) void {
-        self.root.deinit();
-        self.allocator.destroy(self.root);
+        self.allocator.free(self.byte_storage);
+        self.allocator.free(self.node_storage);
     }
 
     pub fn insert(self: *RadixTree, key: []const u8, value: EventValue) !void {
-        assert(key.len <= key_length_max);
+        assert(key.len > 0);
+        if (key.len > limits.key_length_max) return error.KeyTooLong;
+        const existing_index = self.find_exact_node(key);
+        const key_bytes: limits.ByteCount = if (existing_index == null)
+            try limits.byte_count(key.len)
+        else
+            0;
+        const value_bytes = try value_size(value);
+        const bytes_required = std.math.add(
+            limits.ByteCount,
+            key_bytes,
+            value_bytes,
+        ) catch return error.RadixByteCapacityExceeded;
+        if (bytes_required > self.bytes.remaining()) return error.RadixByteCapacityExceeded;
+
+        if (existing_index) |node_index| {
+            const node = &self.nodes.items()[node_index];
+            if (!node.is_terminal) self.size += 1;
+            node.value = self.store_value(value);
+            node.is_terminal = true;
+            return;
+        }
+        if (self.nodes.capacity() - self.nodes.count < 2)
+            return error.RadixNodeCapacityExceeded;
+        self.insert_new(key, value);
+    }
+
+    fn insert_new(self: *RadixTree, key: []const u8, value: EventValue) void {
         const size_before = self.size;
-
-        var node = self.root;
+        var node_index = root_index;
         var remaining = key;
-        var depth: u32 = 0;
-
-        while (true) {
-            assert(depth <= key_length_max + 1);
+        var depth: limits.ByteCount = 0;
+        while (remaining.len > 0) {
+            assert(depth <= limits.key_length_max);
             depth += 1;
-
-            if (remaining.len == 0) {
-                const was_new = !node.is_terminal;
-                if (node.value) |*existing| {
-                    existing.deinit(self.allocator);
+            if (self.find_child(node_index, remaining)) |match| {
+                if (match.common_length < self.nodes.items()[match.index].key_fragment.len) {
+                    self.split_child(match.index, match.common_length);
                 }
-                node.value = value;
-                node.is_terminal = true;
-                if (was_new) self.size += 1;
-                assert(self.size >= size_before);
-                return;
-            }
-
-            var matched: ?*RadixNode = null;
-            var common_len: usize = 0;
-            for (node.children.items) |child| {
-                common_len = common_prefix_length(remaining, child.key_fragment);
-                if (common_len > 0) {
-                    matched = child;
-                    break;
-                }
-            }
-
-            if (matched) |child| {
-                assert(common_len > 0);
-                assert(common_len <= child.key_fragment.len);
-                if (common_len < child.key_fragment.len) {
-                    try self.split_child(child, common_len);
-                    assert(child.key_fragment.len == common_len);
-                }
-                node = child;
-                remaining = remaining[common_len..];
+                node_index = match.index;
+                remaining = remaining[match.common_length..];
             } else {
-                const new_child = try RadixNode.init(self.allocator, remaining);
-                new_child.value = value;
-                new_child.is_terminal = true;
-                try node.children.append(self.allocator, new_child);
+                const fragment = self.bytes.write(remaining) catch unreachable;
+                const stored = self.store_value(value);
+                const parent = &self.nodes.items()[node_index];
+                const child_index = self.nodes.count;
+                self.nodes.append(.{
+                    .key_fragment = fragment,
+                    .value = stored,
+                    .first_child = null,
+                    .next_sibling = parent.first_child,
+                    .is_terminal = true,
+                }) catch unreachable;
+                parent.first_child = child_index;
                 self.size += 1;
                 assert(self.size == size_before + 1);
                 return;
             }
         }
+        const node = &self.nodes.items()[node_index];
+        assert(!node.is_terminal);
+        node.value = self.store_value(value);
+        node.is_terminal = true;
+        self.size += 1;
+        assert(self.size == size_before + 1);
     }
 
-    fn split_child(self: *RadixTree, child: *RadixNode, split_pos: usize) !void {
-        assert(split_pos > 0);
-        assert(split_pos < child.key_fragment.len);
-
-        const remaining_fragment = child.key_fragment[split_pos..];
-        const new_child = try RadixNode.init(self.allocator, remaining_fragment);
-        new_child.value = child.value;
-        new_child.is_terminal = child.is_terminal;
-        new_child.children = child.children;
-
-        const prefix = try self.allocator.dupe(u8, child.key_fragment[0..split_pos]);
-        self.allocator.free(child.key_fragment);
-        child.key_fragment = prefix;
+    fn split_child(
+        self: *RadixTree,
+        child_index: limits.NodeIndex,
+        split_position: limits.ByteCount,
+    ) void {
+        const previous = self.nodes.items_const()[child_index];
+        assert(split_position > 0);
+        assert(split_position < previous.key_fragment.len);
+        const suffix_index = self.nodes.count;
+        self.nodes.append(.{
+            .key_fragment = previous.key_fragment[split_position..],
+            .value = previous.value,
+            .first_child = previous.first_child,
+            .next_sibling = null,
+            .is_terminal = previous.is_terminal,
+        }) catch unreachable;
+        const child = &self.nodes.items()[child_index];
+        child.key_fragment = previous.key_fragment[0..split_position];
         child.value = null;
+        child.first_child = suffix_index;
         child.is_terminal = false;
-        child.children = ArrayList(*RadixNode).empty;
-        try child.children.append(self.allocator, new_child);
-
-        assert(child.children.items.len == 1);
-        assert(!child.is_terminal);
+        assert(child.next_sibling == previous.next_sibling);
     }
 
     pub fn get(self: *const RadixTree, key: []const u8) ?*const EventValue {
-        assert(key.len <= key_length_max);
+        assert(key.len > 0);
+        if (key.len > limits.key_length_max) return null;
+        const node_index = self.find_exact_node(key) orelse return null;
+        const node = &self.nodes.items_const()[node_index];
+        if (!node.is_terminal) return null;
+        assert(node.value != null);
+        return &node.value.?;
+    }
 
-        var node: *const RadixNode = self.root;
+    fn find_exact_node(self: *const RadixTree, key: []const u8) ?limits.NodeIndex {
+        var node_index = root_index;
         var remaining = key;
-        var depth: u32 = 0;
-
-        while (true) {
-            assert(depth <= key_length_max + 1);
+        var depth: limits.ByteCount = 0;
+        while (remaining.len > 0) {
+            assert(depth <= limits.key_length_max);
             depth += 1;
-
-            if (remaining.len == 0) {
-                if (node.is_terminal) {
-                    assert(node.value != null);
-                    if (node.value) |*v| return v;
-                }
-                return null;
-            }
-
-            var descended = false;
-            for (node.children.items) |child| {
-                const common_len = common_prefix_length(remaining, child.key_fragment);
-                if (common_len == child.key_fragment.len and common_len > 0) {
-                    node = child;
-                    remaining = remaining[common_len..];
-                    descended = true;
-                    break;
-                }
-            }
-            if (!descended) return null;
+            const match = self.find_child(node_index, remaining) orelse return null;
+            const child = &self.nodes.items_const()[match.index];
+            if (match.common_length != child.key_fragment.len) return null;
+            node_index = match.index;
+            remaining = remaining[match.common_length..];
         }
+        return node_index;
     }
 
-    const ScanFrame = struct {
-        node: *const RadixNode,
-        child_index: usize,
-        prev_key_len: usize,
-    };
+    fn find_child(
+        self: *const RadixTree,
+        node_index: limits.NodeIndex,
+        remaining: []const u8,
+    ) ?ChildMatch {
+        var child_index = self.nodes.items_const()[node_index].first_child;
+        while (child_index) |index| {
+            const child = &self.nodes.items_const()[index];
+            const common_length = common_prefix_length(remaining, child.key_fragment);
+            if (common_length > 0) return .{
+                .index = index,
+                .common_length = common_length,
+            };
+            child_index = child.next_sibling;
+        }
+        return null;
+    }
 
-    pub fn scan_prefix(
+    pub fn visit_prefix(
         self: *const RadixTree,
         prefix: []const u8,
-        results: *ArrayList(KeyValuePair),
-    ) !void {
-        assert(prefix.len <= key_length_max);
-
-        var key_buf = ArrayList(u8).empty;
-        defer key_buf.deinit(self.allocator);
-
-        var stack = ArrayList(ScanFrame).empty;
-        defer stack.deinit(self.allocator);
-
-        try self.scan_push(&stack, &key_buf, self.root, prefix, results);
-
-        while (stack.items.len > 0) {
-            assert(stack.items.len <= key_length_max + 1);
-            const frame = &stack.items[stack.items.len - 1];
-
-            if (frame.child_index < frame.node.children.items.len) {
-                const child = frame.node.children.items[frame.child_index];
-                frame.child_index += 1;
-                try self.scan_push(&stack, &key_buf, child, prefix, results);
+        context: anytype,
+        comptime visit: anytype,
+    ) !event.VisitControl {
+        assert(prefix.len <= limits.key_length_max);
+        var key_buffer: [limits.key_length_max]u8 = undefined;
+        var key_length: limits.ByteCount = 0;
+        var stack: [limits.key_length_max + 1]ScanFrame = undefined;
+        var stack_count: limits.ByteCount = 0;
+        const root_control = try self.scan_enter(
+            root_index,
+            prefix,
+            &key_buffer,
+            &key_length,
+            &stack,
+            &stack_count,
+            context,
+            visit,
+        );
+        if (root_control == .stop) return .stop;
+        while (stack_count > 0) {
+            const frame = &stack[stack_count - 1];
+            if (frame.next_child) |child_index| {
+                frame.next_child = self.nodes.items_const()[child_index].next_sibling;
+                const control = try self.scan_enter(
+                    child_index,
+                    prefix,
+                    &key_buffer,
+                    &key_length,
+                    &stack,
+                    &stack_count,
+                    context,
+                    visit,
+                );
+                if (control == .stop) return .stop;
             } else {
-                key_buf.items.len = frame.prev_key_len;
-                stack.items.len -= 1;
+                key_length = frame.key_length_before;
+                stack_count -= 1;
             }
         }
-
-        assert(key_buf.items.len == 0);
+        assert(key_length == 0);
+        return .continue_scan;
     }
 
-    /// Appends the node's fragment to key_buf; if the accumulated key still matches
-    /// the prefix, collects a terminal value and pushes a frame to visit children.
-    /// Otherwise the subtree is pruned and key_buf is restored.
-    fn scan_push(
+    fn scan_enter(
         self: *const RadixTree,
-        stack: *ArrayList(ScanFrame),
-        key_buf: *ArrayList(u8),
-        node: *const RadixNode,
+        node_index: limits.NodeIndex,
         prefix: []const u8,
-        results: *ArrayList(KeyValuePair),
-    ) !void {
-        const prev_len = key_buf.items.len;
-        try key_buf.appendSlice(self.allocator, node.key_fragment);
-        const full_key = key_buf.items;
-
-        const pruned = if (full_key.len >= prefix.len)
-            !std.mem.startsWith(u8, full_key, prefix)
+        key_buffer: []u8,
+        key_length: *limits.ByteCount,
+        stack: []ScanFrame,
+        stack_count: *limits.ByteCount,
+        context: anytype,
+        comptime visit: anytype,
+    ) !event.VisitControl {
+        const node = &self.nodes.items_const()[node_index];
+        const key_length_before = key_length.*;
+        const fragment_length = limits.byte_count(node.key_fragment.len) catch unreachable;
+        assert(key_length.* + fragment_length <= key_buffer.len);
+        @memcpy(key_buffer[key_length.*..][0..fragment_length], node.key_fragment);
+        key_length.* += fragment_length;
+        const key = key_buffer[0..key_length.*];
+        const pruned = if (key.len >= prefix.len)
+            !std.mem.startsWith(u8, key, prefix)
         else
-            !std.mem.startsWith(u8, prefix, full_key);
+            !std.mem.startsWith(u8, prefix, key);
         if (pruned) {
-            key_buf.items.len = prev_len;
-            return;
+            key_length.* = key_length_before;
+            return .continue_scan;
         }
-
-        if (node.is_terminal and full_key.len >= prefix.len) {
+        if (node.is_terminal and key.len >= prefix.len) {
             assert(node.value != null);
-            const original = node.value.?;
-            try results.append(self.allocator, KeyValuePair{
-                .key = try self.allocator.dupe(u8, full_key),
-                .value = EventValue{
-                    .sequence = original.sequence,
-                    .event_type = try self.allocator.dupe(u8, original.event_type),
-                    .payload = try self.allocator.dupe(u8, original.payload),
-                    .timestamp = original.timestamp,
-                    .origin_service = try self.allocator.dupe(u8, original.origin_service),
-                },
-            });
+            if (try visit(context, key, node.value.?) == .stop) return .stop;
         }
+        assert(stack_count.* < stack.len);
+        stack[stack_count.*] = .{
+            .next_child = node.first_child,
+            .key_length_before = key_length_before,
+        };
+        stack_count.* += 1;
+        return .continue_scan;
+    }
 
-        try stack.append(self.allocator, ScanFrame{
-            .node = node,
-            .child_index = 0,
-            .prev_key_len = prev_len,
-        });
+    fn store_value(self: *RadixTree, value: EventValue) EventValue {
+        return .{
+            .sequence = value.sequence,
+            .event_type = self.bytes.write(value.event_type) catch unreachable,
+            .payload = self.bytes.write(value.payload) catch unreachable,
+            .timestamp = value.timestamp,
+            .origin_service = self.bytes.write(value.origin_service) catch unreachable,
+        };
     }
 };
 
-fn common_prefix_length(a: []const u8, b: []const u8) usize {
-    var i: usize = 0;
-    while (i < a.len and i < b.len and a[i] == b[i]) {
-        i += 1;
-    }
-    assert(i <= a.len);
-    assert(i <= b.len);
-    return i;
+fn value_size(value: EventValue) !limits.ByteCount {
+    return try limits.byte_count(
+        value.event_type.len + value.payload.len + value.origin_service.len,
+    );
 }
 
+fn common_prefix_length(a: []const u8, b: []const u8) limits.ByteCount {
+    var index: limits.ByteCount = 0;
+    while (index < a.len and index < b.len and a[index] == b[index]) {
+        index += 1;
+    }
+    assert(index <= a.len);
+    assert(index <= b.len);
+    return index;
+}
+
+const CountContext = struct {
+    count: limits.CollectionCount = 0,
+
+    fn visit(self: *CountContext, _: []const u8, _: EventValue) !event.VisitControl {
+        self.count += 1;
+        return .continue_scan;
+    }
+};
+
 test "radix insert and get" {
-    const allocator = std.testing.allocator;
-    var tree = try RadixTree.init(allocator);
+    var tree = try RadixTree.init(std.testing.allocator);
     defer tree.deinit();
 
-    const v1 = try EventValue.init(allocator, 1, "svc", "evt", "{}", 0);
-    try tree.insert("hello", v1);
-    const v2 = try EventValue.init(allocator, 2, "svc", "evt", "{}", 0);
-    try tree.insert("help", v2);
+    try tree.insert("hello", .{
+        .sequence = 1,
+        .event_type = "evt",
+        .payload = "{}",
+        .timestamp = 0,
+        .origin_service = "svc",
+    });
+    try tree.insert("help", .{
+        .sequence = 2,
+        .event_type = "evt",
+        .payload = "{}",
+        .timestamp = 0,
+        .origin_service = "svc",
+    });
 
     try std.testing.expectEqual(@as(u64, 1), tree.get("hello").?.sequence);
     try std.testing.expectEqual(@as(u64, 2), tree.get("help").?.sequence);
     try std.testing.expect(tree.get("hel") == null);
     try std.testing.expect(tree.get("missing") == null);
-    try std.testing.expectEqual(@as(usize, 2), tree.size);
+    try std.testing.expectEqual(@as(limits.NodeCount, 2), tree.size);
 }
 
 test "radix overwrite does not grow size" {
-    const allocator = std.testing.allocator;
-    var tree = try RadixTree.init(allocator);
+    var tree = try RadixTree.init(std.testing.allocator);
     defer tree.deinit();
-
-    const v1 = try EventValue.init(allocator, 1, "svc", "first", "{}", 0);
-    try tree.insert("key", v1);
-    const v2 = try EventValue.init(allocator, 2, "svc", "second", "{}", 0);
-    try tree.insert("key", v2);
-
-    try std.testing.expectEqual(@as(usize, 1), tree.size);
+    const first = EventValue{
+        .sequence = 1,
+        .event_type = "first",
+        .payload = "{}",
+        .timestamp = 0,
+        .origin_service = "svc",
+    };
+    var second = first;
+    second.sequence = 2;
+    second.event_type = "second";
+    try tree.insert("key", first);
+    try tree.insert("key", second);
+    try std.testing.expectEqual(@as(limits.NodeCount, 1), tree.size);
     try std.testing.expectEqual(@as(u64, 2), tree.get("key").?.sequence);
 }
 
-test "radix scan_prefix" {
-    const allocator = std.testing.allocator;
-    var tree = try RadixTree.init(allocator);
+test "radix prefix visitor is bounded" {
+    var tree = try RadixTree.init(std.testing.allocator);
     defer tree.deinit();
-
     const keys = [_][]const u8{ "a:1", "a:2", "a:3", "b:1" };
-    for (keys, 0..) |k, i| {
-        const v = try EventValue.init(allocator, i + 1, "svc", "evt", "{}", 0);
-        try tree.insert(k, v);
-    }
-
-    var results = ArrayList(KeyValuePair).empty;
-    defer {
-        for (results.items) |*item| item.deinit(allocator);
-        results.deinit(allocator);
-    }
-    try tree.scan_prefix("a:", &results);
-    try std.testing.expectEqual(@as(usize, 3), results.items.len);
+    for (keys, 0..) |key, index| try tree.insert(key, .{
+        .sequence = index + 1,
+        .event_type = "evt",
+        .payload = "{}",
+        .timestamp = 0,
+        .origin_service = "svc",
+    });
+    var context = CountContext{};
+    _ = try tree.visit_prefix("a:", &context, CountContext.visit);
+    try std.testing.expectEqual(@as(limits.CollectionCount, 3), context.count);
 }
 
-test "radix deep keys stay bounded" {
-    const allocator = std.testing.allocator;
-    var tree = try RadixTree.init(allocator);
+test "radix operations allocate nothing after initialization" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var tree = try RadixTree.init(failing.allocator());
     defer tree.deinit();
-
-    // Nested prefixes force maximum tree depth (one node per added character).
-    var key_buf: [256]u8 = undefined;
-    for (0..256) |len| {
-        key_buf[len] = 'x';
-        const v = try EventValue.init(allocator, len + 1, "svc", "evt", "{}", 0);
-        try tree.insert(key_buf[0 .. len + 1], v);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    var key_buffer: [64]u8 = undefined;
+    for (0..256) |index| {
+        const key = try std.fmt.bufPrint(&key_buffer, "fixed:{d}", .{index});
+        try tree.insert(key, .{
+            .sequence = index + 1,
+            .event_type = "fixed.event",
+            .payload = "{}",
+            .timestamp = 1,
+            .origin_service = "fixed-service",
+        });
     }
-    try std.testing.expectEqual(@as(usize, 256), tree.size);
-    try std.testing.expectEqual(@as(u64, 256), tree.get(&key_buf).?.sequence);
-
-    var results = ArrayList(KeyValuePair).empty;
-    defer {
-        for (results.items) |*item| item.deinit(allocator);
-        results.deinit(allocator);
-    }
-    try tree.scan_prefix("xxx", &results);
-    try std.testing.expectEqual(@as(usize, 254), results.items.len);
+    try std.testing.expectEqual(@as(u64, 256), tree.get("fixed:255").?.sequence);
+    var context = CountContext{};
+    _ = try tree.visit_prefix("fixed:", &context, CountContext.visit);
+    try std.testing.expectEqual(@as(limits.CollectionCount, 256), context.count);
+    try std.testing.expect(!failing.has_induced_failure);
 }

@@ -1,0 +1,18 @@
+{
+  "service_name": "compix-e2e",
+  "instance_id": "node-1",
+  "listen_address": "127.0.0.1:44200",
+  "wal_path": "data/e2e.wal",
+  "client_secret": "0123456789abcdef0123456789abcdef",
+  "credentials": [
+    {
+      "service_name": "compix-test-client",
+      "secret": "abcdef0123456789abcdef0123456789",
+      "permissions": ["append", "read_stream", "read_log", "recover"]
+    }
+  ],
+  "connection_capacity": 16,
+  "stream_capacity": 8192,
+  "stream_id_bytes_capacity": 1048576,
+  "contracts": []
+}

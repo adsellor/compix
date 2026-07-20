@@ -1,251 +1,156 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const ArrayList = std.ArrayList;
+const limits = @import("limits.zig");
 const sstable = @import("sstable.zig");
 const RawEntry = sstable.RawEntry;
+const RawIteratorBuffered = sstable.RawIteratorBuffered;
 const SSTableReader = sstable.SSTableReader;
-const RawIterator = sstable.RawIterator;
 
-pub const MergeIterator = struct {
-    allocator: std.mem.Allocator,
-    sources: []Source,
-    result_buf: ?[]u8,
+pub const FixedMergeSource = struct {
+    iterator: RawIteratorBuffered,
+    sstable_id: u64,
+    current: ?RawEntry,
+};
 
-    const Source = struct {
-        iter: RawIterator,
-        sst_id: u64,
-        current_key: ?[]u8,
-        current_value: ?[]u8,
-
-        fn free_current_entry(self: *Source, allocator: std.mem.Allocator) void {
-            if (self.current_key) |k| allocator.free(k);
-            if (self.current_value) |v| allocator.free(v);
-            self.current_key = null;
-            self.current_value = null;
-        }
-    };
+pub const FixedMergeIterator = struct {
+    sources: []FixedMergeSource,
+    result_buffer: []u8,
 
     pub fn init(
-        allocator: std.mem.Allocator,
+        source_storage: []FixedMergeSource,
         readers: []*SSTableReader,
-        sst_ids: []const u64,
-    ) !MergeIterator {
-        assert(readers.len == sst_ids.len);
-        const sources = try allocator.alloc(Source, readers.len);
-        errdefer allocator.free(sources);
+        sstable_ids: []const u64,
+        block_storage: []u8,
+        result_buffer: []u8,
+    ) !FixedMergeIterator {
+        assert(readers.len == sstable_ids.len);
+        if (readers.len > source_storage.len) return error.SourceCapacityExceeded;
+        const blocks_size = readers.len * limits.sstable_block_size_max;
+        if (blocks_size > block_storage.len) return error.BlockStorageTooSmall;
 
-        for (readers, 0..) |reader, i| {
-            sources[i] = Source{
-                .iter = reader.raw_iterator(),
-                .sst_id = sst_ids[i],
-                .current_key = null,
-                .current_value = null,
+        const sources = source_storage[0..readers.len];
+        for (sources, readers, sstable_ids, 0..) |*source, reader, sstable_id, index| {
+            const block_start = index * limits.sstable_block_size_max;
+            const block = block_storage[block_start .. block_start + limits.sstable_block_size_max];
+            source.* = .{
+                .iterator = RawIteratorBuffered.init(reader, block),
+                .sstable_id = sstable_id,
+                .current = null,
             };
+            source.current = try source.iterator.next();
         }
-
-        var self = MergeIterator{
-            .allocator = allocator,
-            .sources = sources,
-            .result_buf = null,
-        };
-        for (self.sources) |*s| {
-            try self.advance(s);
-        }
-        return self;
+        return .{ .sources = sources, .result_buffer = result_buffer };
     }
 
-    pub fn deinit(self: *MergeIterator) void {
-        for (self.sources) |*s| {
-            s.free_current_entry(self.allocator);
-            s.iter.deinit();
-        }
-        if (self.result_buf) |buf| self.allocator.free(buf);
-        self.allocator.free(self.sources);
-    }
-
-    pub fn next(self: *MergeIterator) !?RawEntry {
-        if (self.result_buf) |buf| {
-            self.allocator.free(buf);
-            self.result_buf = null;
-        }
-
-        var min_key: ?[]const u8 = null;
-        for (self.sources) |s| {
-            if (s.current_key) |k| {
-                if (min_key == null or std.mem.order(u8, k, min_key.?) == .lt) {
-                    min_key = k;
+    pub fn next(self: *FixedMergeIterator) !?RawEntry {
+        var minimum_key: ?[]const u8 = null;
+        for (self.sources) |source| {
+            if (source.current) |entry| {
+                if (minimum_key == null or
+                    std.mem.order(u8, entry.key, minimum_key.?) == .lt)
+                {
+                    minimum_key = entry.key;
                 }
             }
         }
-        if (min_key == null) return null;
+        const key = minimum_key orelse return null;
 
-        var winner_idx: ?usize = null;
+        var winner: ?limits.CollectionIndex = null;
         var winner_id: u64 = 0;
-        for (self.sources, 0..) |s, i| {
-            if (s.current_key) |k| {
-                if (std.mem.eql(u8, k, min_key.?)) {
-                    if (winner_idx == null or s.sst_id > winner_id) {
-                        winner_idx = i;
-                        winner_id = s.sst_id;
+        for (self.sources, 0..) |source, index| {
+            if (source.current) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) {
+                    if (winner == null or source.sstable_id > winner_id) {
+                        winner = @intCast(index);
+                        winner_id = source.sstable_id;
                     }
                 }
             }
         }
-
-        const win = winner_idx.?;
-        const win_key = self.sources[win].current_key.?;
-        const win_value = self.sources[win].current_value.?;
-
-        const buf = try self.allocator.alloc(u8, win_key.len + win_value.len);
-        // TODO: see if I can get rid of this
-        @memcpy(buf[0..win_key.len], win_key);
-        @memcpy(buf[win_key.len..], win_value);
-        self.result_buf = buf;
-
+        const winning_entry = self.sources[limits.usize_from(winner.?)].current.?;
+        const result_size = winning_entry.key.len + winning_entry.value.len;
+        if (result_size > self.result_buffer.len) return error.ResultBufferTooSmall;
+        @memcpy(self.result_buffer[0..winning_entry.key.len], winning_entry.key);
+        @memcpy(
+            self.result_buffer[winning_entry.key.len..result_size],
+            winning_entry.value,
+        );
         const result = RawEntry{
-            .key = buf[0..win_key.len],
-            .value = buf[win_key.len..],
+            .key = self.result_buffer[0..winning_entry.key.len],
+            .value = self.result_buffer[winning_entry.key.len..result_size],
         };
 
-        for (self.sources) |*s| {
-            if (s.current_key) |k| {
-                if (std.mem.eql(u8, k, result.key)) {
-                    try self.advance(s);
+        for (self.sources) |*source| {
+            if (source.current) |entry| {
+                if (std.mem.eql(u8, entry.key, result.key)) {
+                    source.current = try source.iterator.next();
                 }
             }
         }
-
         return result;
-    }
-
-    fn advance(self: *MergeIterator, source: *Source) !void {
-        source.free_current_entry(self.allocator);
-        if (try source.iter.next()) |entry| {
-            source.current_key = try self.allocator.dupe(u8, entry.key);
-            source.current_value = try self.allocator.dupe(u8, entry.value);
-        }
     }
 };
 
-pub fn collect_merged(
+fn write_test_table(
     allocator: std.mem.Allocator,
-    merge_iter: *MergeIterator,
-) ![]RawEntry {
-    var result = ArrayList(RawEntry).empty;
-    errdefer {
-        for (result.items) |e| {
-            allocator.free(e.key);
-            allocator.free(e.value);
-        }
-        result.deinit(allocator);
-    }
-
-    while (try merge_iter.next()) |entry| {
-        if (result.items.len > 0) {
-            const prev = result.items[result.items.len - 1].key;
-            assert(std.mem.order(u8, prev, entry.key) == .lt);
-        }
-        try result.append(allocator, RawEntry{
-            .key = try allocator.dupe(u8, entry.key),
-            .value = try allocator.dupe(u8, entry.value),
-        });
-    }
-    return result.toOwnedSlice(allocator);
+    path: []const u8,
+    io: std.Io,
+    entries: []const RawEntry,
+) !void {
+    const data = try allocator.alloc(u8, limits.sstable_block_size_max);
+    defer allocator.free(data);
+    const index = try allocator.alloc(u8, limits.sstable_index_size_max);
+    defer allocator.free(index);
+    var writer = try sstable.StreamingWriter.init(path, io, data, index);
+    errdefer writer.abort();
+    for (entries) |entry| try writer.append(entry);
+    _ = try writer.finish();
 }
 
-const Io = std.Io;
-const IoDir = Io.Dir;
-
-test "merge_iterator single source" {
+test "fixed merge iterator deduplicates with newest table winning" {
     const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const path_old = "data/test_merge_fixed_old.sst";
+    const path_new = "data/test_merge_fixed_new.sst";
+    std.Io.Dir.cwd().deleteFile(io, path_old) catch {};
+    std.Io.Dir.cwd().deleteFile(io, path_new) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path_old) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path_new) catch {};
 
-    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const path = "data/test_merge_single.sst";
-    IoDir.cwd().deleteFile(io, path) catch {};
-    defer IoDir.cwd().deleteFile(io, path) catch {};
-
-    const entries = [_]sstable.RawEntry{
+    try write_test_table(allocator, path_old, io, &.{
         .{ .key = "a", .value = "1|0|2|s|e|{}" },
         .{ .key = "b", .value = "2|0|2|s|e|{}" },
         .{ .key = "c", .value = "3|0|2|s|e|{}" },
-    };
-    _ = try sstable.write_sstable(allocator, path, io, &entries);
-
-    var reader = try SSTableReader.open(allocator, path, io);
-    defer reader.deinit();
-
-    var readers = [_]*SSTableReader{&reader};
-    const ids = [_]u64{1};
-
-    var merge = try MergeIterator.init(allocator, &readers, &ids);
-    defer merge.deinit();
-
-    const e1 = (try merge.next()).?;
-    try std.testing.expectEqualStrings("a", e1.key);
-    const e2 = (try merge.next()).?;
-    try std.testing.expectEqualStrings("b", e2.key);
-    const e3 = (try merge.next()).?;
-    try std.testing.expectEqualStrings("c", e3.key);
-    try std.testing.expect(try merge.next() == null);
-}
-
-test "merge_iterator deduplication newest wins" {
-    const allocator = std.testing.allocator;
-
-    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const path1 = "data/test_merge_dedup1.sst";
-    const path2 = "data/test_merge_dedup2.sst";
-    IoDir.cwd().deleteFile(io, path1) catch {};
-    IoDir.cwd().deleteFile(io, path2) catch {};
-    defer IoDir.cwd().deleteFile(io, path1) catch {};
-    defer IoDir.cwd().deleteFile(io, path2) catch {};
-
-    // SST 1 (older): a=1, b=2, c=3
-    const entries1 = [_]sstable.RawEntry{
-        .{ .key = "a", .value = "1|0|2|s|e|{}" },
-        .{ .key = "b", .value = "2|0|2|s|e|{}" },
-        .{ .key = "c", .value = "3|0|2|s|e|{}" },
-    };
-    _ = try sstable.write_sstable(allocator, path1, io, &entries1);
-
-    // SST 2 (newer): b=20, d=40
-    const entries2 = [_]sstable.RawEntry{
+    });
+    try write_test_table(allocator, path_new, io, &.{
         .{ .key = "b", .value = "20|0|2|s|e|{}" },
         .{ .key = "d", .value = "40|0|2|s|e|{}" },
-    };
-    _ = try sstable.write_sstable(allocator, path2, io, &entries2);
+    });
 
-    var r1 = try SSTableReader.open(allocator, path1, io);
-    defer r1.deinit();
-    var r2 = try SSTableReader.open(allocator, path2, io);
-    defer r2.deinit();
+    var reader_old = try SSTableReader.open_uncached(path_old, io);
+    defer reader_old.deinit();
+    var reader_new = try SSTableReader.open_uncached(path_new, io);
+    defer reader_new.deinit();
+    var readers = [_]*SSTableReader{ &reader_old, &reader_new };
+    var sources: [2]FixedMergeSource = undefined;
+    var blocks: [2 * limits.sstable_block_size_max]u8 = undefined;
+    var result_buffer: [limits.sstable_block_size_max]u8 = undefined;
+    var merge = try FixedMergeIterator.init(
+        &sources,
+        &readers,
+        &.{ 1, 2 },
+        &blocks,
+        &result_buffer,
+    );
 
-    var readers = [_]*SSTableReader{ &r1, &r2 };
-    const ids = [_]u64{ 1, 2 }; // r2 is newer (id=2)
-
-    var merge = try MergeIterator.init(allocator, &readers, &ids);
-    defer merge.deinit();
-
-    const collected = try collect_merged(allocator, &merge);
-    defer {
-        for (collected) |e| {
-            allocator.free(e.key);
-            allocator.free(e.value);
+    const expected_keys = [_][]const u8{ "a", "b", "c", "d" };
+    var count: limits.CollectionCount = 0;
+    while (try merge.next()) |entry| {
+        try std.testing.expectEqualStrings(expected_keys[count], entry.key);
+        if (std.mem.eql(u8, entry.key, "b")) {
+            try std.testing.expectEqualStrings("20|0|2|s|e|{}", entry.value);
         }
-        allocator.free(collected);
+        count += 1;
     }
-
-    try std.testing.expectEqual(@as(usize, 4), collected.len);
-    try std.testing.expectEqualStrings("a", collected[0].key);
-    try std.testing.expectEqualStrings("1|0|2|s|e|{}", collected[0].value);
-    try std.testing.expectEqualStrings("b", collected[1].key);
-    try std.testing.expectEqualStrings("20|0|2|s|e|{}", collected[1].value); // newest wins
-    try std.testing.expectEqualStrings("c", collected[2].key);
-    try std.testing.expectEqualStrings("d", collected[3].key);
+    try std.testing.expectEqual(@as(limits.CollectionCount, 4), count);
 }

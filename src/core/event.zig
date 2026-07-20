@@ -1,38 +1,53 @@
 const std = @import("std");
 const assert = std.debug.assert;
+const limits = @import("limits.zig");
 
 pub const EventValue = struct {
-    sequence: u64,
+    sequence: limits.Sequence,
     event_type: []const u8,
     payload: []const u8,
-    timestamp: i64,
+    timestamp: limits.Timestamp,
     origin_service: []const u8,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        sequence: u64,
+    pub const InitOptions = struct {
+        sequence: limits.Sequence,
         origin_service: []const u8,
         event_type: []const u8,
         payload: []const u8,
-        timestamp: i64,
-    ) !EventValue {
-        return EventValue{
-            .sequence = sequence,
-            .event_type = try allocator.dupe(u8, event_type),
-            .payload = try allocator.dupe(u8, payload),
-            .timestamp = timestamp,
-            .origin_service = try allocator.dupe(u8, origin_service),
+        timestamp: limits.Timestamp,
+    };
+
+    pub fn init(options: InitOptions) !EventValue {
+        if (options.origin_service.len > limits.service_name_length_max)
+            return error.ServiceNameTooLong;
+        if (options.event_type.len > limits.event_type_length_max)
+            return error.EventTypeTooLong;
+        if (options.payload.len > limits.payload_size_max) return error.PayloadTooLarge;
+
+        return .{
+            .sequence = options.sequence,
+            .event_type = options.event_type,
+            .payload = options.payload,
+            .timestamp = options.timestamp,
+            .origin_service = options.origin_service,
         };
     }
 
-    pub fn serialize(self: *const EventValue, allocator: std.mem.Allocator) ![]u8 {
-        // The origin_service and event_type fields are delimiter-separated, so
-        // they must never contain the delimiter; payload length is encoded, so
-        // the payload may.
+    pub fn serialize_into(self: *const EventValue, buffer: []u8) ![]const u8 {
         assert(std.mem.indexOfScalar(u8, self.origin_service, '|') == null);
         assert(std.mem.indexOfScalar(u8, self.event_type, '|') == null);
+        return std.fmt.bufPrint(buffer, "{}|{}|{}|{s}|{s}|{s}", .{
+            self.sequence,
+            self.timestamp,
+            self.payload.len,
+            self.origin_service,
+            self.event_type,
+            self.payload,
+        }) catch return error.BufferTooSmall;
+    }
 
-        const serialized = try std.fmt.allocPrint(allocator, "{}|{}|{}|{s}|{s}|{s}", .{
+    pub fn serialized_size(self: *const EventValue) limits.ByteCount {
+        const size = std.fmt.count("{}|{}|{}|{s}|{s}|{s}", .{
             self.sequence,
             self.timestamp,
             self.payload.len,
@@ -40,69 +55,79 @@ pub const EventValue = struct {
             self.event_type,
             self.payload,
         });
-        assert(serialized.len >= 5 + self.payload.len);
-        return serialized;
+        return limits.byte_count(size) catch unreachable;
     }
 
-    pub fn deserialize(allocator: std.mem.Allocator, data: []const u8) !EventValue {
+    /// Decode an event as views into `data`. The result owns no memory and is
+    /// valid only while `data` remains unchanged.
+    pub fn deserialize_borrowed(data: []const u8) !EventValue {
         var iter = std.mem.splitSequence(u8, data, "|");
         const sequence_str = iter.next() orelse return error.InvalidFormat;
         const sequence = try std.fmt.parseInt(u64, sequence_str, 10);
         const timestamp_str = iter.next() orelse return error.InvalidFormat;
         const timestamp = try std.fmt.parseInt(i64, timestamp_str, 10);
         const payload_len_str = iter.next() orelse return error.InvalidFormat;
-        const payload_len = try std.fmt.parseInt(usize, payload_len_str, 10);
+        const payload_len = try std.fmt.parseInt(limits.ByteCount, payload_len_str, 10);
         const origin_service = iter.next() orelse return error.InvalidFormat;
         const event_type = iter.next() orelse return error.InvalidFormat;
         const payload_raw = iter.rest();
         const payload = if (payload_raw.len > 0) payload_raw else "";
 
-        if (payload.len != payload_len) return error.InvalidFormat;
+        if (payload.len != limits.usize_from(payload_len)) return error.InvalidFormat;
 
-        return EventValue{
+        if (origin_service.len > limits.service_name_length_max)
+            return error.ServiceNameTooLong;
+        if (event_type.len > limits.event_type_length_max)
+            return error.EventTypeTooLong;
+        if (payload.len > limits.payload_size_max) return error.PayloadTooLarge;
+
+        return .{
             .sequence = sequence,
-            .event_type = try allocator.dupe(u8, event_type),
-            .payload = try allocator.dupe(u8, payload),
+            .origin_service = origin_service,
+            .event_type = event_type,
+            .payload = payload,
             .timestamp = timestamp,
-            .origin_service = try allocator.dupe(u8, origin_service),
         };
     }
+};
 
-    pub fn deinit(self: *EventValue, allocator: std.mem.Allocator) void {
-        allocator.free(self.event_type);
-        allocator.free(self.payload);
-        allocator.free(self.origin_service);
-    }
+pub const VisitControl = enum {
+    continue_scan,
+    stop,
 };
 
 pub const KeyValuePair = struct {
     key: []const u8,
     value: EventValue,
-
-    pub fn deinit(self: *KeyValuePair, allocator: std.mem.Allocator) void {
-        allocator.free(self.key);
-        self.value.deinit(allocator);
-    }
 };
 
-test "serialize/deserialize round-trip with origin_service" {
-    const allocator = std.testing.allocator;
+fn test_event_value(
+    sequence: limits.Sequence,
+    origin_service: []const u8,
+    event_type: []const u8,
+    payload: []const u8,
+    timestamp: limits.Timestamp,
+) !EventValue {
+    return try EventValue.init(.{
+        .sequence = sequence,
+        .origin_service = origin_service,
+        .event_type = event_type,
+        .payload = payload,
+        .timestamp = timestamp,
+    });
+}
 
-    var ev = try EventValue.init(
-        allocator,
+test "serialize/deserialize round-trip with origin_service" {
+    const ev = try test_event_value(
         42,
         "order-service",
         "order.created",
         "{\"id\":123}",
         1700000000,
     );
-    defer ev.deinit(allocator);
-
-    const serialized = try ev.serialize(allocator);
-    defer allocator.free(serialized);
-
-    var deserialized = try EventValue.deserialize(allocator, serialized);
-    defer deserialized.deinit(allocator);
+    var buffer: [1024]u8 = undefined;
+    const serialized = try ev.serialize_into(&buffer);
+    const deserialized = try EventValue.deserialize_borrowed(serialized);
 
     try std.testing.expectEqual(@as(u64, 42), deserialized.sequence);
     try std.testing.expectEqual(@as(i64, 1700000000), deserialized.timestamp);
@@ -112,16 +137,10 @@ test "serialize/deserialize round-trip with origin_service" {
 }
 
 test "payload containing pipe characters deserializes correctly" {
-    const allocator = std.testing.allocator;
-
-    var ev = try EventValue.init(allocator, 1, "test-service", "test.event", "a|b|c", 100);
-    defer ev.deinit(allocator);
-
-    const serialized = try ev.serialize(allocator);
-    defer allocator.free(serialized);
-
-    var deserialized = try EventValue.deserialize(allocator, serialized);
-    defer deserialized.deinit(allocator);
+    const ev = try test_event_value(1, "test-service", "test.event", "a|b|c", 100);
+    var buffer: [1024]u8 = undefined;
+    const serialized = try ev.serialize_into(&buffer);
+    const deserialized = try EventValue.deserialize_borrowed(serialized);
 
     try std.testing.expectEqualStrings("a|b|c", deserialized.payload);
     try std.testing.expectEqualStrings("test.event", deserialized.event_type);
@@ -129,16 +148,10 @@ test "payload containing pipe characters deserializes correctly" {
 }
 
 test "empty payload round-trip" {
-    const allocator = std.testing.allocator;
-
-    var ev = try EventValue.init(allocator, 5, "svc", "evt", "", 999);
-    defer ev.deinit(allocator);
-
-    const serialized = try ev.serialize(allocator);
-    defer allocator.free(serialized);
-
-    var deserialized = try EventValue.deserialize(allocator, serialized);
-    defer deserialized.deinit(allocator);
+    const ev = try test_event_value(5, "svc", "evt", "", 999);
+    var buffer: [1024]u8 = undefined;
+    const serialized = try ev.serialize_into(&buffer);
+    const deserialized = try EventValue.deserialize_borrowed(serialized);
 
     try std.testing.expectEqualStrings("", deserialized.payload);
     try std.testing.expectEqualStrings("evt", deserialized.event_type);
