@@ -294,13 +294,15 @@ pub const RadixTree = struct {
             .payload = self.bytes.write(value.payload) catch unreachable,
             .timestamp = value.timestamp,
             .origin_service = self.bytes.write(value.origin_service) catch unreachable,
+            .signature = self.bytes.write(value.signature) catch unreachable,
         };
     }
 };
 
 fn value_size(value: EventValue) !limits.ByteCount {
     return try limits.byte_count(
-        value.event_type.len + value.payload.len + value.origin_service.len,
+        value.event_type.len + value.payload.len + value.origin_service.len +
+            value.signature.len,
     );
 }
 

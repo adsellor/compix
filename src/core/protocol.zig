@@ -2,7 +2,6 @@ const std = @import("std");
 const assert = std.debug.assert;
 const auth = @import("auth.zig");
 const limits = @import("limits.zig");
-const raft = @import("raft.zig");
 
 pub const protocol_version: u8 = 0x05;
 pub const frame_size_max: limits.ByteCount = 1024 * 1024;
@@ -28,12 +27,6 @@ pub const MessageType = enum(u8) {
     read_log_response = 0x0A,
     health_request = 0x0B,
     health_response = 0x0C,
-    raft_request_vote = 0x0D,
-    raft_vote_result = 0x0E,
-    raft_append_entries = 0x0F,
-    raft_append_result = 0x10,
-    raft_install_snapshot = 0x11,
-    raft_snapshot_result = 0x12,
 };
 
 pub const EventId = u128;
@@ -53,7 +46,6 @@ pub const requests_per_connection_max: RequestCount = limits.messages_per_connec
 pub const append_batch_header_size: limits.ByteCount = 112;
 pub const append_event_storage_overhead: limits.ByteCount = 26;
 pub const append_batch_size_max: limits.ByteCount = limits.payload_size_max;
-pub const replicated_command_size_max: limits.ByteCount = append_batch_size_max + 8;
 
 comptime {
     assert(stream_id_length_max > 0);
@@ -107,9 +99,6 @@ pub const ErrorCode = enum(u16) {
     internal_error = 4,
     unauthenticated = 5,
     permission_denied = 6,
-    not_leader = 7,
-    quorum_unavailable = 8,
-    replication_unavailable = 9,
 };
 
 pub const Error = struct {
@@ -215,24 +204,6 @@ pub const HealthResponse = struct {
     replication_lag: u64,
 };
 
-pub const RaftAppendEntries = struct {
-    value: raft.AppendEntries,
-    command: []const u8 = "",
-};
-
-pub const RaftInstallSnapshot = struct {
-    value: raft.InstallSnapshot,
-    offset: u64,
-    done: bool,
-    chunk: []const u8,
-};
-
-pub const RaftSnapshotResult = struct {
-    value: raft.SnapshotResult,
-    next_offset: u64,
-    accepted: bool,
-};
-
 pub const DecodeBuffers = struct {
     pull_events: []PullResponse.EventEntry = &.{},
     append_events: []AppendEvent = &.{},
@@ -252,12 +223,6 @@ pub const Message = union(MessageType) {
     read_log_response: ReadLogResponse,
     health_request: HealthRequest,
     health_response: HealthResponse,
-    raft_request_vote: raft.RequestVote,
-    raft_vote_result: raft.VoteResult,
-    raft_append_entries: RaftAppendEntries,
-    raft_append_result: raft.AppendResult,
-    raft_install_snapshot: RaftInstallSnapshot,
-    raft_snapshot_result: RaftSnapshotResult,
 };
 
 /// Encodes into caller-owned memory.
@@ -325,113 +290,10 @@ pub fn encode_into(buffer: []u8, msg: Message) ![]const u8 {
         },
         .health_request => {},
         .health_response => |response| offset = write_health_response(frame, offset, response),
-        .raft_request_vote => |request| {
-            std.mem.writeInt(u64, frame[offset..][0..8], request.term, .big);
-            offset += 8;
-            frame[offset] = request.candidate;
-            offset += 1;
-            std.mem.writeInt(u64, frame[offset..][0..8], request.last_log_index, .big);
-            offset += 8;
-            std.mem.writeInt(u64, frame[offset..][0..8], request.last_log_term, .big);
-            offset += 8;
-        },
-        .raft_vote_result => |result| {
-            std.mem.writeInt(u64, frame[offset..][0..8], result.term, .big);
-            offset += 8;
-            frame[offset] = result.voter;
-            offset += 1;
-            frame[offset] = @intFromBool(result.granted);
-            offset += 1;
-        },
-        .raft_append_entries => |append| {
-            offset = write_raft_append(frame, offset, append);
-        },
-        .raft_append_result => |result| {
-            std.mem.writeInt(u64, frame[offset..][0..8], result.term, .big);
-            offset += 8;
-            frame[offset] = result.follower;
-            offset += 1;
-            frame[offset] = @intFromBool(result.success);
-            offset += 1;
-            std.mem.writeInt(u64, frame[offset..][0..8], result.match_index, .big);
-            offset += 8;
-            std.mem.writeInt(u64, frame[offset..][0..8], result.conflict_index, .big);
-            offset += 8;
-        },
-        .raft_install_snapshot => |install| {
-            std.mem.writeInt(u64, frame[offset..][0..8], install.value.term, .big);
-            offset += 8;
-            frame[offset] = install.value.leader;
-            offset += 1;
-            offset = write_raft_snapshot(frame, offset, install.value.snapshot);
-            std.mem.writeInt(u64, frame[offset..][0..8], install.offset, .big);
-            offset += 8;
-            frame[offset] = @intFromBool(install.done);
-            offset += 1;
-            offset = write_bytes_u32(frame, offset, install.chunk);
-        },
-        .raft_snapshot_result => |result| {
-            std.mem.writeInt(u64, frame[offset..][0..8], result.value.term, .big);
-            offset += 8;
-            frame[offset] = result.value.follower;
-            offset += 1;
-            std.mem.writeInt(u64, frame[offset..][0..8], result.value.installed_index, .big);
-            offset += 8;
-            std.mem.writeInt(u64, frame[offset..][0..8], result.next_offset, .big);
-            offset += 8;
-            frame[offset] = @intFromBool(result.accepted);
-            offset += 1;
-        },
     }
 
     assert(offset == total_size);
     return frame;
-}
-
-fn write_raft_append(
-    frame: []u8,
-    offset_start: limits.ByteCount,
-    append: RaftAppendEntries,
-) limits.ByteCount {
-    var offset = offset_start;
-    std.mem.writeInt(u64, frame[offset..][0..8], append.value.term, .big);
-    offset += 8;
-    frame[offset] = append.value.leader;
-    offset += 1;
-    std.mem.writeInt(u64, frame[offset..][0..8], append.value.previous_index, .big);
-    offset += 8;
-    std.mem.writeInt(u64, frame[offset..][0..8], append.value.previous_term, .big);
-    offset += 8;
-    std.mem.writeInt(u64, frame[offset..][0..8], append.value.leader_commit, .big);
-    offset += 8;
-    frame[offset] = @intFromBool(append.value.entry != null);
-    offset += 1;
-    if (append.value.entry) |entry| {
-        std.mem.writeInt(u64, frame[offset..][0..8], entry.term, .big);
-        offset += 8;
-        std.mem.writeInt(u64, frame[offset..][0..8], entry.index, .big);
-        offset += 8;
-        @memcpy(frame[offset..][0..32], &entry.command_checksum);
-        offset += 32;
-        offset = write_bytes_u32(frame, offset, append.command);
-    }
-    return offset;
-}
-
-fn write_raft_snapshot(
-    frame: []u8,
-    offset_start: limits.ByteCount,
-    snapshot: raft.Snapshot,
-) limits.ByteCount {
-    var offset = offset_start;
-    std.mem.writeInt(u64, frame[offset..][0..8], snapshot.last_index, .big);
-    offset += 8;
-    std.mem.writeInt(u64, frame[offset..][0..8], snapshot.last_term, .big);
-    offset += 8;
-    std.mem.writeInt(u64, frame[offset..][0..8], snapshot.state_size, .big);
-    offset += 8;
-    @memcpy(frame[offset..][0..32], &snapshot.state_checksum);
-    return offset + 32;
 }
 
 fn write_health_response(
@@ -652,146 +514,7 @@ pub fn decode(frame: []const u8, buffers: *DecodeBuffers) !Message {
         else
             error.TrailingData,
         0x0C => decode_health_response(payload),
-        0x0D => decode_raft_request_vote(payload),
-        0x0E => decode_raft_vote_result(payload),
-        0x0F => decode_raft_append(payload),
-        0x10 => decode_raft_append_result(payload),
-        0x11 => decode_raft_install_snapshot(payload),
-        0x12 => decode_raft_snapshot_result(payload),
         else => error.UnknownMessageType,
-    };
-}
-
-fn decode_raft_request_vote(payload: []const u8) !Message {
-    var decoder: PayloadDecoder = .{ .payload = payload };
-    const value: raft.RequestVote = .{
-        .term = try decoder.read_int(u64),
-        .candidate = try decoder.read_int(u8),
-        .last_log_index = try decoder.read_int(u64),
-        .last_log_term = try decoder.read_int(u64),
-    };
-    try decoder.finish();
-    return .{ .raft_request_vote = value };
-}
-
-fn decode_raft_vote_result(payload: []const u8) !Message {
-    var decoder: PayloadDecoder = .{ .payload = payload };
-    const term = try decoder.read_int(u64);
-    const voter = try decoder.read_int(u8);
-    const granted = switch (try decoder.read_int(u8)) {
-        0 => false,
-        1 => true,
-        else => return error.InvalidBoolean,
-    };
-    try decoder.finish();
-    return .{ .raft_vote_result = .{ .term = term, .voter = voter, .granted = granted } };
-}
-
-fn decode_raft_append(payload: []const u8) !Message {
-    var decoder: PayloadDecoder = .{ .payload = payload };
-    const term = try decoder.read_int(u64);
-    const leader = try decoder.read_int(u8);
-    const previous_index = try decoder.read_int(u64);
-    const previous_term = try decoder.read_int(u64);
-    const leader_commit = try decoder.read_int(u64);
-    const has_entry = switch (try decoder.read_int(u8)) {
-        0 => false,
-        1 => true,
-        else => return error.InvalidBoolean,
-    };
-    var entry: ?raft.Entry = null;
-    var command: []const u8 = "";
-    if (has_entry) {
-        const entry_term = try decoder.read_int(u64);
-        const entry_index = try decoder.read_int(u64);
-        const checksum_bytes = try decoder.read_bytes(32);
-        command = try decoder.read_bytes_u32();
-        if (command.len == 0 or command.len > replicated_command_size_max)
-            return error.InvalidReplicatedCommand;
-        entry = .{
-            .term = entry_term,
-            .index = entry_index,
-            .command_checksum = checksum_bytes[0..32].*,
-        };
-    }
-    try decoder.finish();
-    return .{ .raft_append_entries = .{
-        .value = .{
-            .term = term,
-            .leader = leader,
-            .previous_index = previous_index,
-            .previous_term = previous_term,
-            .leader_commit = leader_commit,
-            .entry = entry,
-        },
-        .command = command,
-    } };
-}
-
-fn decode_raft_append_result(payload: []const u8) !Message {
-    var decoder: PayloadDecoder = .{ .payload = payload };
-    const term = try decoder.read_int(u64);
-    const follower = try decoder.read_int(u8);
-    const success = switch (try decoder.read_int(u8)) {
-        0 => false,
-        1 => true,
-        else => return error.InvalidBoolean,
-    };
-    const match_index = try decoder.read_int(u64);
-    const conflict_index = try decoder.read_int(u64);
-    try decoder.finish();
-    return .{ .raft_append_result = .{
-        .term = term,
-        .follower = follower,
-        .success = success,
-        .match_index = match_index,
-        .conflict_index = conflict_index,
-    } };
-}
-
-fn decode_raft_install_snapshot(payload: []const u8) !Message {
-    var decoder: PayloadDecoder = .{ .payload = payload };
-    const term = try decoder.read_int(u64);
-    const leader = try decoder.read_int(u8);
-    const snapshot = try decode_raft_snapshot(&decoder);
-    const offset = try decoder.read_int(u64);
-    const done_wire = try decoder.read_int(u8);
-    if (done_wire > 1) return error.InvalidBoolean;
-    const chunk = try decoder.read_bytes_u32();
-    try decoder.finish();
-    return .{ .raft_install_snapshot = .{
-        .value = .{ .term = term, .leader = leader, .snapshot = snapshot },
-        .offset = offset,
-        .done = done_wire == 1,
-        .chunk = chunk,
-    } };
-}
-
-fn decode_raft_snapshot_result(payload: []const u8) !Message {
-    var decoder: PayloadDecoder = .{ .payload = payload };
-    const value: RaftSnapshotResult = .{
-        .value = .{
-            .term = try decoder.read_int(u64),
-            .follower = try decoder.read_int(u8),
-            .installed_index = try decoder.read_int(u64),
-        },
-        .next_offset = try decoder.read_int(u64),
-        .accepted = switch (try decoder.read_int(u8)) {
-            0 => false,
-            1 => true,
-            else => return error.InvalidBoolean,
-        },
-    };
-    try decoder.finish();
-    return .{ .raft_snapshot_result = value };
-}
-
-fn decode_raft_snapshot(decoder: *PayloadDecoder) !raft.Snapshot {
-    return .{
-        .last_index = try decoder.read_int(u64),
-        .last_term = try decoder.read_int(u64),
-        .state_size = try decoder.read_int(u64),
-        .state_checksum = (try decoder.read_bytes(32))[0..32].*,
     };
 }
 
@@ -927,9 +650,6 @@ fn decode_error_borrowed(payload: []const u8) !Message {
         4 => .internal_error,
         5 => .unauthenticated,
         6 => .permission_denied,
-        7 => .not_leader,
-        8 => .quorum_unavailable,
-        9 => .replication_unavailable,
         else => return error.InvalidMessage,
     };
     const message_length = std.mem.readInt(u16, payload[2..4], .big);
@@ -1167,19 +887,6 @@ fn payload_size(msg: Message) !limits.ByteCount {
         },
         .health_request => {},
         .health_response => try payload_size_add(&size, 128),
-        .raft_request_vote => try payload_size_add(&size, 25),
-        .raft_vote_result => try payload_size_add(&size, 10),
-        .raft_append_entries => |append| {
-            try payload_size_add(&size, 34);
-            if (append.value.entry != null) {
-                try payload_size_add(&size, 8 + 8 + 32 + 4 + append.command.len);
-            }
-        },
-        .raft_append_result => try payload_size_add(&size, 26),
-        .raft_install_snapshot => |install| {
-            try payload_size_add(&size, 78 + install.chunk.len);
-        },
-        .raft_snapshot_result => try payload_size_add(&size, 26),
     }
     assert(size >= 2);
     assert(size <= frame_payload_size_max);
@@ -1266,29 +973,6 @@ fn validate_message(msg: Message) !void {
                 response.stream_id_bytes_used > response.stream_id_bytes_max or
                 response.connections_active > response.connections_max)
                 return error.InvalidHealthResponse;
-        },
-        .raft_request_vote => {},
-        .raft_vote_result => {},
-        .raft_append_entries => |append| {
-            if (append.value.entry == null) {
-                if (append.command.len != 0) return error.UnexpectedReplicatedCommand;
-            } else if (append.command.len == 0 or
-                append.command.len > replicated_command_size_max)
-                return error.InvalidReplicatedCommand;
-        },
-        .raft_append_result => {},
-        .raft_install_snapshot => |install| {
-            if (install.chunk.len == 0 or
-                install.chunk.len > limits.snapshot_chunk_size_max or
-                install.offset > install.value.snapshot.state_size or
-                install.chunk.len > install.value.snapshot.state_size - install.offset or
-                install.done !=
-                    (install.offset + install.chunk.len == install.value.snapshot.state_size))
-                return error.InvalidSnapshotChunk;
-        },
-        .raft_snapshot_result => |result| {
-            if (result.next_offset > limits.snapshot_size_hard_max)
-                return error.InvalidSnapshotOffset;
         },
     }
 }
@@ -1500,9 +1184,6 @@ test "round-trip error with each error code" {
         .internal_error,
         .unauthenticated,
         .permission_denied,
-        .not_leader,
-        .quorum_unavailable,
-        .replication_unavailable,
     };
     for (codes) |code| {
         const msg = Message{ .err = .{
@@ -1751,204 +1432,6 @@ test "round-trip bounded health metrics" {
     try std.testing.expectEqualDeep(expected, decoded.health_response);
     const request_frame = try encode_into(&frame_buffer, .{ .health_request = .{} });
     try std.testing.expect((try decode(request_frame, &buffers)) == .health_request);
-}
-
-test "round-trip Raft messages and replicated command" {
-    const checksum: [32]u8 = @splat(0xa5);
-    const snapshot_checksum: [32]u8 = @splat(0x5a);
-    const messages = [_]Message{
-        .{ .raft_request_vote = .{
-            .term = 7,
-            .candidate = 2,
-            .last_log_index = 41,
-            .last_log_term = 6,
-        } },
-        .{ .raft_vote_result = .{ .term = 7, .voter = 3, .granted = true } },
-        .{ .raft_append_entries = .{ .value = .{
-            .term = 7,
-            .leader = 2,
-            .previous_index = 41,
-            .previous_term = 6,
-            .leader_commit = 40,
-            .entry = .{
-                .term = 7,
-                .index = 42,
-                .command_checksum = checksum,
-            },
-        }, .command = "durable-command" } },
-        .{ .raft_append_entries = .{ .value = .{
-            .term = 7,
-            .leader = 2,
-            .previous_index = 42,
-            .previous_term = 7,
-            .leader_commit = 42,
-            .entry = null,
-        } } },
-        .{ .raft_append_result = .{
-            .term = 7,
-            .follower = 3,
-            .success = false,
-            .match_index = 40,
-            .conflict_index = 38,
-        } },
-        .{ .raft_install_snapshot = .{
-            .value = .{
-                .term = 8,
-                .leader = 2,
-                .snapshot = .{
-                    .last_index = 42,
-                    .last_term = 7,
-                    .state_size = 4,
-                    .state_checksum = snapshot_checksum,
-                },
-            },
-            .offset = 0,
-            .done = true,
-            .chunk = "snap",
-        } },
-        .{ .raft_snapshot_result = .{
-            .value = .{
-                .term = 8,
-                .follower = 3,
-                .installed_index = 42,
-            },
-            .next_offset = 4,
-            .accepted = true,
-        } },
-    };
-    var frame_buffer: [1024]u8 = undefined;
-    var buffers: DecodeBuffers = .{};
-    for (messages) |expected| {
-        const actual = try test_round_trip(&frame_buffer, expected, &buffers);
-        switch (expected) {
-            .raft_request_vote => |value| {
-                try std.testing.expectEqualDeep(value, actual.raft_request_vote);
-            },
-            .raft_vote_result => |value| {
-                try std.testing.expectEqualDeep(value, actual.raft_vote_result);
-            },
-            .raft_append_entries => |value| {
-                try std.testing.expectEqualDeep(value.value, actual.raft_append_entries.value);
-                try std.testing.expectEqualStrings(
-                    value.command,
-                    actual.raft_append_entries.command,
-                );
-            },
-            .raft_append_result => |value| {
-                try std.testing.expectEqualDeep(value, actual.raft_append_result);
-            },
-            .raft_install_snapshot => |value| {
-                try std.testing.expectEqualDeep(value, actual.raft_install_snapshot);
-            },
-            .raft_snapshot_result => |value| {
-                try std.testing.expectEqualDeep(value, actual.raft_snapshot_result);
-            },
-            else => unreachable,
-        }
-    }
-}
-
-test "Raft append wire rejects command and boolean mismatches" {
-    const checksum: [32]u8 = @splat(0x31);
-    const entry: raft.Entry = .{
-        .term = 3,
-        .index = 9,
-        .command_checksum = checksum,
-    };
-    const heartbeat: raft.AppendEntries = .{
-        .term = 3,
-        .leader = 1,
-        .previous_index = 8,
-        .previous_term = 3,
-        .leader_commit = 8,
-        .entry = null,
-    };
-    var frame_buffer: [256]u8 = undefined;
-    try std.testing.expectError(
-        error.UnexpectedReplicatedCommand,
-        encode_into(&frame_buffer, .{ .raft_append_entries = .{
-            .value = heartbeat,
-            .command = "unexpected",
-        } }),
-    );
-    var with_entry = heartbeat;
-    with_entry.entry = entry;
-    try std.testing.expectError(
-        error.InvalidReplicatedCommand,
-        encode_into(&frame_buffer, .{ .raft_append_entries = .{ .value = with_entry } }),
-    );
-
-    const valid = try encode_into(&frame_buffer, .{ .raft_append_entries = .{
-        .value = with_entry,
-        .command = "x",
-    } });
-    var malformed: [256]u8 = undefined;
-    @memcpy(malformed[0..valid.len], valid);
-    const has_entry_offset = 6 + 8 + 1 + 8 + 8 + 8;
-    malformed[has_entry_offset] = 2;
-    var buffers: DecodeBuffers = .{};
-    try std.testing.expectError(
-        error.InvalidBoolean,
-        decode(malformed[0..valid.len], &buffers),
-    );
-
-    @memcpy(malformed[0..valid.len], valid);
-    const command_length_offset = has_entry_offset + 1 + 8 + 8 + 32;
-    std.mem.writeInt(u32, malformed[command_length_offset..][0..4], 0, .big);
-    try std.testing.expectError(
-        error.InvalidReplicatedCommand,
-        decode(malformed[0..valid.len], &buffers),
-    );
-}
-
-test "snapshot chunks reject invalid bounds completion and booleans" {
-    const install: raft.InstallSnapshot = .{
-        .term = 4,
-        .leader = 1,
-        .snapshot = .{
-            .last_index = 8,
-            .last_term = 4,
-            .state_size = 4,
-            .state_checksum = @splat(0x44),
-        },
-    };
-    var frame_buffer: [256]u8 = undefined;
-    try std.testing.expectError(error.InvalidSnapshotChunk, encode_into(
-        &frame_buffer,
-        .{ .raft_install_snapshot = .{
-            .value = install,
-            .offset = 0,
-            .done = true,
-            .chunk = "",
-        } },
-    ));
-    try std.testing.expectError(error.InvalidSnapshotChunk, encode_into(
-        &frame_buffer,
-        .{ .raft_install_snapshot = .{
-            .value = install,
-            .offset = 0,
-            .done = false,
-            .chunk = "full",
-        } },
-    ));
-    try std.testing.expectError(error.InvalidSnapshotChunk, encode_into(
-        &frame_buffer,
-        .{ .raft_install_snapshot = .{
-            .value = install,
-            .offset = 3,
-            .done = true,
-            .chunk = "xx",
-        } },
-    ));
-    const frame = try encode_into(&frame_buffer, .{ .raft_install_snapshot = .{
-        .value = install,
-        .offset = 0,
-        .done = true,
-        .chunk = "full",
-    } });
-    frame_buffer[79] = 2;
-    var buffers: DecodeBuffers = .{};
-    try std.testing.expectError(error.InvalidBoolean, decode(frame, &buffers));
 }
 
 test "append and read contracts enforce shared bounds" {

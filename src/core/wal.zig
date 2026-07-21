@@ -20,6 +20,11 @@ pub const entry_size_max: u32 = limits.wal_entry_size_max;
 
 const write_buf_size: u32 = 512 * 1024;
 
+const value_serialized_reachable_max: u32 = limits.payload_size_max +
+    limits.event_type_length_max + limits.service_name_length_max + 64;
+const entry_reachable_max: u32 = 4 + limits.key_length_max + 4 +
+    value_serialized_reachable_max + 1;
+
 comptime {
     // Header layout: [4B magic][2B version][2B flags][8B sequence]
     // [4B entry_len][16B BLAKE3 checksum]. The checksum covers the first
@@ -27,6 +32,8 @@ comptime {
     assert(header_size == 4 + 2 + 2 + 8 + 4 + checksum_size);
     assert(entry_size_max > 0);
     assert(write_buf_size > 0);
+    assert(entry_reachable_max <= entry_size_max);
+    assert(header_size + entry_reachable_max <= write_buf_size);
 }
 
 fn write_all_positional(file: IoFile, io: Io, buf: []const u8, offset: u64) !void {
@@ -49,6 +56,7 @@ pub const WriteAheadLog = struct {
     io: Io,
     allocator: std.mem.Allocator,
     wal_path: []const u8,
+    flushing_path: []const u8,
     cursor_path: []const u8,
     write_pos: u64,
     write_buf: []u8,
@@ -103,12 +111,15 @@ pub const WriteAheadLog = struct {
         const cursor_path_view = try wal_cursor.derive_path_into(cursor_path_buf, file_path);
         const cursor_path = try allocator.dupe(u8, cursor_path_view);
         errdefer allocator.free(cursor_path);
+        const flushing_path = try std.fmt.allocPrint(allocator, "{s}.flushing", .{file_path});
+        errdefer allocator.free(flushing_path);
 
         return WriteAheadLog{
             .file = file,
             .io = io,
             .allocator = allocator,
             .wal_path = try allocator.dupe(u8, file_path),
+            .flushing_path = flushing_path,
             .cursor_path = cursor_path,
             .write_pos = file_size,
             .write_buf = wb,
@@ -125,6 +136,7 @@ pub const WriteAheadLog = struct {
         self.allocator.free(self.write_buf);
         self.allocator.free(self.replay_buf);
         self.allocator.free(self.cursor_path);
+        self.allocator.free(self.flushing_path);
         self.allocator.free(self.wal_path);
     }
 
@@ -149,8 +161,8 @@ pub const WriteAheadLog = struct {
         const serialized_value_size = value.serialized_size();
         const entry_len: u32 = @intCast(4 + key.len + 4 + serialized_value_size + 1);
         const total_size: limits.ByteCount = header_size + entry_len;
-        assert(entry_len <= entry_size_max);
-        assert(total_size <= self.write_buf.len);
+        if (entry_len > entry_size_max or total_size > self.write_buf.len)
+            return error.WalEntryTooLarge;
 
         if (self.buf_len + total_size > self.write_buf.len) {
             try self.sync();
@@ -214,7 +226,65 @@ pub const WriteAheadLog = struct {
     }
 
     pub fn replay(self: *WriteAheadLog, target: anytype) !WalCursor {
-        const file_size = (try self.file.stat(self.io)).size;
+        const crumb = try self.replay_file(self.file, target);
+        try wal_cursor.save_path(self.cursor_path, crumb, self.io);
+        self.write_pos = crumb.file_offset;
+        return crumb;
+    }
+
+    pub fn flushing_exists(self: *WriteAheadLog) !bool {
+        const file = IoDir.cwd().openFile(
+            self.io,
+            self.flushing_path,
+            .{ .mode = .read_only },
+        ) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        file.close(self.io);
+        return true;
+    }
+
+    pub fn replay_flushing(self: *WriteAheadLog, target: anytype) !void {
+        const file = IoDir.cwd().openFile(self.io, self.flushing_path, .{
+            .mode = .read_write,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer file.close(self.io);
+        _ = try self.replay_file(file, target);
+    }
+
+    pub fn retire_flushing(self: *WriteAheadLog) !void {
+        IoDir.cwd().deleteFile(self.io, self.flushing_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return error.InputOutput,
+        };
+        try sync_parent_directory(self.flushing_path, self.io);
+    }
+
+    pub fn rotate(self: *WriteAheadLog) !void {
+        try self.sync();
+        self.file.close(self.io);
+        const dir = IoDir.cwd();
+        try dir.renamePreserve(self.wal_path, dir, self.flushing_path, self.io);
+        self.file = try dir.createFile(self.io, self.wal_path, .{
+            .truncate = true,
+            .read = true,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        });
+        self.file.sync(self.io) catch return error.SyncFailed;
+        try sync_parent_directory(self.wal_path, self.io);
+        self.write_pos = 0;
+        self.buf_len = 0;
+    }
+
+    fn replay_file(self: *WriteAheadLog, file: IoFile, target: anytype) !WalCursor {
+        const file_size = (try file.stat(self.io)).size;
         var offset: u64 = 0;
         var crumb = WalCursor{ .file_offset = 0, .last_sequence = 0 };
 
@@ -222,7 +292,7 @@ pub const WriteAheadLog = struct {
             if (offset + header_size > file_size) break;
 
             var header: [header_size]u8 = undefined;
-            try read_exact_io(self.file, self.io, &header, offset);
+            try read_exact_io(file, self.io, &header, offset);
             const magic = std.mem.readInt(u32, header[0..4], .little);
             if (magic != magic_number) return error.InvalidFormat;
             if (std.mem.readInt(u16, header[4..6], .little) != format_version)
@@ -235,7 +305,7 @@ pub const WriteAheadLog = struct {
 
             if (offset + header_size + entry_len > file_size) break;
             const entry_buf = self.replay_buf[0..entry_len];
-            try read_exact_io(self.file, self.io, entry_buf, offset + header_size);
+            try read_exact_io(file, self.io, entry_buf, offset + header_size);
             const checksum = entry_checksum(header[0..20], entry_buf);
             if (!std.crypto.timing_safe.eql(
                 [checksum_size]u8,
@@ -268,13 +338,9 @@ pub const WriteAheadLog = struct {
         assert(crumb.file_offset <= offset);
 
         if (offset != file_size) {
-            self.file.setLength(self.io, offset) catch return error.InputOutput;
-            self.file.sync(self.io) catch return error.SyncFailed;
+            file.setLength(self.io, offset) catch return error.InputOutput;
+            file.sync(self.io) catch return error.SyncFailed;
         }
-
-        try wal_cursor.save_path(self.cursor_path, crumb, self.io);
-
-        self.write_pos = offset;
 
         return crumb;
     }
@@ -656,4 +722,109 @@ test "replay truncates a torn final record before accepting new writes" {
         try std.testing.expect(!tree.contains("key-2"));
         try std.testing.expect(tree.contains("key-3"));
     }
+}
+
+test "append_event accepts the largest reachable entry and rejects oversize entries" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "data/test_wal_entry_bounds.wal";
+    IoDir.cwd().deleteFile(io, path) catch {};
+    IoDir.cwd().deleteFile(io, "data/test_wal_entry_bounds.crumb") catch {};
+    defer IoDir.cwd().deleteFile(io, path) catch {};
+    defer IoDir.cwd().deleteFile(io, "data/test_wal_entry_bounds.crumb") catch {};
+
+    var wal = try WriteAheadLog.init(allocator, path, io);
+    defer wal.deinit();
+
+    const payload = try allocator.alloc(u8, limits.payload_size_max);
+    defer allocator.free(payload);
+    @memset(payload, 'x');
+    const key = try allocator.alloc(u8, limits.key_length_max);
+    defer allocator.free(key);
+    @memset(key, 'k');
+    const max_value = try EventValue.init(.{
+        .sequence = 1,
+        .origin_service = "compix",
+        .event_type = "compix.append-batch",
+        .payload = payload,
+        .timestamp = 0,
+    });
+    try wal.append_event(key, max_value);
+    try wal.sync();
+
+    const oversize_payload = try allocator.alloc(u8, write_buf_size);
+    defer allocator.free(oversize_payload);
+    @memset(oversize_payload, 'y');
+    const oversize_value = EventValue{
+        .sequence = 2,
+        .origin_service = "compix",
+        .event_type = "compix.append-batch",
+        .payload = oversize_payload,
+        .timestamp = 0,
+    };
+    try std.testing.expectError(
+        error.WalEntryTooLarge,
+        wal.append_event(key, oversize_value),
+    );
+}
+
+test "rotate splits the log into a flushing segment recovered before the active one" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "data/test_wal_rotate.wal";
+    IoDir.cwd().deleteFile(io, path) catch {};
+    IoDir.cwd().deleteFile(io, "data/test_wal_rotate.wal.flushing") catch {};
+    IoDir.cwd().deleteFile(io, "data/test_wal_rotate.crumb") catch {};
+    defer IoDir.cwd().deleteFile(io, path) catch {};
+    defer IoDir.cwd().deleteFile(io, "data/test_wal_rotate.wal.flushing") catch {};
+    defer IoDir.cwd().deleteFile(io, "data/test_wal_rotate.crumb") catch {};
+
+    {
+        var wal = try WriteAheadLog.init(allocator, path, io);
+        defer wal.deinit();
+        for (1..3) |sequence| {
+            var key_buffer: [8]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "pre-{d}", .{sequence});
+            try wal.append_event(key, .{
+                .sequence = sequence,
+                .event_type = "test.event",
+                .payload = "payload",
+                .timestamp = 0,
+                .origin_service = "test-service",
+            });
+        }
+        try wal.rotate();
+        try std.testing.expect(try wal.flushing_exists());
+        for (3..5) |sequence| {
+            var key_buffer: [8]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "post-{d}", .{sequence});
+            try wal.append_event(key, .{
+                .sequence = sequence,
+                .event_type = "test.event",
+                .payload = "payload",
+                .timestamp = 0,
+                .origin_service = "test-service",
+            });
+        }
+        try wal.sync();
+    }
+
+    var wal = try WriteAheadLog.init(allocator, path, io);
+    defer wal.deinit();
+    try std.testing.expect(try wal.flushing_exists());
+    var tree = try Memtable.init(allocator);
+    defer tree.deinit();
+    try wal.replay_flushing(&tree);
+    const active = try wal.replay(&tree);
+    try std.testing.expectEqual(@as(u64, 4), active.last_sequence);
+    try std.testing.expect(tree.contains("pre-1"));
+    try std.testing.expect(tree.contains("pre-2"));
+    try std.testing.expect(tree.contains("post-3"));
+    try std.testing.expect(tree.contains("post-4"));
+    try wal.retire_flushing();
+    try std.testing.expect(!try wal.flushing_exists());
 }

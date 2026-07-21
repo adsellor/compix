@@ -8,6 +8,7 @@ const protocol = @import("protocol.zig");
 const stream_store_mod = @import("stream_store.zig");
 const breadcrumb_mod = @import("breadcrumb.zig");
 const contract_mod = @import("contract.zig");
+const signing = @import("signing.zig");
 const limits = @import("limits.zig");
 const time_mod = @import("time.zig");
 
@@ -43,6 +44,9 @@ pub const Config = struct {
     contracts: []const DependencyContract = &.{},
     stream_capacity: limits.StreamCount = limits.stream_capacity_test_default,
     stream_id_bytes_capacity: limits.ByteCount = limits.stream_id_bytes_capacity_test_default,
+    /// When set, the store signs each of its own appended events as it indexes
+    /// them under `evt:` keys for pull serving.
+    signing_key: ?signing.SigningKey = null,
 };
 
 pub const QueryResult = struct {
@@ -65,18 +69,21 @@ const QueryContext = struct {
         }
 
         const bytes_required = try limits.byte_count(
-            value.origin_service.len + value.event_type.len + value.payload.len,
+            value.origin_service.len + value.event_type.len + value.payload.len +
+                value.signature.len,
         );
         if (bytes_required > self.arena.remaining()) return error.QueryBufferTooSmall;
         const origin = self.arena.write(value.origin_service) catch unreachable;
         const event_type = self.arena.write(value.event_type) catch unreachable;
         const payload = self.arena.write(value.payload) catch unreachable;
+        const signature = self.arena.write(value.signature) catch unreachable;
         self.output[self.count] = .{
             .sequence = value.sequence,
             .event_type = event_type,
             .payload = payload,
             .timestamp = value.timestamp,
             .origin_service = origin,
+            .signature = signature,
         };
         self.count += 1;
         return .continue_scan;
@@ -89,6 +96,10 @@ pub const EventStore = struct {
     streams: StreamStore,
     identity: ?[]const u8,
     contracts: []const DependencyContract,
+    signing_key: ?signing.SigningKey,
+    /// Buffer for the one-shot signing message; allocated only when signing is
+    /// enabled. Sized for a full serialized event (payload plus header).
+    sign_scratch: []u8,
 
     pub const Metrics = struct {
         streams_used: limits.StreamCount,
@@ -124,12 +135,20 @@ pub const EventStore = struct {
         });
         errdefer streams.deinit();
 
+        const sign_scratch: []u8 = if (config.signing_key != null)
+            try allocator.alloc(u8, limits.event_serialized_size_max)
+        else
+            &.{};
+        errdefer allocator.free(sign_scratch);
+
         return EventStore{
             .allocator = allocator,
             .lsm = lsm_ptr,
             .streams = streams,
             .identity = config.identity,
             .contracts = config.contracts,
+            .signing_key = config.signing_key,
+            .sign_scratch = sign_scratch,
         };
     }
 
@@ -137,6 +156,7 @@ pub const EventStore = struct {
         self.streams.deinit();
         self.lsm.deinit();
         self.allocator.destroy(self.lsm);
+        self.allocator.free(self.sign_scratch);
     }
 
     pub fn put(self: *EventStore, key: []const u8, value: EventValue) !void {
@@ -157,7 +177,71 @@ pub const EventStore = struct {
         request: protocol.AppendStream,
         timestamp: limits.Timestamp,
     ) !protocol.AppendStreamResponse {
-        return self.streams.append(request, timestamp);
+        // Stage (no fsync) so the canonical batch and the pull-servable evt:
+        // events are made durable together by one durable_sync below.
+        const response = try self.streams.stage_append(request, timestamp);
+        switch (response) {
+            .committed => |result| {
+                try self.index_owned_events(request, result, timestamp);
+                try self.streams.durable_sync();
+            },
+            else => {},
+        }
+        return response;
+    }
+
+    pub fn stage_append_stream(
+        self: *EventStore,
+        request: protocol.AppendStream,
+        timestamp: limits.Timestamp,
+    ) !protocol.AppendStreamResponse {
+        const response = try self.streams.stage_append(request, timestamp);
+        switch (response) {
+            // The caller (server) fsyncs the whole staged set via group commit.
+            .committed => |result| try self.index_owned_events(request, result, timestamp),
+            else => {},
+        }
+        return response;
+    }
+
+    /// Index each of this node's own appended events under an `evt:` key so
+    /// dependents can pull them, signing with the configured key so consumers
+    /// can verify authorship. Skipped without an identity (dev mode).
+    fn index_owned_events(
+        self: *EventStore,
+        request: protocol.AppendStream,
+        result: protocol.AppendResult,
+        timestamp: limits.Timestamp,
+    ) !void {
+        const origin = self.identity orelse return;
+        for (request.events, 0..) |append_event, index| {
+            const log_position = result.log_position_first + index;
+            var value = try EventValue.init(.{
+                .sequence = log_position,
+                .origin_service = origin,
+                .event_type = append_event.event_type,
+                .payload = append_event.payload,
+                .timestamp = timestamp,
+            });
+            // The hex signature buffer must outlive put_buffered below, which
+            // serializes `value` (whose `signature` slice points into it).
+            var signature_hex: [signing.signature_hex_length]u8 = undefined;
+            if (self.signing_key) |*key| {
+                try value.sign(key, self.sign_scratch, &signature_hex);
+            }
+
+            var key_buffer: [limits.key_length_max]u8 = undefined;
+            const key = try make_event_key_into(&key_buffer, .{
+                .origin = origin,
+                .event_type = append_event.event_type,
+                .sequence = log_position,
+            });
+            try self.put_buffered(key, value);
+        }
+    }
+
+    pub fn durable_sync(self: *EventStore) !void {
+        return self.streams.durable_sync();
     }
 
     pub fn read_stream_into(
@@ -217,8 +301,9 @@ pub const EventStore = struct {
             &key_buffer,
             bc.source_service,
             bc.event_type,
+            bc.peer_address,
         );
-        var payload_buffer: [limits.peer_address_length_max + 32]u8 = undefined;
+        var payload_buffer: [32]u8 = undefined;
         const payload = try bc.serialize_payload_into(&payload_buffer);
         const ev = EventValue{
             .sequence = local_sequence,
@@ -234,18 +319,37 @@ pub const EventStore = struct {
         self: *EventStore,
         source_service: []const u8,
         event_type: []const u8,
+        peer_address: []const u8,
         byte_buffer: []u8,
     ) !?limits.Sequence {
         var key_buffer: [limits.key_length_max]u8 = undefined;
-        const key = try Breadcrumb.make_key_into(&key_buffer, source_service, event_type);
+        const key = try Breadcrumb.make_key_into(
+            &key_buffer,
+            source_service,
+            event_type,
+            peer_address,
+        );
         const value = try self.get_bounded(key, byte_buffer) orelse return null;
-        const parsed = try Breadcrumb.deserialize_payload_borrowed(value.payload);
-        return parsed.last_sequence;
+        return try Breadcrumb.deserialize_sequence(value.payload);
     }
 
     pub fn ingest_event(self: *EventStore, value: EventValue) !void {
-        if (!self.is_allowed_by_contract(value.origin_service, value.event_type))
-            return error.UnauthorizedOrigin;
+        // A configured identity authorizes cross-service intake by contract. A
+        // node's own events and the no-identity dev mode bypass the check.
+        if (self.identity) |identity| {
+            if (!std.mem.eql(u8, value.origin_service, identity)) {
+                const contract = self.find_contract(value.origin_service, value.event_type) orelse
+                    return error.UnauthorizedOrigin;
+                // Provenance: when the contract declares the owner's public key,
+                // the event must carry a valid origin signature — this is what
+                // makes a pulled event trustworthy regardless of which peer
+                // relayed it. Unsigned or forged events are rejected.
+                if (contract.origin_public_key) |public_key| {
+                    if (!value.verify_provenance(public_key))
+                        return error.InvalidProvenance;
+                }
+            }
+        }
 
         var key_buffer: [limits.key_length_max]u8 = undefined;
         const key = try make_event_key_into(&key_buffer, .{
@@ -257,17 +361,15 @@ pub const EventStore = struct {
         try self.put(key, value);
     }
 
-    fn is_allowed_by_contract(
+    fn find_contract(
         self: *const EventStore,
         origin: []const u8,
         event_type: []const u8,
-    ) bool {
-        if (self.identity == null) return true;
-        if (std.mem.eql(u8, origin, self.identity.?)) return true;
-        for (self.contracts) |contract| {
-            if (contract.matches_event(origin, event_type)) return true;
+    ) ?*const DependencyContract {
+        for (self.contracts) |*contract| {
+            if (contract.matches_event(origin, event_type)) return contract;
         }
-        return false;
+        return null;
     }
 
     pub fn query_events_into(
@@ -394,9 +496,15 @@ const TestGetBuffer = struct {
         store: *EventStore,
         source_service: []const u8,
         event_type: []const u8,
+        peer_address: []const u8,
     ) !?Breadcrumb {
         var key_buffer: [limits.key_length_max]u8 = undefined;
-        const key = try Breadcrumb.make_key_into(&key_buffer, source_service, event_type);
+        const key = try Breadcrumb.make_key_into(
+            &key_buffer,
+            source_service,
+            event_type,
+            peer_address,
+        );
         const value = try self.get(store, key) orelse return null;
         return try Breadcrumb.from_wal_entry_borrowed(key, value);
     }
@@ -968,7 +1076,12 @@ test "put_breadcrumb and get_breadcrumb round-trip" {
     try event_store.put_breadcrumb(bc, 1, "my-service", 1700000000);
 
     var get_buffer: TestGetBuffer = undefined;
-    const maybe_bc = try get_buffer.breadcrumb(&event_store, "order-service", "order.created");
+    const maybe_bc = try get_buffer.breadcrumb(
+        &event_store,
+        "order-service",
+        "order.created",
+        "10.0.0.5:4200",
+    );
     try std.testing.expect(maybe_bc != null);
 
     const restored = maybe_bc.?;
@@ -1061,7 +1174,12 @@ test "breadcrumbs and domain events coexist" {
         return error.DomainEventNotFound;
     }
 
-    const maybe_bc = try get_buffer.breadcrumb(&event_store, "order-service", "order.created");
+    const maybe_bc = try get_buffer.breadcrumb(
+        &event_store,
+        "order-service",
+        "order.created",
+        "10.0.0.5:4200",
+    );
     try std.testing.expect(maybe_bc != null);
     const restored = maybe_bc.?;
     try std.testing.expectEqual(@as(u64, 5), restored.last_sequence);
@@ -1104,6 +1222,7 @@ test "breadcrumb survives WAL replay" {
             &event_store,
             "order-service",
             "order.created",
+            "10.0.0.5:4200",
         );
         try std.testing.expect(maybe_bc != null);
 
@@ -1364,6 +1483,231 @@ test "ingest_event accepts events matching a declared contract" {
     var query_buffer: TestQueryBuffer = undefined;
     const results = try query_buffer.query(&store, "order-service", "order.created", 0);
     try std.testing.expectEqual(@as(usize, 1), results.events.len);
+}
+
+fn signed_test_event(
+    key: *const signing.SigningKey,
+    sequence: limits.Sequence,
+    origin: []const u8,
+    event_type: []const u8,
+    payload: []const u8,
+    timestamp: limits.Timestamp,
+    // Caller-owned; backs the returned event's borrowed signature slice.
+    signature_hex_out: *[signing.signature_hex_length]u8,
+) !EventValue {
+    var ev = try test_event_value(sequence, origin, event_type, payload, timestamp);
+    var message_buffer: [256]u8 = undefined;
+    try ev.sign(key, &message_buffer, signature_hex_out);
+    return ev;
+}
+
+test "ingest_event accepts a validly signed event when the contract declares a public key" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_signed.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_signed.crumb") catch {};
+
+    const key = try signing.SigningKey.from_seed(@splat(11));
+    const contracts = [_]DependencyContract{.{
+        .source_service = "order-service",
+        .event_types = &[_][]const u8{"order.created"},
+        .peer_address = "10.0.0.5:4200",
+        .retention_hint = null,
+        .origin_public_key = key.public_key(),
+    }};
+
+    var store = try EventStore.init(allocator, "data/test_ingest_signed.wal", io, .{
+        .identity = "my-service",
+        .contracts = &contracts,
+    });
+    defer {
+        store.deinit();
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_signed.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_signed.crumb") catch {};
+    }
+
+    var signature_hex: [signing.signature_hex_length]u8 = undefined;
+    const ev = try signed_test_event(&key, 1, "order-service", "order.created", "{}", 100, &signature_hex);
+    try store.ingest_event(ev);
+
+    var query_buffer: TestQueryBuffer = undefined;
+    const results = try query_buffer.query(&store, "order-service", "order.created", 0);
+    try std.testing.expectEqual(@as(usize, 1), results.events.len);
+    // The signature survives storage and is served back verbatim.
+    try std.testing.expect(results.events[0].is_signed());
+    try std.testing.expect(results.events[0].verify_provenance(key.public_key()));
+}
+
+test "ingest_event rejects an unsigned event when the contract requires provenance" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_unsigned.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_unsigned.crumb") catch {};
+
+    const key = try signing.SigningKey.from_seed(@splat(12));
+    const contracts = [_]DependencyContract{.{
+        .source_service = "order-service",
+        .event_types = &[_][]const u8{"order.created"},
+        .peer_address = "10.0.0.5:4200",
+        .retention_hint = null,
+        .origin_public_key = key.public_key(),
+    }};
+
+    var store = try EventStore.init(allocator, "data/test_ingest_unsigned.wal", io, .{
+        .identity = "my-service",
+        .contracts = &contracts,
+    });
+    defer {
+        store.deinit();
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_unsigned.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_unsigned.crumb") catch {};
+    }
+
+    const ev = try test_event_value(1, "order-service", "order.created", "{}", 100);
+    try std.testing.expectError(error.InvalidProvenance, store.ingest_event(ev));
+}
+
+test "ingest_event rejects a forged event signed by the wrong key" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_forged.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_forged.crumb") catch {};
+
+    const owner_key = try signing.SigningKey.from_seed(@splat(13));
+    const attacker_key = try signing.SigningKey.from_seed(@splat(99));
+    const contracts = [_]DependencyContract{.{
+        .source_service = "order-service",
+        .event_types = &[_][]const u8{"order.created"},
+        .peer_address = "10.0.0.5:4200",
+        .retention_hint = null,
+        .origin_public_key = owner_key.public_key(),
+    }};
+
+    var store = try EventStore.init(allocator, "data/test_ingest_forged.wal", io, .{
+        .identity = "my-service",
+        .contracts = &contracts,
+    });
+    defer {
+        store.deinit();
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_forged.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_forged.crumb") catch {};
+    }
+
+    // Attacker signs an event attributed to order-service with its own key.
+    var signature_hex: [signing.signature_hex_length]u8 = undefined;
+    const forged = try signed_test_event(&attacker_key, 1, "order-service", "order.created", "{}", 100, &signature_hex);
+    try std.testing.expectError(error.InvalidProvenance, store.ingest_event(forged));
+}
+
+test "ingest_event accepts unsigned events when the contract declares no public key" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_nokey.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_ingest_nokey.crumb") catch {};
+
+    const contracts = [_]DependencyContract{.{
+        .source_service = "order-service",
+        .event_types = &[_][]const u8{"order.created"},
+        .peer_address = "10.0.0.5:4200",
+        .retention_hint = null,
+    }};
+
+    var store = try EventStore.init(allocator, "data/test_ingest_nokey.wal", io, .{
+        .identity = "my-service",
+        .contracts = &contracts,
+    });
+    defer {
+        store.deinit();
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_nokey.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_ingest_nokey.crumb") catch {};
+    }
+
+    const ev = try test_event_value(1, "order-service", "order.created", "{}", 100);
+    try store.ingest_event(ev);
+    var query_buffer: TestQueryBuffer = undefined;
+    const results = try query_buffer.query(&store, "order-service", "order.created", 0);
+    try std.testing.expectEqual(@as(usize, 1), results.events.len);
+}
+
+test "owned appended events are signed, indexed for pull, and ingest-verifiable by a consumer" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    inline for (.{
+        "data/test_owned_origin",
+        "data/test_owned_consumer",
+    }) |base| {
+        Io.Dir.cwd().deleteFile(io, base ++ ".wal") catch {};
+        Io.Dir.cwd().deleteFile(io, base ++ ".crumb") catch {};
+    }
+
+    const key = try signing.SigningKey.from_seed(@splat(21));
+
+    // Origin service appends its own events; the store auto-indexes them under
+    // evt: keys, signed with its key, for pull serving.
+    var origin = try EventStore.init(allocator, "data/test_owned_origin.wal", io, .{
+        .identity = "order-service",
+        .signing_key = key,
+    });
+    defer {
+        origin.deinit();
+        Io.Dir.cwd().deleteFile(io, "data/test_owned_origin.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_owned_origin.crumb") catch {};
+    }
+    const append_events = [_]protocol.AppendEvent{
+        .{ .event_type = "order.created", .schema_version = 1, .payload = "first" },
+        .{ .event_type = "order.created", .schema_version = 1, .payload = "second" },
+    };
+    const append_response = try origin.append_stream(.{
+        .stream_id = "orders/1",
+        .expected_version = .empty,
+        .command_id = "owned-command",
+        .events = &append_events,
+    }, 100);
+    try std.testing.expect(append_response == .committed);
+
+    // The owned events are now servable via the pull query, signed.
+    var origin_query: TestQueryBuffer = undefined;
+    const served = try origin_query.query(&origin, "order-service", "order.created", 0);
+    try std.testing.expectEqual(@as(usize, 2), served.events.len);
+    for (served.events) |ev| {
+        try std.testing.expect(ev.is_signed());
+        try std.testing.expect(ev.verify_provenance(key.public_key()));
+    }
+
+    // A consumer that declares the owner's public key ingests them, verifying
+    // authorship — the full producer -> signed pull -> verified ingest loop.
+    const contracts = [_]DependencyContract{.{
+        .source_service = "order-service",
+        .event_types = &[_][]const u8{"order.created"},
+        .peer_address = "10.0.0.5:4200",
+        .retention_hint = null,
+        .origin_public_key = key.public_key(),
+    }};
+    var consumer = try EventStore.init(allocator, "data/test_owned_consumer.wal", io, .{
+        .identity = "my-service",
+        .contracts = &contracts,
+    });
+    defer {
+        consumer.deinit();
+        Io.Dir.cwd().deleteFile(io, "data/test_owned_consumer.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_owned_consumer.crumb") catch {};
+    }
+    for (served.events) |ev| try consumer.ingest_event(ev);
+
+    var consumer_query: TestQueryBuffer = undefined;
+    const ingested = try consumer_query.query(&consumer, "order-service", "order.created", 0);
+    try std.testing.expectEqual(@as(usize, 2), ingested.events.len);
 }
 
 test "ingest_event rejects events from undeclared origins" {

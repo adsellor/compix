@@ -14,10 +14,6 @@ const contract_mod = @import("contract.zig");
 const identity_mod = @import("identity.zig");
 const time_mod = @import("time.zig");
 const limits = @import("limits.zig");
-const config_mod = @import("config.zig");
-const raft = @import("raft.zig");
-const replication_mod = @import("replication.zig");
-const snapshot_storage = @import("snapshot_storage.zig");
 
 const EventStore = store_mod.EventStore;
 const EventValue = event_mod.EventValue;
@@ -28,7 +24,6 @@ const Breadcrumb = breadcrumb_mod.Breadcrumb;
 const log = std.log.scoped(.server);
 const connection_idle_deadline_ms: u32 = 5 * 60 * 1000;
 const handshake_deadline_ms: u32 = if (builtin.is_test) 50 else 3_000;
-const raft_dispatch_capacity: u16 = 256;
 
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -73,6 +68,11 @@ pub const Server = struct {
     group_commit_leader: bool,
     group_commit_mutex: Io.Mutex,
     store_mutex: Io.Mutex,
+    flush_mutex: Io.Mutex,
+    flush_needed: Io.Condition,
+    flush_done: Io.Condition,
+    flush_active_bg: bool,
+    flush_failed: bool,
     replay_entries: []auth.ReplayEntry,
     replay_mutex: Io.Mutex,
     recovery_connection: *transport.Connection,
@@ -86,12 +86,6 @@ pub const Server = struct {
     corruption_findings: std.atomic.Value(u64),
     backups_completed: u64,
     last_backup_unix_seconds: i64,
-    replication: ?*replication_mod.Runtime,
-    replication_mutex: Io.Mutex,
-    replication_rpc_mutex: Io.Mutex,
-    replication_connection: ?*transport.Connection,
-    replication_command_scratch: []u8,
-    replication_failures: std.atomic.Value(u64),
 
     const ConnectionSlot = struct {
         connection: transport.Connection,
@@ -113,7 +107,6 @@ pub const Server = struct {
 
     const AuthenticatedSession = struct {
         permissions: ?auth.Permissions,
-        raft_node: ?raft.NodeId,
     };
 
     pub const InitOptions = struct {
@@ -127,7 +120,6 @@ pub const Server = struct {
         integrity_verified: bool = true,
         backups_completed: u64 = 0,
         last_backup_unix_seconds: i64 = 0,
-        cluster: ?config_mod.Cluster = null,
     };
 
     pub fn init(
@@ -188,34 +180,6 @@ pub const Server = struct {
         errdefer allocator.free(replay_entries);
         for (replay_entries) |*entry| entry.* = .{};
 
-        var replication_runtime: ?*replication_mod.Runtime = null;
-        var replication_connection: ?*transport.Connection = null;
-        var replication_command_scratch: []u8 = &.{};
-        if (options.cluster) |cluster| {
-            const runtime = try allocator.create(replication_mod.Runtime);
-            errdefer allocator.destroy(runtime);
-            var seed_bytes: [8]u8 = undefined;
-            try options.io.randomSecure(&seed_bytes);
-            runtime.* = try replication_mod.Runtime.init(
-                allocator,
-                options.io,
-                cluster,
-                options.store,
-                std.mem.readInt(u64, &seed_bytes, .little),
-            );
-            errdefer runtime.deinit();
-            const outbound = try allocator.create(transport.Connection);
-            errdefer allocator.destroy(outbound);
-            const command_scratch = try allocator.alloc(
-                u8,
-                @max(cluster.command_slot_size, limits.snapshot_chunk_size_max),
-            );
-            errdefer allocator.free(command_scratch);
-            replication_runtime = runtime;
-            replication_connection = outbound;
-            replication_command_scratch = command_scratch;
-        }
-
         target.* = .{
             .allocator = allocator,
             .store = options.store,
@@ -237,6 +201,11 @@ pub const Server = struct {
             .group_commit_leader = false,
             .group_commit_mutex = .init,
             .store_mutex = .init,
+            .flush_mutex = .init,
+            .flush_needed = .init,
+            .flush_done = .init,
+            .flush_active_bg = false,
+            .flush_failed = false,
             .replay_entries = replay_entries,
             .replay_mutex = .init,
             .recovery_connection = recovery_connection,
@@ -249,16 +218,12 @@ pub const Server = struct {
             .admission_saturation = .init(0),
             .corruption_findings = .init(@as(u64, @intCast(
                 options.store.metrics().startup_quarantined_files,
-            )) + if (replication_runtime) |runtime| runtime.recovery_findings else 0),
+            ))),
             .backups_completed = options.backups_completed,
             .last_backup_unix_seconds = options.last_backup_unix_seconds,
-            .replication = replication_runtime,
-            .replication_mutex = .init,
-            .replication_rpc_mutex = .init,
-            .replication_connection = replication_connection,
-            .replication_command_scratch = replication_command_scratch,
-            .replication_failures = .init(0),
         };
+
+        options.store.lsm.enable_background_flush();
     }
 
     pub fn deinit(self: *Server) void {
@@ -271,12 +236,6 @@ pub const Server = struct {
         self.allocator.free(self.recovery_tasks);
         self.allocator.free(self.recovery_scratch);
         self.allocator.free(self.replay_entries);
-        if (self.replication) |runtime| {
-            runtime.deinit();
-            self.allocator.destroy(runtime);
-            self.allocator.destroy(self.replication_connection.?);
-            self.allocator.free(self.replication_command_scratch);
-        }
         self.listener.deinit();
     }
 
@@ -291,6 +250,7 @@ pub const Server = struct {
                 const last_sequence = try self.store.get_breadcrumb_sequence(
                     contract.source_service,
                     event_type,
+                    contract.peer_address,
                     self.recovery_scratch,
                 );
                 const from_sequence = if (last_sequence) |sequence| blk: {
@@ -431,15 +391,6 @@ pub const Server = struct {
                     continue;
                 }
             }
-            if (is_raft_request(msg) and session.raft_node == null) {
-                _ = self.permission_denials.fetchAdd(1, .monotonic);
-                try conn.send_message(.{ .err = .{
-                    .code = .permission_denied,
-                    .message = "authenticated cluster membership required",
-                } });
-                continue;
-            }
-
             switch (msg) {
                 .pull_request => |req| {
                     self.serve_pull_request(conn, scratch, req) catch |err| {
@@ -457,9 +408,6 @@ pub const Server = struct {
                 },
                 .health_request => {
                     try conn.send_message(.{ .health_response = self.health() });
-                },
-                .raft_request_vote, .raft_append_entries, .raft_install_snapshot => {
-                    try self.serve_raft_request(conn, session.raft_node.?, msg);
                 },
                 else => {
                     conn.send_message(.{ .err = .{
@@ -495,7 +443,7 @@ pub const Server = struct {
                 hello.service_name,
                 hello.instance_id,
             });
-            return .{ .permissions = null, .raft_node = null };
+            return .{ .permissions = null };
         }
         if (hello.kind != .client_hello)
             return self.reject_authentication(conn, error.InvalidHandshake);
@@ -548,16 +496,7 @@ pub const Server = struct {
             hello.service_name,
             hello.instance_id,
         });
-        const raft_node = if (self.replication) |runtime|
-            runtime.node_for_authenticated_instance(
-                hello.service_name,
-                hello.instance_id,
-                credential.permissions,
-                self.identity.name,
-            )
-        else
-            null;
-        return .{ .permissions = credential.permissions, .raft_node = raft_node };
+        return .{ .permissions = credential.permissions };
     }
 
     fn reject_authentication(
@@ -700,492 +639,122 @@ pub const Server = struct {
         conn: *transport.Connection,
         request: protocol.AppendStream,
     ) !void {
-        if (self.replication != null) {
-            try self.serve_replicated_append(conn, request);
-            return;
-        }
         const timestamp: limits.Timestamp = @intCast(time_mod.Instant.now(self.io).timestamp.sec);
-        self.store_mutex.lockUncancelable(self.io);
-        const response = self.store.append_stream(request, timestamp) catch |err| {
+        if (!try self.reserve_flush_room(conn)) return;
+        const response = self.store.stage_append_stream(request, timestamp) catch |err| {
             self.record_store_error(err);
             self.store_mutex.unlock(self.io);
             try send_store_error(conn, err);
             return;
         };
         self.store_mutex.unlock(self.io);
+        self.group_commit() catch |err| {
+            try send_store_error(conn, err);
+            return;
+        };
         try conn.send_message(.{ .append_stream_response = response });
     }
 
-    fn serve_replicated_append(
-        self: *Server,
-        conn: *transport.Connection,
-        request: protocol.AppendStream,
-    ) !void {
-        var initial: [replication_mod.outbox_capacity]raft.Envelope = undefined;
-        self.replication_mutex.lockUncancelable(self.io);
-        const runtime = self.replication.?;
-        runtime.outbox.reset();
-        const timestamp: limits.Timestamp = @intCast(time_mod.Instant.now(self.io).timestamp.sec);
-        const index = runtime.machine.propose_append(
-            request,
-            timestamp,
-            &runtime.outbox,
-        ) catch |err| {
-            self.replication_mutex.unlock(self.io);
-            switch (err) {
-                error.NotLeader => try send_protocol_error(conn, .not_leader, "not leader"),
-                error.RaftLogFull => try send_protocol_error(
-                    conn,
-                    .replication_unavailable,
-                    "replication log capacity exhausted",
-                ),
-                else => {
-                    self.record_replication_failure();
-                    try send_protocol_error(
-                        conn,
-                        .replication_unavailable,
-                        "replication proposal failed",
-                    );
-                },
+    /// Returns true holding `store_mutex` with the active memtable guaranteed to
+    /// have room for a full transaction; freezes and hands the frozen memtable to
+    /// the background flush task when the active one crosses the high-water mark,
+    /// and applies bounded backpressure (off `store_mutex`, so the flush task can
+    /// always publish) when a flush is already in flight. Returns false after
+    /// sending an error frame.
+    fn reserve_flush_room(self: *Server, conn: *transport.Connection) !bool {
+        while (true) {
+            self.store_mutex.lockUncancelable(self.io);
+            if (self.store.lsm.active_has_room()) return true;
+            if (self.store.lsm.can_freeze()) {
+                self.store.lsm.freeze() catch |err| {
+                    self.store.streams.poisoned = true;
+                    self.store_mutex.unlock(self.io);
+                    try send_store_error(conn, err);
+                    return false;
+                };
+                self.store_mutex.unlock(self.io);
+                self.flush_mutex.lockUncancelable(self.io);
+                self.flush_active_bg = true;
+                self.flush_needed.broadcast(self.io);
+                self.flush_mutex.unlock(self.io);
+                continue;
             }
-            return;
-        };
-        self.store_mutex.lockUncancelable(self.io);
-        runtime.checkpoint_and_apply() catch |err| {
             self.store_mutex.unlock(self.io);
-            self.replication_mutex.unlock(self.io);
-            if (err == error.Canceled) return error.Canceled;
-            runtime.machine.poisoned = true;
-            self.record_replication_failure();
-            log.err("failed to persist replicated proposal: {}", .{err});
-            try send_protocol_error(
-                conn,
-                .replication_unavailable,
-                "replication persistence failed",
-            );
-            return;
-        };
-        self.store_mutex.unlock(self.io);
-        const initial_count = runtime.take_outbox(&initial) catch |err| {
-            self.replication_mutex.unlock(self.io);
-            return err;
-        };
-        self.replication_mutex.unlock(self.io);
-
-        self.dispatch_raft(initial[0..initial_count]) catch |err| {
-            self.record_replication_failure();
-            log.warn("replication dispatch failed: {}", .{err});
-            try send_protocol_error(
-                conn,
-                .replication_unavailable,
-                "replication dispatch failed",
-            );
-            return;
-        };
-
-        self.replication_mutex.lockUncancelable(self.io);
-        const response = runtime.machine.result(index);
-        const role = runtime.machine.node.role;
-        const poisoned = runtime.machine.poisoned;
-        self.replication_mutex.unlock(self.io);
-        if (response) |committed| {
-            try conn.send_message(.{ .append_stream_response = committed });
-        } else if (poisoned) {
-            try send_protocol_error(
-                conn,
-                .replication_unavailable,
-                "replication state is poisoned",
-            );
-        } else if (role != .leader) {
-            try send_protocol_error(conn, .not_leader, "leadership changed before commit");
-        } else {
-            try send_protocol_error(conn, .quorum_unavailable, "quorum did not commit append");
-        }
-    }
-
-    /// Returns true after sending a clustered-read rejection. Single-node reads
-    /// return false immediately; clustered reads require a fresh leader quorum
-    /// barrier before touching the canonical store.
-    fn ensure_linearizable_read(
-        self: *Server,
-        conn: *transport.Connection,
-    ) !bool {
-        if (self.replication == null) return false;
-        var initial: [replication_mod.outbox_capacity]raft.Envelope = undefined;
-        self.replication_mutex.lockUncancelable(self.io);
-        const runtime = self.replication.?;
-        if (runtime.machine.poisoned) {
-            self.replication_mutex.unlock(self.io);
-            try send_protocol_error(
-                conn,
-                .replication_unavailable,
-                "replication state is poisoned",
-            );
-            return true;
-        }
-        runtime.outbox.reset();
-        runtime.machine.node.begin_linearizable_read(&runtime.outbox) catch |err| {
-            self.replication_mutex.unlock(self.io);
-            if (err == error.NotLeader) {
-                try send_protocol_error(conn, .not_leader, "not leader");
-                return true;
+            self.flush_mutex.lockUncancelable(self.io);
+            while (self.flush_active_bg and self.running.load(.acquire)) {
+                self.flush_done.waitUncancelable(self.io, &self.flush_mutex);
             }
-            return err;
-        };
-        const count = try runtime.take_outbox(&initial);
-        self.replication_mutex.unlock(self.io);
-        self.dispatch_raft(initial[0..count]) catch |err| {
-            self.record_replication_failure();
-            log.warn("linearizable read barrier failed: {}", .{err});
-            try send_protocol_error(
-                conn,
-                .replication_unavailable,
-                "read barrier dispatch failed",
-            );
-            return true;
-        };
-        self.replication_mutex.lockUncancelable(self.io);
-        const ready = runtime.machine.node.linearizable_read_ready() and
-            !runtime.machine.poisoned;
-        const role = runtime.machine.node.role;
-        self.replication_mutex.unlock(self.io);
-        if (ready) return false;
-        if (role != .leader) {
-            try send_protocol_error(conn, .not_leader, "leadership changed during read barrier");
-        } else {
-            try send_protocol_error(conn, .quorum_unavailable, "read quorum unavailable");
+            const failed = self.flush_failed;
+            self.flush_mutex.unlock(self.io);
+            if (failed) {
+                try send_store_error(conn, error.BackgroundFlushFailed);
+                return false;
+            }
         }
-        return true;
     }
 
-    fn serve_raft_request(
-        self: *Server,
-        conn: *transport.Connection,
-        authenticated_node: raft.NodeId,
-        message: protocol.Message,
-    ) !void {
-        if (message == .raft_install_snapshot)
-            return self.serve_raft_snapshot_chunk(
-                conn,
-                authenticated_node,
-                message.raft_install_snapshot,
-            );
-        const incoming = try raft_request_from_protocol(
-            message,
-            authenticated_node,
-            self.replication.?.config.node_id,
-        );
-        var responses: [replication_mod.outbox_capacity]raft.Envelope = undefined;
-        self.replication_mutex.lockUncancelable(self.io);
-        const runtime = self.replication.?;
-        runtime.outbox.reset();
-        runtime.machine.receive(
-            incoming.envelope,
-            incoming.command,
-            &runtime.outbox,
-        ) catch |err| {
-            self.replication_mutex.unlock(self.io);
-            self.record_replication_failure();
-            log.warn("rejected Raft request from node {d}: {}", .{
-                authenticated_node,
-                err,
-            });
-            try send_protocol_error(conn, .replication_unavailable, "invalid Raft request");
-            return;
-        };
-        self.store_mutex.lockUncancelable(self.io);
-        runtime.checkpoint_and_apply() catch |err| {
-            self.store_mutex.unlock(self.io);
-            self.replication_mutex.unlock(self.io);
-            if (err == error.Canceled) return error.Canceled;
-            runtime.machine.poisoned = true;
-            self.record_replication_failure();
-            log.err("failed to persist Raft request from node {d}: {}", .{
-                authenticated_node,
-                err,
-            });
-            try send_protocol_error(
-                conn,
-                .replication_unavailable,
-                "replication persistence failed",
-            );
-            return;
-        };
-        self.store_mutex.unlock(self.io);
-        const response_count = runtime.take_outbox(&responses) catch |err| {
-            self.replication_mutex.unlock(self.io);
-            return err;
-        };
-        self.replication_mutex.unlock(self.io);
-        if (response_count != 1) return error.InvalidRaftResponseCount;
-        const response = responses[0];
-        if (response.from != runtime.config.node_id or response.to != authenticated_node)
-            return error.InvalidRaftEnvelope;
-        try conn.send_message(try raft_response_to_protocol(response));
-    }
+    fn background_flush_loop(self: *Server) Io.Cancelable!void {
+        while (self.running.load(.acquire)) {
+            self.flush_mutex.lockUncancelable(self.io);
+            while (!self.flush_active_bg and self.running.load(.acquire)) {
+                self.flush_needed.waitUncancelable(self.io, &self.flush_mutex);
+            }
+            const active = self.flush_active_bg;
+            self.flush_mutex.unlock(self.io);
+            if (!self.running.load(.acquire)) return;
+            if (!active) continue;
 
-    fn serve_raft_snapshot_chunk(
-        self: *Server,
-        conn: *transport.Connection,
-        authenticated_node: raft.NodeId,
-        install: protocol.RaftInstallSnapshot,
-    ) !void {
-        self.replication_mutex.lockUncancelable(self.io);
-        const runtime = self.replication.?;
-        self.store_mutex.lockUncancelable(self.io);
-        const progress = runtime.receive_snapshot_chunk(
-            authenticated_node,
-            install,
-        ) catch |err| {
-            self.store_mutex.unlock(self.io);
-            self.replication_mutex.unlock(self.io);
-            if (err == error.Canceled) return error.Canceled;
-            runtime.machine.poisoned = true;
-            self.record_replication_failure();
-            log.err("snapshot chunk from node {d} failed: {}", .{
-                authenticated_node,
-                err,
-            });
-            try send_protocol_error(
-                conn,
-                .replication_unavailable,
-                "snapshot installation failed",
-            );
-            return;
-        };
-        self.store_mutex.unlock(self.io);
-        self.replication_mutex.unlock(self.io);
-        try conn.send_message(.{ .raft_snapshot_result = .{
-            .value = progress.result,
-            .next_offset = progress.next_offset,
-            .accepted = progress.accepted,
-        } });
-    }
-
-    fn dispatch_raft(self: *Server, initial: []const raft.Envelope) !void {
-        if (initial.len == 0) return;
-        if (initial.len > raft_dispatch_capacity) return error.RaftDispatchQueueFull;
-        var pending: [raft_dispatch_capacity]raft.Envelope = undefined;
-        @memcpy(pending[0..initial.len], initial);
-        var pending_count: usize = initial.len;
-        var cursor: usize = 0;
-
-        self.replication_rpc_mutex.lockUncancelable(self.io);
-        defer self.replication_rpc_mutex.unlock(self.io);
-        while (cursor < pending_count) : (cursor += 1) {
-            const request = pending[cursor];
-            const response_message = self.send_raft_rpc(request) catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => {
-                    _ = self.replication_failures.fetchAdd(1, .monotonic);
-                    log.warn("Raft RPC {d}->{d} failed: {}", .{
-                        request.from,
-                        request.to,
-                        err,
-                    });
-                    continue;
-                },
+            self.run_background_flush() catch |err| {
+                if (err == error.Canceled) return error.Canceled;
+                log.err("background flush failed: {}", .{err});
+                self.store_mutex.lockUncancelable(self.io);
+                self.store.streams.poisoned = true;
+                self.store_mutex.unlock(self.io);
+                self.flush_mutex.lockUncancelable(self.io);
+                self.flush_failed = true;
+                self.flush_active_bg = false;
+                self.flush_done.broadcast(self.io);
+                self.flush_mutex.unlock(self.io);
+                self.shutdown();
+                return;
             };
 
-            self.replication_mutex.lockUncancelable(self.io);
-            const runtime = self.replication.?;
-            runtime.outbox.reset();
-            runtime.machine.receive(.{
-                .from = request.to,
-                .to = request.from,
-                .message = response_message,
-            }, null, &runtime.outbox) catch |err| {
-                self.replication_mutex.unlock(self.io);
+            self.flush_mutex.lockUncancelable(self.io);
+            self.flush_active_bg = false;
+            self.flush_done.broadcast(self.io);
+            self.flush_mutex.unlock(self.io);
+        }
+    }
+
+    fn run_background_flush(self: *Server) !void {
+        self.store_mutex.lockUncancelable(self.io);
+        const pending = self.store.lsm.flush_pending_now();
+        self.store_mutex.unlock(self.io);
+        if (pending) {
+            try self.store.lsm.flush_frozen_write();
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
+            try self.store.lsm.flush_frozen_publish();
+        }
+        while (true) {
+            self.store_mutex.lockUncancelable(self.io);
+            const plan = self.store.lsm.compaction_prepare(0);
+            self.store_mutex.unlock(self.io);
+            const chosen = plan orelse break;
+            const result = self.store.lsm.compaction_write(chosen) catch |err| {
+                self.store_mutex.lockUncancelable(self.io);
+                self.store.lsm.compaction_abandon();
+                self.store_mutex.unlock(self.io);
                 return err;
             };
             self.store_mutex.lockUncancelable(self.io);
-            runtime.checkpoint_and_apply() catch |err| {
-                runtime.machine.poisoned = true;
-                self.store_mutex.unlock(self.io);
-                self.replication_mutex.unlock(self.io);
-                return err;
-            };
-            self.store_mutex.unlock(self.io);
-            const appended = runtime.take_outbox(pending[pending_count..]) catch |err| {
-                self.replication_mutex.unlock(self.io);
-                return err;
-            };
-            pending_count += appended;
-            self.replication_mutex.unlock(self.io);
-        }
-    }
-
-    fn send_raft_rpc(self: *Server, request: raft.Envelope) !raft.Message {
-        const runtime = self.replication.?;
-        if (request.from != runtime.config.node_id or request.to == runtime.config.node_id)
-            return error.InvalidRaftEnvelope;
-        const peer = runtime.member(request.to) orelse return error.UnknownRaftPeer;
-        if (request.message == .install_snapshot)
-            return self.send_snapshot_rpc(request, peer);
-        var command: []const u8 = "";
-        self.replication_mutex.lockUncancelable(self.io);
-        if (runtime.machine.command_for(request)) |stored| {
-            if (stored.len > self.replication_command_scratch.len) {
-                self.replication_mutex.unlock(self.io);
-                return error.ReplicatedCommandTooLarge;
-            }
-            @memcpy(self.replication_command_scratch[0..stored.len], stored);
-            command = self.replication_command_scratch[0..stored.len];
-        }
-        self.replication_mutex.unlock(self.io);
-
-        const conn = self.replication_connection.?;
-        try transport.dial_into_timeout(
-            conn,
-            peer.address,
-            self.io,
-            runtime.config.rpc_timeout_ms,
-        );
-        defer conn.close();
-        try self.authenticate_cluster_peer(conn, peer);
-        try conn.send_message(try raft_request_to_protocol(request, command));
-        const response = try self.recv_replication_message(
-            conn,
-            runtime.config.rpc_timeout_ms,
-        );
-        if (response == .err) return error.RaftPeerRejected;
-        const raft_response = try raft_response_from_protocol(response);
-        if (!raft_response_matches(request.message, raft_response))
-            return error.UnexpectedRaftResponse;
-        return raft_response;
-    }
-
-    fn send_snapshot_rpc(
-        self: *Server,
-        request: raft.Envelope,
-        peer: config_mod.ClusterMember,
-    ) !raft.Message {
-        const install = request.message.install_snapshot;
-        var offset: u64 = 0;
-        var final_result: ?raft.SnapshotResult = null;
-        while (offset < install.snapshot.state_size) {
-            const conn = self.replication_connection.?;
-            try transport.dial_into_timeout(
-                conn,
-                peer.address,
-                self.io,
-                self.replication.?.config.rpc_timeout_ms,
-            );
-            defer conn.close();
-            try self.authenticate_cluster_peer(conn, peer);
-            var message_count: u16 = 0;
-            while (offset < install.snapshot.state_size and message_count < 512) {
-                const chunk = try snapshot_storage.read_chunk(
-                    self.io,
-                    self.replication.?.snapshot_paths.archive,
-                    install.snapshot,
-                    offset,
-                    self.replication_command_scratch[0..limits.snapshot_chunk_size_max],
-                );
-                const done = offset + chunk.len == install.snapshot.state_size;
-                try conn.send_message(.{ .raft_install_snapshot = .{
-                    .value = install,
-                    .offset = offset,
-                    .done = done,
-                    .chunk = chunk,
-                } });
-                const response = try self.recv_replication_message(
-                    conn,
-                    self.replication.?.config.rpc_timeout_ms,
-                );
-                if (response == .err or response != .raft_snapshot_result)
-                    return error.RaftPeerRejected;
-                const progress = response.raft_snapshot_result;
-                if (progress.value.follower != request.to) return error.InvalidRaftEnvelope;
-                if (!progress.accepted) return .{ .snapshot_result = progress.value };
-                const expected_offset = offset + chunk.len;
-                if (progress.next_offset != expected_offset)
-                    return error.InvalidSnapshotOffset;
-                offset = progress.next_offset;
-                final_result = progress.value;
-                message_count += 1;
+            defer self.store_mutex.unlock(self.io);
+            if (result) |value| {
+                try self.store.lsm.compaction_publish(chosen, value);
+            } else {
+                self.store.lsm.compaction_abandon();
             }
         }
-        const result = final_result orelse return error.InvalidSnapshot;
-        if (result.installed_index < install.snapshot.last_index)
-            return error.SnapshotInstallationRejected;
-        return .{ .snapshot_result = result };
-    }
-
-    fn authenticate_cluster_peer(
-        self: *Server,
-        conn: *transport.Connection,
-        peer: config_mod.ClusterMember,
-    ) !void {
-        try auth.validate_secret(self.client_secret);
-        var client_nonce: [auth.nonce_length]u8 = undefined;
-        try self.io.randomSecure(&client_nonce);
-        try conn.send_message(.{ .handshake = .{
-            .kind = .client_hello,
-            .service_name = self.identity.name,
-            .instance_id = self.identity.instance_id,
-            .nonce = client_nonce,
-            .proof = auth.make_client_proof(
-                self.client_secret,
-                self.identity.name,
-                self.identity.instance_id,
-                client_nonce,
-            ),
-        } });
-        const response = try self.recv_replication_message(
-            conn,
-            self.replication.?.config.rpc_timeout_ms,
-        );
-        const server_hello = switch (response) {
-            .handshake => |handshake| handshake,
-            else => return error.AuthenticationFailed,
-        };
-        if (server_hello.kind != .server_hello or
-            !std.mem.eql(u8, server_hello.service_name, self.identity.name) or
-            !std.mem.eql(u8, server_hello.instance_id, peer.instance_id))
-            return error.ClusterIdentityMismatch;
-        if (!auth.verify_server_proof(
-            self.client_secret,
-            client_nonce,
-            server_hello.nonce,
-            server_hello.service_name,
-            server_hello.instance_id,
-            server_hello.proof,
-        )) return error.AuthenticationFailed;
-        const keys = auth.derive_session_keys(
-            self.client_secret,
-            client_nonce,
-            server_hello.nonce,
-            self.identity.name,
-            self.identity.instance_id,
-            server_hello.service_name,
-            server_hello.instance_id,
-        );
-        try conn.enable_security(keys, .client);
-    }
-
-    fn recv_replication_message(
-        self: *Server,
-        connection: *transport.Connection,
-        deadline_ms: u32,
-    ) !protocol.Message {
-        var completions: [2]ReceiveCompletion = undefined;
-        var select = Io.Select(ReceiveCompletion).init(self.io, &completions);
-        defer select.cancelDiscard();
-        try select.concurrent(.message, recv_message_task, .{connection});
-        try select.concurrent(.deadline, connection_deadline, .{ self.io, deadline_ms });
-        const completion = try select.await();
-        return switch (completion) {
-            .message => |result| try result,
-            .deadline => |result| deadline: {
-                try result;
-                break :deadline error.ReplicationRpcDeadlineExceeded;
-            },
-        };
-    }
-
-    fn record_replication_failure(self: *Server) void {
-        _ = self.replication_failures.fetchAdd(1, .monotonic);
     }
 
     fn serve_read_stream(
@@ -1194,7 +763,6 @@ pub const Server = struct {
         scratch: *ConnectionScratch,
         request: protocol.ReadStream,
     ) !void {
-        if (try self.ensure_linearizable_read(conn)) return;
         self.store_mutex.lockUncancelable(self.io);
         const response = self.store.read_stream_into(
             request,
@@ -1216,7 +784,6 @@ pub const Server = struct {
         scratch: *ConnectionScratch,
         request: protocol.ReadLog,
     ) !void {
-        if (try self.ensure_linearizable_read(conn)) return;
         self.store_mutex.lockUncancelable(self.io);
         const response = self.store.read_log_into(
             request,
@@ -1240,13 +807,11 @@ pub const Server = struct {
             monitor_shutdown_signal,
             .{self},
         );
-        if (self.replication != null) {
-            try self.connection_group.concurrent(
-                self.io,
-                replication_loop,
-                .{self},
-            );
-        }
+        try self.connection_group.concurrent(
+            self.io,
+            background_flush_loop,
+            .{self},
+        );
 
         while (self.running.load(.acquire)) {
             if (shutdown_requested.load(.acquire)) break;
@@ -1277,6 +842,10 @@ pub const Server = struct {
             };
         }
 
+        self.running.store(false, .release);
+        self.flush_mutex.lockUncancelable(self.io);
+        self.flush_needed.broadcast(self.io);
+        self.flush_mutex.unlock(self.io);
         self.connection_group.cancel(self.io);
     }
 
@@ -1295,50 +864,6 @@ pub const Server = struct {
             }
             try self.io.sleep(.fromMilliseconds(10), .awake);
         }
-    }
-
-    fn replication_loop(self: *Server) Io.Cancelable!void {
-        const interval_ms = self.replication.?.config.heartbeat_interval_ms;
-        while (self.running.load(.acquire)) {
-            try self.io.sleep(.fromMilliseconds(interval_ms), .awake);
-            self.replication_cycle() catch |err| switch (err) {
-                error.Canceled => return error.Canceled,
-                else => {
-                    self.record_replication_failure();
-                    self.replication_mutex.lockUncancelable(self.io);
-                    self.replication.?.machine.poisoned = true;
-                    self.replication_mutex.unlock(self.io);
-                    log.err("fatal replication loop failure: {}", .{err});
-                    self.shutdown();
-                    return;
-                },
-            };
-        }
-    }
-
-    fn replication_cycle(self: *Server) !void {
-        var initial: [replication_mod.outbox_capacity]raft.Envelope = undefined;
-        self.replication_mutex.lockUncancelable(self.io);
-        const runtime = self.replication.?;
-        runtime.outbox.reset();
-        runtime.machine.node.tick(&runtime.outbox) catch |err| {
-            self.replication_mutex.unlock(self.io);
-            return err;
-        };
-        self.store_mutex.lockUncancelable(self.io);
-        runtime.checkpoint_and_apply() catch |err| {
-            runtime.machine.poisoned = true;
-            self.store_mutex.unlock(self.io);
-            self.replication_mutex.unlock(self.io);
-            return err;
-        };
-        self.store_mutex.unlock(self.io);
-        const count = runtime.take_outbox(&initial) catch |err| {
-            self.replication_mutex.unlock(self.io);
-            return err;
-        };
-        self.replication_mutex.unlock(self.io);
-        try self.dispatch_raft(initial[0..count]);
     }
 
     fn recv_message_task(connection: *transport.Connection) anyerror!protocol.Message {
@@ -1415,7 +940,7 @@ pub const Server = struct {
         self.group_commit_mutex.lockUncancelable(self.io);
         self.store_mutex.lockUncancelable(self.io);
         const failed = sync: {
-            self.store.sync() catch break :sync true;
+            self.store.durable_sync() catch break :sync true;
             break :sync false;
         };
         self.store_mutex.unlock(self.io);
@@ -1430,18 +955,13 @@ pub const Server = struct {
     }
 
     pub fn health(self: *Server) protocol.HealthResponse {
-        var clustered = false;
-        var replication_quorum = false;
-        var replication_poisoned = false;
-        var replication_lag: u64 = 0;
-        if (self.replication) |runtime| {
-            clustered = true;
-            self.replication_mutex.lockUncancelable(self.io);
-            replication_quorum = runtime.machine.node.linearizable_read_ready();
-            replication_poisoned = runtime.machine.poisoned;
-            replication_lag = runtime.replication_lag();
-            self.replication_mutex.unlock(self.io);
-        }
+        // Single-node posture: durability is local WAL fsync, so there is no
+        // cross-node quorum. These fields remain on the wire for compatibility
+        // and report neutral values.
+        const clustered = false;
+        const replication_quorum = false;
+        const replication_poisoned = false;
+        const replication_lag: u64 = 0;
         self.store_mutex.lockUncancelable(self.io);
         defer self.store_mutex.unlock(self.io);
         const metrics = self.store.metrics();
@@ -1481,7 +1001,7 @@ pub const Server = struct {
             .admission_saturation = self.admission_saturation.load(.acquire),
             .corruption_findings = self.corruption_findings.load(.acquire),
             .compaction_failures = metrics.compaction_failures,
-            .replication_failures = self.replication_failures.load(.acquire),
+            .replication_failures = 0,
             .backups_completed = self.backups_completed,
             .last_backup_unix_seconds = self.last_backup_unix_seconds,
             .backup_age_seconds = backup_age,
@@ -1508,102 +1028,6 @@ pub const Server = struct {
     }
 };
 
-const IncomingRaftRequest = struct {
-    envelope: raft.Envelope,
-    command: ?[]const u8,
-};
-
-fn raft_request_from_protocol(
-    message: protocol.Message,
-    from: raft.NodeId,
-    to: raft.NodeId,
-) !IncomingRaftRequest {
-    return switch (message) {
-        .raft_request_vote => |request| .{
-            .envelope = .{ .from = from, .to = to, .message = .{
-                .request_vote = request,
-            } },
-            .command = null,
-        },
-        .raft_append_entries => |append| .{
-            .envelope = .{ .from = from, .to = to, .message = .{
-                .append_entries = append.value,
-            } },
-            .command = if (append.value.entry == null) null else append.command,
-        },
-        .raft_install_snapshot => |install| .{
-            .envelope = .{ .from = from, .to = to, .message = .{
-                .install_snapshot = install.value,
-            } },
-            .command = null,
-        },
-        else => error.UnexpectedRaftRequest,
-    };
-}
-
-fn raft_request_to_protocol(
-    envelope: raft.Envelope,
-    command: []const u8,
-) !protocol.Message {
-    return switch (envelope.message) {
-        .request_vote => |request| .{ .raft_request_vote = request },
-        .append_entries => |append| .{ .raft_append_entries = .{
-            .value = append,
-            .command = command,
-        } },
-        // Metadata-only installation is intentionally never sent: a follower
-        // must not acknowledge a snapshot whose canonical bytes it lacks.
-        .install_snapshot => error.SnapshotTransferUnsupported,
-        else => error.UnexpectedRaftRequest,
-    };
-}
-
-fn raft_response_from_protocol(message: protocol.Message) !raft.Message {
-    return switch (message) {
-        .raft_vote_result => |response| .{ .vote_result = response },
-        .raft_append_result => |response| .{ .append_result = response },
-        .raft_snapshot_result => |response| .{ .snapshot_result = response.value },
-        else => error.UnexpectedRaftResponse,
-    };
-}
-
-fn raft_response_to_protocol(envelope: raft.Envelope) !protocol.Message {
-    return switch (envelope.message) {
-        .vote_result => |response| .{ .raft_vote_result = response },
-        .append_result => |response| .{ .raft_append_result = response },
-        .snapshot_result => |response| .{ .raft_snapshot_result = .{
-            .value = response,
-            .next_offset = 0,
-            .accepted = true,
-        } },
-        else => error.UnexpectedRaftResponse,
-    };
-}
-
-fn raft_response_matches(request: raft.Message, response: raft.Message) bool {
-    return switch (request) {
-        .request_vote => response == .vote_result,
-        .append_entries => response == .append_result,
-        .install_snapshot => response == .snapshot_result,
-        else => false,
-    };
-}
-
-fn is_raft_request(message: protocol.Message) bool {
-    return switch (message) {
-        .raft_request_vote, .raft_append_entries, .raft_install_snapshot => true,
-        else => false,
-    };
-}
-
-fn send_protocol_error(
-    conn: *transport.Connection,
-    code: protocol.ErrorCode,
-    message: []const u8,
-) !void {
-    try conn.send_message(.{ .err = .{ .code = code, .message = message } });
-}
-
 fn message_permitted(permissions: auth.Permissions, message: protocol.Message) bool {
     return switch (message) {
         .append_stream => permissions.append,
@@ -1611,7 +1035,6 @@ fn message_permitted(permissions: auth.Permissions, message: protocol.Message) b
         .read_log => permissions.read_log,
         .pull_request => permissions.recover,
         .health_request => permissions.observe,
-        .raft_request_vote, .raft_append_entries, .raft_install_snapshot => permissions.replicate,
         .handshake,
         .pull_response,
         .err,
@@ -1619,9 +1042,6 @@ fn message_permitted(permissions: auth.Permissions, message: protocol.Message) b
         .read_stream_response,
         .read_log_response,
         .health_response,
-        .raft_vote_result,
-        .raft_append_result,
-        .raft_snapshot_result,
         => false,
     };
 }
@@ -1648,19 +1068,12 @@ test "operation permissions are least privilege" {
         .max_count = 1,
     } };
     const observe: protocol.Message = .{ .health_request = .{} };
-    const replicate: protocol.Message = .{ .raft_request_vote = .{
-        .term = 1,
-        .candidate = 1,
-        .last_log_index = 0,
-        .last_log_term = 0,
-    } };
     const messages = [_]protocol.Message{
         append,
         read_stream,
         read_log,
         recover,
         observe,
-        replicate,
     };
     const grants = [_]auth.Permissions{
         .{ .append = true },
@@ -1668,7 +1081,6 @@ test "operation permissions are least privilege" {
         .{ .read_log = true },
         .{ .recover = true },
         .{ .observe = true },
-        .{ .replicate = true },
     };
     for (grants, 0..) |grant, allowed| {
         for (messages, 0..) |message, operation| {
@@ -1974,11 +1386,11 @@ test "recovery ingests events from peer" {
             const entries = [_]protocol.PullResponse.EventEntry{
                 .{
                     .key = "evt:order-service:order.created:0000000000000001",
-                    .value = "1|100|2|order-service|order.created|{}",
+                    .value = "1|100|2|order-service|order.created||{}",
                 },
                 .{
                     .key = "evt:order-service:order.created:0000000000000002",
-                    .value = "2|200|2|order-service|order.created|{}",
+                    .value = "2|200|2|order-service|order.created||{}",
                 },
             };
             conn.send_message(.{ .pull_response = .{ .events = &entries } }) catch {};
@@ -2470,6 +1882,107 @@ test "network driver appends and reads committed streams" {
     server_thread.join();
 }
 
+fn cleanup_bg_flush_e2e(io: Io) void {
+    const singles = [_][]const u8{
+        "data/test_bg_flush_e2e.wal",
+        "data/test_bg_flush_e2e.wal.flushing",
+        "data/test_bg_flush_e2e.crumb",
+        "data/test_bg_flush_e2e.manifest",
+    };
+    for (singles) |p| Io.Dir.cwd().deleteFile(io, p) catch {};
+    Io.Dir.cwd().deleteTree(io, "data/test_bg_flush_e2e.quarantine") catch {};
+    for (0..4) |level| {
+        for (1..128) |id| {
+            var buffer: [64]u8 = undefined;
+            const path = std.fmt.bufPrint(
+                &buffer,
+                "data/test_bg_flush_e2e_L{d}_{d:0>8}.sst",
+                .{ level, id },
+            ) catch continue;
+            Io.Dir.cwd().deleteFile(io, path) catch {};
+        }
+    }
+}
+
+test "single-node appends drive background flushes and survive restart" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wal_path = "data/test_bg_flush_e2e.wal";
+    cleanup_bg_flush_e2e(io);
+    defer cleanup_bg_flush_e2e(io);
+
+    const append_count: u32 = 150;
+    const events_per_append: u16 = 256;
+    const total_events: u64 = @as(u64, append_count) * events_per_append;
+
+    {
+        var event_store = try EventStore.init(allocator, wal_path, io, .{});
+        defer event_store.deinit();
+        const identity: ServiceIdentity = .{
+            .name = "bg-flush-test",
+            .instance_id = "node-1",
+            .listen_address = "127.0.0.1:0",
+        };
+        var server = try Server.init(allocator, &event_store, identity, &.{}, io);
+        defer server.deinit();
+        const server_thread = try std.Thread.spawn(.{}, struct {
+            fn run(target: *Server) void {
+                target.serve() catch @panic("server failed during background flush test");
+            }
+        }.run, .{&server});
+
+        var address_buffer: [32]u8 = undefined;
+        const address = try std.fmt.bufPrint(
+            &address_buffer,
+            "127.0.0.1:{d}",
+            .{server.listener.get_port()},
+        );
+        var client: transport.Connection = undefined;
+        try transport.dial_into(&client, address, io);
+        try client.send_message(.{ .handshake = .{
+            .service_name = "bg-flush-client",
+            .instance_id = "client-1",
+        } });
+
+        var events: [events_per_append]protocol.AppendEvent = undefined;
+        for (&events) |*slot| slot.* = .{ .event_type = "e", .schema_version = 1, .payload = "x" };
+
+        var index: u32 = 0;
+        while (index < append_count) : (index += 1) {
+            var stream_buffer: [32]u8 = undefined;
+            var command_buffer: [32]u8 = undefined;
+            const stream_id = try std.fmt.bufPrint(&stream_buffer, "bg/{d}", .{index});
+            const command_id = try std.fmt.bufPrint(&command_buffer, "cmd-{d}", .{index});
+            try client.send_message(.{ .append_stream = .{
+                .stream_id = stream_id,
+                .expected_version = .empty,
+                .command_id = command_id,
+                .events = &events,
+            } });
+            const reply = try client.recv_message();
+            try std.testing.expect(reply.append_stream_response == .committed);
+        }
+
+        try client.send_message(.{ .health_request = .{} });
+        const health = try client.recv_message();
+        try std.testing.expectEqual(total_events, health.health_response.committed_log_position);
+        try std.testing.expect(health.health_response.sstables > 0);
+        client.close();
+
+        server.shutdown();
+        server_thread.join();
+    }
+
+    var reopened = try EventStore.init(allocator, wal_path, io, .{});
+    defer reopened.deinit();
+    const verification = try reopened.verify_integrity();
+    try std.testing.expectEqual(total_events, verification.events);
+    try std.testing.expectEqual(@as(limits.StreamCount, append_count), verification.streams);
+    try std.testing.expectEqual(total_events, verification.committed_log_position);
+}
+
 test "health readiness follows integrity poison and stream capacity" {
     const allocator = std.testing.allocator;
     var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
@@ -2583,418 +2096,3 @@ test "recovery skips unreachable peers" {
     try std.testing.expectEqual(@as(usize, 0), results.events.len);
 }
 
-const LiveClusterTest = struct {
-    const node_count = 3;
-    const cluster_secret = "0123456789abcdef0123456789abcdef";
-    const app_secret = "abcdef0123456789abcdef0123456789";
-    const instance_ids = [node_count][]const u8{ "cluster-1", "cluster-2", "cluster-3" };
-    const wal_paths = [node_count][]const u8{
-        "data/test_live_cluster_1.wal",
-        "data/test_live_cluster_2.wal",
-        "data/test_live_cluster_3.wal",
-    };
-    const state_paths = [node_count][]const u8{
-        "data/test_live_cluster_1.raft",
-        "data/test_live_cluster_2.raft",
-        "data/test_live_cluster_3.raft",
-    };
-
-    const Node = struct {
-        store: EventStore,
-        server: Server,
-    };
-
-    allocator: Allocator,
-    io: Io,
-    address_storage: [node_count][32]u8 = undefined,
-    addresses: [node_count][]const u8 = undefined,
-    members: [node_count]config_mod.ClusterMember = undefined,
-    credentials: [2]auth.Credential = .{
-        .{
-            .service_name = "compix-cluster-test",
-            .secret = cluster_secret,
-            .permissions = .{ .replicate = true },
-        },
-        .{
-            .service_name = "cluster-app",
-            .secret = app_secret,
-            .permissions = .{ .append = true, .read_stream = true, .read_log = true },
-        },
-    },
-    nodes: [node_count]Node = undefined,
-    threads: [node_count]?std.Thread = @splat(null),
-    live: [node_count]bool = @splat(false),
-    initialized: [node_count]bool = @splat(false),
-    built: u8 = 0,
-
-    fn init(self: *LiveClusterTest, allocator: Allocator, io: Io) !void {
-        self.* = .{ .allocator = allocator, .io = io };
-        cleanup_files(io);
-
-        var reservations: [node_count]transport.Listener = undefined;
-        var reserved: u8 = 0;
-        errdefer for (reservations[0..reserved]) |*listener| listener.deinit();
-        for (&reservations) |*listener| {
-            listener.* = try transport.Listener.init("127.0.0.1:0", io);
-            reserved += 1;
-        }
-        for (&reservations, 0..) |*listener, index| {
-            self.addresses[index] = try std.fmt.bufPrint(
-                &self.address_storage[index],
-                "127.0.0.1:{d}",
-                .{listener.get_port()},
-            );
-        }
-        for (&reservations) |*listener| listener.deinit();
-        reserved = 0;
-
-        for (&self.members, 0..) |*member, index| member.* = .{
-            .node_id = @intCast(index + 1),
-            .instance_id = instance_ids[index],
-            .address = self.addresses[index],
-        };
-        for (0..node_count) |index| {
-            try self.init_node(index);
-            self.initialized[index] = true;
-            self.built += 1;
-        }
-    }
-
-    fn init_node(self: *LiveClusterTest, index: usize) !void {
-        const node = &self.nodes[index];
-        node.store = try EventStore.init(self.allocator, wal_paths[index], self.io, .{
-            .identity = "compix-cluster-test",
-            .stream_capacity = 32,
-            .stream_id_bytes_capacity = 4096,
-        });
-        errdefer node.store.deinit();
-        try Server.init_in_place(&node.server, self.allocator, .{
-            .store = &node.store,
-            .identity = .{
-                .name = "compix-cluster-test",
-                .instance_id = instance_ids[index],
-                .listen_address = self.addresses[index],
-            },
-            .contracts = &.{},
-            .io = self.io,
-            .connection_capacity = 4,
-            .client_secret = cluster_secret,
-            .credentials = &self.credentials,
-            .cluster = .{
-                .node_id = @intCast(index + 1),
-                .state_path = state_paths[index],
-                .members = &self.members,
-                .heartbeat_interval_ms = 20,
-                .election_timeout_min_ticks = 25,
-                .election_timeout_max_ticks = 40,
-                .rpc_timeout_ms = 300,
-                .log_capacity = 16,
-                .command_slot_size = protocol.replicated_command_size_max,
-            },
-        });
-    }
-
-    fn start(self: *LiveClusterTest) !void {
-        for (0..self.built) |index| {
-            self.threads[index] = try std.Thread.spawn(
-                .{},
-                serve_node,
-                .{&self.nodes[index].server},
-            );
-            self.live[index] = true;
-        }
-    }
-
-    fn stop(self: *LiveClusterTest, index: usize) void {
-        if (!self.live[index]) return;
-        self.nodes[index].server.shutdown();
-        self.threads[index].?.join();
-        self.threads[index] = null;
-        self.live[index] = false;
-    }
-
-    fn restart(self: *LiveClusterTest, index: usize) !void {
-        self.stop(index);
-        self.nodes[index].server.deinit();
-        self.nodes[index].store.deinit();
-        self.initialized[index] = false;
-        try self.init_node(index);
-        self.initialized[index] = true;
-        self.threads[index] = try std.Thread.spawn(
-            .{},
-            serve_node,
-            .{&self.nodes[index].server},
-        );
-        self.live[index] = true;
-    }
-
-    fn replace(self: *LiveClusterTest, index: usize) !void {
-        self.stop(index);
-        self.nodes[index].server.deinit();
-        self.nodes[index].store.deinit();
-        self.initialized[index] = false;
-        cleanup_node_files(self.io, index);
-        try self.init_node(index);
-        self.initialized[index] = true;
-        self.threads[index] = try std.Thread.spawn(
-            .{},
-            serve_node,
-            .{&self.nodes[index].server},
-        );
-        self.live[index] = true;
-    }
-
-    fn deinit(self: *LiveClusterTest) void {
-        for (0..self.built) |index| self.stop(index);
-        var remaining = self.built;
-        while (remaining > 0) {
-            remaining -= 1;
-            if (!self.initialized[remaining]) continue;
-            self.nodes[remaining].server.deinit();
-            self.nodes[remaining].store.deinit();
-            self.initialized[remaining] = false;
-        }
-        self.built = 0;
-        cleanup_files(self.io);
-    }
-
-    fn wait_for_leader(self: *LiveClusterTest) !usize {
-        for (0..250) |_| {
-            for (0..self.built) |index| {
-                if (!self.live[index]) continue;
-                const health_state = self.nodes[index].server.health();
-                if (health_state.ready and health_state.replication_quorum) return index;
-            }
-            try self.io.sleep(.fromMilliseconds(20), .awake);
-        }
-        return error.ClusterElectionTimeout;
-    }
-
-    fn wait_for_position(self: *LiveClusterTest, expected: u64) !void {
-        for (0..250) |_| {
-            var complete = true;
-            for (0..self.built) |index| {
-                if (!self.live[index]) continue;
-                self.nodes[index].server.store_mutex.lockUncancelable(self.io);
-                const position = self.nodes[index].store.metrics().committed_log_position;
-                self.nodes[index].server.store_mutex.unlock(self.io);
-                if (position != expected) complete = false;
-            }
-            if (complete) return;
-            try self.io.sleep(.fromMilliseconds(20), .awake);
-        }
-        return error.ClusterApplyTimeout;
-    }
-
-    fn wait_for_snapshot(
-        self: *LiveClusterTest,
-        node_index: usize,
-        expected_minimum: raft.Index,
-    ) !void {
-        for (0..250) |_| {
-            self.nodes[node_index].server.replication_mutex.lockUncancelable(self.io);
-            const snapshot_index =
-                self.nodes[node_index].server.replication.?.machine.node.snapshot.last_index;
-            self.nodes[node_index].server.replication_mutex.unlock(self.io);
-            if (snapshot_index >= expected_minimum) return;
-            try self.io.sleep(.fromMilliseconds(20), .awake);
-        }
-        return error.ClusterSnapshotTimeout;
-    }
-
-    fn serve_node(server: *Server) void {
-        server.serve() catch |err| {
-            if (server.running.load(.acquire)) {
-                std.debug.panic("live cluster server failed: {}", .{err});
-            }
-        };
-    }
-
-    fn cleanup_files(io: Io) void {
-        for (0..node_count) |index| {
-            cleanup_node_files(io, index);
-        }
-    }
-
-    fn cleanup_node_files(io: Io, index: usize) void {
-        Io.Dir.cwd().deleteFile(io, wal_paths[index]) catch {};
-        Io.Dir.cwd().deleteFile(io, state_paths[index]) catch {};
-        var state_buffer: [128]u8 = undefined;
-        inline for (.{ ".snapshot", ".snapshot.incoming", ".snapshot.quarantine" }) |suffix| {
-            const path = std.fmt.bufPrint(&state_buffer, "{s}{s}", .{
-                state_paths[index],
-                suffix,
-            }) catch unreachable;
-            Io.Dir.cwd().deleteFile(io, path) catch {};
-        }
-        var path_buffer: [128]u8 = undefined;
-        inline for (.{ ".crumb", ".manifest" }) |suffix| {
-            const path = std.fmt.bufPrint(
-                &path_buffer,
-                "data/test_live_cluster_{d}{s}",
-                .{ index + 1, suffix },
-            ) catch unreachable;
-            Io.Dir.cwd().deleteFile(io, path) catch {};
-        }
-    }
-};
-
-test "live cluster snapshots, replaces a node, fails over, and fences minority writes" {
-    const allocator = std.testing.allocator;
-    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
-    defer threaded.deinit();
-    const io = threaded.io();
-    var cluster: LiveClusterTest = undefined;
-    try cluster.init(allocator, io);
-    defer cluster.deinit();
-    try cluster.start();
-
-    const first_leader = try cluster.wait_for_leader();
-    var production_observed = false;
-    for (0..200) |_| {
-        const health = cluster.nodes[first_leader].server.health();
-        if (health.production_ready and !health.degraded) {
-            try std.testing.expect(health.ready);
-            try std.testing.expect(health.replication_quorum);
-            production_observed = true;
-            break;
-        }
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    try std.testing.expect(production_observed);
-    var client: DriverTest.driver.Client = undefined;
-    try DriverTest.driver.Client.connect(&client, .{
-        .address = cluster.addresses[first_leader],
-        .service_name = "cluster-app",
-        .instance_id = "client-1",
-        .secret = LiveClusterTest.app_secret,
-        .io = io,
-    });
-    const large_payload: [40 * 1024]u8 = @splat('x');
-    const first_event = [_]protocol.AppendEvent{.{
-        .event_type = "cluster.created",
-        .schema_version = 1,
-        .payload = &large_payload,
-    }};
-    const first = try client.append(.{
-        .stream_id = "cluster/1",
-        .expected_version = .empty,
-        .command_id = "live-cluster-command-1",
-        .events = &first_event,
-    });
-    try std.testing.expect(first.response == .committed);
-    const read = try client.read_stream(.{
-        .stream_id = "cluster/1",
-        .from_version = 0,
-        .max_count = 8,
-    });
-    switch (read) {
-        .response => |response| try std.testing.expectEqual(
-            @as(usize, 1),
-            response.events.len,
-        ),
-        .rejected => |rejection| {
-            std.debug.print("snapshot test read rejected: {t} {s}\n", .{
-                rejection.code,
-                rejection.message,
-            });
-            return error.UnexpectedReadRejection;
-        },
-    }
-    for (2..20) |command_number| {
-        var command_buffer: [64]u8 = undefined;
-        const command_id = try std.fmt.bufPrint(
-            &command_buffer,
-            "live-cluster-command-{d}",
-            .{command_number},
-        );
-        const appended = try client.append(.{
-            .stream_id = "cluster/1",
-            .expected_version = .{ .exact = command_number - 1 },
-            .command_id = command_id,
-            .events = &first_event,
-        });
-        switch (appended) {
-            .response => |response| try std.testing.expect(response == .committed),
-            .rejected => |rejection| {
-                std.debug.print("snapshot test append {d} rejected: {t} {s}\n", .{
-                    command_number,
-                    rejection.code,
-                    rejection.message,
-                });
-                return error.UnexpectedAppendRejection;
-            },
-        }
-    }
-    client.deinit();
-    try cluster.wait_for_position(19);
-    try cluster.wait_for_snapshot(first_leader, 16);
-
-    const restarted_follower = (first_leader + 1) % LiveClusterTest.node_count;
-    try cluster.replace(restarted_follower);
-    try cluster.wait_for_position(19);
-    cluster.nodes[restarted_follower].server.replication_mutex.lockUncancelable(io);
-    const installed_snapshot = cluster.nodes[restarted_follower]
-        .server.replication.?.machine.node.snapshot.last_index;
-    cluster.nodes[restarted_follower].server.replication_mutex.unlock(io);
-    try std.testing.expect(installed_snapshot >= 16);
-
-    cluster.stop(first_leader);
-    const second_leader = try cluster.wait_for_leader();
-    try std.testing.expect(second_leader != first_leader);
-    try DriverTest.driver.Client.connect(&client, .{
-        .address = cluster.addresses[second_leader],
-        .service_name = "cluster-app",
-        .instance_id = "client-2",
-        .secret = LiveClusterTest.app_secret,
-        .io = io,
-    });
-    const second_event = [_]protocol.AppendEvent{.{
-        .event_type = "cluster.updated",
-        .schema_version = 1,
-        .payload = "two",
-    }};
-    const second = try client.append(.{
-        .stream_id = "cluster/1",
-        .expected_version = .{ .exact = 19 },
-        .command_id = "live-cluster-command-20",
-        .events = &second_event,
-    });
-    try std.testing.expect(second.response == .committed);
-    client.deinit();
-    try cluster.wait_for_position(20);
-
-    for (0..LiveClusterTest.node_count) |index| {
-        if (cluster.live[index] and index != second_leader) cluster.stop(index);
-    }
-    try DriverTest.driver.Client.connect(&client, .{
-        .address = cluster.addresses[second_leader],
-        .service_name = "cluster-app",
-        .instance_id = "client-3",
-        .secret = LiveClusterTest.app_secret,
-        .io = io,
-    });
-    const unavailable = try client.append(.{
-        .stream_id = "cluster/1",
-        .expected_version = .{ .exact = 20 },
-        .command_id = "live-cluster-command-no-quorum",
-        .events = &second_event,
-    });
-    try std.testing.expectEqual(
-        protocol.ErrorCode.quorum_unavailable,
-        unavailable.rejected.code,
-    );
-    client.deinit();
-    var degraded_observed = false;
-    for (0..200) |_| {
-        const health = cluster.nodes[second_leader].server.health();
-        if (!health.production_ready and health.degraded and !health.ready and
-            !health.replication_quorum)
-        {
-            degraded_observed = true;
-            break;
-        }
-        try io.sleep(.fromMilliseconds(10), .awake);
-    }
-    try std.testing.expect(degraded_observed);
-}

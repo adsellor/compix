@@ -1,5 +1,6 @@
 const std = @import("std");
 const breadcrumb = @import("breadcrumb.zig");
+const signing = @import("signing.zig");
 const Breadcrumb = breadcrumb.Breadcrumb;
 
 pub const DependencyContract = struct {
@@ -7,6 +8,9 @@ pub const DependencyContract = struct {
     event_types: []const []const u8,
     peer_address: []const u8,
     retention_hint: ?u64,
+    /// The declared owner's Ed25519 public key. When set, pulled events from
+    /// this origin must carry a valid origin signature or ingest rejects them.
+    origin_public_key: ?[signing.public_key_length]u8 = null,
 
     /// Returns true if this contract covers the given breadcrumb's source_service and event_type.
     pub fn matches_breadcrumb(self: *const DependencyContract, bc: Breadcrumb) bool {

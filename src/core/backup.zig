@@ -4,10 +4,6 @@ const std = @import("std");
 const config_mod = @import("config.zig");
 const limits = @import("limits.zig");
 const protocol = @import("protocol.zig");
-const raft = @import("raft.zig");
-const replication_mod = @import("replication.zig");
-const replicated_storage = @import("replicated_storage.zig");
-const snapshot_storage = @import("snapshot_storage.zig");
 const store_mod = @import("store.zig");
 const time_mod = @import("time.zig");
 
@@ -43,7 +39,7 @@ const FileRecord = struct {
     checksum: [checksum_size]u8,
     payload_name: []const u8,
 
-    const Kind = enum { wal, manifest, sst, snapshot, raft };
+    const Kind = enum { wal, manifest, sst };
 };
 
 pub fn create(
@@ -56,14 +52,8 @@ pub fn create(
     if (destination.len == 0 or destination.len > limits.wal_path_length_max)
         return error.InvalidBackupPath;
     const verification = try store.verify_integrity();
-    const cluster_snapshot: ?raft.Snapshot = if (config.cluster) |cluster|
-        try verified_cluster_snapshot(allocator, io, cluster)
-    else
-        null;
     const table_count = store.lsm.manifest.live.count;
-    const file_count: u16 = @intCast(table_count + 2 +
-        @intFromBool(config.cluster != null) +
-        @intFromBool(if (cluster_snapshot) |snapshot| snapshot.last_index > 0 else false));
+    const file_count: u16 = @intCast(table_count + 2);
     try IoDir.cwd().createDir(io, destination, .default_dir);
     try sync_parent_directory(destination, io);
 
@@ -152,46 +142,6 @@ pub fn create(
         &summary.bytes,
     );
     record_index += 1;
-    if (config.cluster) |cluster| {
-        try backup_file(
-            allocator,
-            io,
-            backup_manifest,
-            &manifest_position,
-            &manifest_hash,
-            destination,
-            record_index,
-            .raft,
-            0,
-            0,
-            cluster.state_path,
-            copy_buffer,
-            &summary.bytes,
-        );
-        record_index += 1;
-        if (cluster_snapshot.?.last_index > 0) {
-            const snapshot_path = try std.fmt.allocPrint(
-                allocator,
-                "{s}.snapshot",
-                .{cluster.state_path},
-            );
-            defer allocator.free(snapshot_path);
-            try backup_snapshot_file(
-                allocator,
-                io,
-                backup_manifest,
-                &manifest_position,
-                &manifest_hash,
-                destination,
-                record_index,
-                snapshot_path,
-                cluster_snapshot.?,
-                copy_buffer,
-                &summary.bytes,
-            );
-            record_index += 1;
-        }
-    }
     for (store.lsm.manifest.live.items_const()) |table| {
         const source = try std.fmt.allocPrint(
             allocator,
@@ -334,106 +284,6 @@ fn state_path(allocator: Allocator, wal_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ base, backup_state_suffix });
 }
 
-pub fn verify_cluster_state(
-    allocator: Allocator,
-    io: Io,
-    cluster: config_mod.Cluster,
-) !void {
-    _ = try verified_cluster_snapshot(allocator, io, cluster);
-}
-
-fn verified_cluster_snapshot(
-    allocator: Allocator,
-    io: Io,
-    cluster: config_mod.Cluster,
-) !raft.Snapshot {
-    const snapshot = (try verify_replication_state_path(
-        allocator,
-        io,
-        cluster,
-        cluster.state_path,
-    )).snapshot;
-    const path = try std.fmt.allocPrint(allocator, "{s}.snapshot", .{cluster.state_path});
-    defer allocator.free(path);
-    try verify_snapshot_path(allocator, io, cluster, snapshot, path);
-    return snapshot;
-}
-
-fn verify_snapshot_path(
-    allocator: Allocator,
-    io: Io,
-    cluster: config_mod.Cluster,
-    snapshot: raft.Snapshot,
-    path: []const u8,
-) !void {
-    const members = try allocator.alloc(raft.NodeId, cluster.members.len);
-    defer allocator.free(members);
-    for (cluster.members, 0..) |member, index| members[index] = member.node_id;
-    const scratch = try allocator.alloc(u8, @max(
-        @as(usize, limits.snapshot_chunk_size_max),
-        @as(usize, cluster.command_slot_size),
-    ));
-    defer allocator.free(scratch);
-    try snapshot_storage.verify(io, path, snapshot, members, scratch);
-}
-
-fn verify_replication_state_path(
-    allocator: Allocator,
-    io: Io,
-    cluster: config_mod.Cluster,
-    path: []const u8,
-) !replicated_storage.Recovered {
-    const capacity: usize = cluster.log_capacity;
-    const members = try allocator.alloc(raft.NodeId, cluster.members.len);
-    defer allocator.free(members);
-    for (cluster.members, 0..) |member, index| members[index] = member.node_id;
-    const entries = try allocator.alloc(raft.Entry, capacity);
-    defer allocator.free(entries);
-    const command_indices = try allocator.alloc(raft.Index, capacity);
-    defer allocator.free(command_indices);
-    const command_lengths = try allocator.alloc(limits.ByteCount, capacity);
-    defer allocator.free(command_lengths);
-    const command_bytes_size = std.math.mul(
-        usize,
-        capacity,
-        cluster.command_slot_size,
-    ) catch return error.InvalidReplicationCapacity;
-    const command_bytes = try allocator.alloc(u8, command_bytes_size);
-    defer allocator.free(command_bytes);
-    const scratch_size = try replicated_storage.state_size_max(
-        capacity,
-        cluster.command_slot_size,
-    );
-    const scratch = try allocator.alloc(u8, scratch_size);
-    defer allocator.free(scratch);
-    const recovered = try replicated_storage.load(
-        io,
-        path,
-        cluster.node_id,
-        members,
-        entries,
-        command_bytes,
-        command_indices,
-        command_lengths,
-        cluster.command_slot_size,
-        scratch,
-    ) orelse return error.MissingReplicatedState;
-    _ = try raft.Node.init(.{
-        .id = cluster.node_id,
-        .members = members,
-        .log_storage = entries,
-        .hard_state = recovered.hard_state,
-        .snapshot = recovered.snapshot,
-        .election_timeout_ticks = cluster.election_timeout_min_ticks,
-        .election_timeout_ticks_max = cluster.election_timeout_max_ticks,
-        .heartbeat_ticks = 1,
-        .restored_entry_count = recovered.entry_count,
-        .restored_commit_index = recovered.commit_index,
-        .restored_applied_index = recovered.applied_index,
-    });
-    return recovered;
-}
-
 pub fn restore(
     allocator: Allocator,
     io: Io,
@@ -459,33 +309,6 @@ pub fn restore(
     if (manifest_read != manifest.len) return error.TruncatedBackupManifest;
     const parsed = try verify_manifest(config, manifest);
 
-    var restored_snapshot: ?raft.Snapshot = null;
-    if (config.cluster) |cluster| {
-        var metadata_records = record_iterator(manifest);
-        var snapshot_records: u8 = 0;
-        while (try metadata_records.next()) |record| {
-            if (record.kind == .snapshot) snapshot_records += 1;
-            if (record.kind != .raft) continue;
-            const payload_path = try std.fmt.allocPrint(
-                allocator,
-                "{s}/{s}",
-                .{ source, record.payload_name },
-            );
-            defer allocator.free(payload_path);
-            restored_snapshot = (try verify_replication_state_path(
-                allocator,
-                io,
-                cluster,
-                payload_path,
-            )).snapshot;
-        }
-        const expected_snapshot_records: u8 = @intFromBool(
-            restored_snapshot != null and restored_snapshot.?.last_index > 0,
-        );
-        if (snapshot_records != expected_snapshot_records)
-            return error.BackupSnapshotCountMismatch;
-    }
-
     const base = try derive_base(allocator, config.wal_path);
     defer allocator.free(base);
     const copy_buffer = try allocator.alloc(u8, copy_buffer_size);
@@ -501,20 +324,6 @@ pub fn restore(
         );
         defer allocator.free(payload_path);
         try verify_payload(io, payload_path, record.size, record.checksum, copy_buffer);
-        if (record.kind == .raft) {
-            const cluster = config.cluster orelse return error.UnexpectedReplicatedState;
-            _ = try verify_replication_state_path(allocator, io, cluster, payload_path);
-        }
-        if (record.kind == .snapshot) {
-            const cluster = config.cluster orelse return error.UnexpectedReplicatedState;
-            try verify_snapshot_path(
-                allocator,
-                io,
-                cluster,
-                restored_snapshot orelse return error.MissingReplicatedState,
-                payload_path,
-            );
-        }
         const target_path = try target_path_for(allocator, config, base, record);
         defer allocator.free(target_path);
         try require_absent(io, target_path);
@@ -522,7 +331,7 @@ pub fn restore(
 
     // SSTables first, WAL second, manifest last. A failed restore cannot publish
     // a manifest that references missing tables.
-    inline for (.{ FileRecord.Kind.sst, .wal, .manifest, .snapshot, .raft }) |kind| {
+    inline for (.{ FileRecord.Kind.sst, .wal, .manifest }) |kind| {
         records = record_iterator(manifest);
         while (try records.next()) |record| {
             if (record.kind != kind) continue;
@@ -595,8 +404,6 @@ fn verify_manifest(config: *const LoadedConfig, manifest: []const u8) !ParsedMan
     var bytes: u64 = 0;
     var wal_files: u8 = 0;
     var manifest_files: u8 = 0;
-    var raft_files: u8 = 0;
-    var snapshot_files: u8 = 0;
     var trailer_seen = false;
     while (iterator.next()) |line| {
         if (line.len == 0) break;
@@ -625,8 +432,6 @@ fn verify_manifest(config: *const LoadedConfig, manifest: []const u8) !ParsedMan
             .wal => wal_files += 1,
             .manifest => manifest_files += 1,
             .sst => {},
-            .snapshot => snapshot_files += 1,
-            .raft => raft_files += 1,
         }
         bytes = std.math.add(u64, bytes, record.size) catch
             return error.InvalidBackupManifest;
@@ -635,9 +440,7 @@ fn verify_manifest(config: *const LoadedConfig, manifest: []const u8) !ParsedMan
         hash.update("\n");
     }
     if (!trailer_seen or files != expected_files) return error.BackupFileCountMismatch;
-    const expected_raft_files: u8 = @intFromBool(config.cluster != null);
-    if (wal_files != 1 or manifest_files != 1 or raft_files != expected_raft_files or
-        snapshot_files > expected_raft_files)
+    if (wal_files != 1 or manifest_files != 1)
         return error.InvalidBackupManifest;
     try validate_unique_targets(manifest);
     return .{
@@ -694,10 +497,6 @@ fn parse_file_record(line: []const u8) !FileRecord {
         .manifest
     else if (std.mem.eql(u8, kind_text, "SST"))
         .sst
-    else if (std.mem.eql(u8, kind_text, "RAFT"))
-        .raft
-    else if (std.mem.eql(u8, kind_text, "SNAPSHOT"))
-        .snapshot
     else
         return error.InvalidBackupManifest;
     const level = try std.fmt.parseInt(
@@ -724,7 +523,7 @@ fn parse_file_record(line: []const u8) !FileRecord {
     if (!valid_payload_name(payload_name) or fields.next() != null)
         return error.InvalidBackupManifest;
     switch (kind) {
-        .wal, .manifest, .snapshot, .raft => if (level != 0 or id != 0)
+        .wal, .manifest => if (level != 0 or id != 0)
             return error.InvalidBackupManifest,
         .sst => if (id == 0) return error.InvalidBackupManifest,
     }
@@ -783,8 +582,6 @@ fn backup_file(
                 .wal => "WAL",
                 .manifest => "MANIFEST",
                 .sst => "SST",
-                .snapshot => "SNAPSHOT",
-                .raft => "RAFT",
             },
             level,
             id,
@@ -796,80 +593,7 @@ fn backup_file(
     try append_manifest_line(manifest, io, manifest_position, manifest_hash, line);
 }
 
-fn backup_snapshot_file(
-    allocator: Allocator,
-    io: Io,
-    manifest: IoFile,
-    manifest_position: *u64,
-    manifest_hash: *std.crypto.hash.Blake3,
-    destination: []const u8,
-    index: u16,
-    source: []const u8,
-    snapshot: raft.Snapshot,
-    copy_buffer: []u8,
-    bytes_total: *u64,
-) !void {
-    var payload_name_buffer: ["payload-0000".len]u8 = undefined;
-    const payload_name = try std.fmt.bufPrint(&payload_name_buffer, "payload-{d:0>4}", .{index});
-    const target = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
-        destination,
-        payload_name,
-    });
-    defer allocator.free(target);
-    const copied = try copy_file_prefix(
-        io,
-        source,
-        target,
-        snapshot.state_size,
-        copy_buffer,
-    );
-    if (!std.crypto.timing_safe.eql(
-        [checksum_size]u8,
-        copied.checksum,
-        snapshot.state_checksum,
-    )) return error.SnapshotChecksumMismatch;
-    bytes_total.* = std.math.add(u64, bytes_total.*, copied.size) catch
-        return error.BackupTooLarge;
-    const checksum_hex = std.fmt.bytesToHex(copied.checksum, .lower);
-    var line_buffer: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(
-        &line_buffer,
-        "FILE SNAPSHOT 0 0 {d} {s} {s}",
-        .{ copied.size, &checksum_hex, payload_name },
-    );
-    try append_manifest_line(manifest, io, manifest_position, manifest_hash, line);
-}
-
 const CopyResult = struct { size: u64, checksum: [checksum_size]u8 };
-
-fn copy_file_prefix(
-    io: Io,
-    source_path: []const u8,
-    target_path: []const u8,
-    size: u64,
-    buffer: []u8,
-) !CopyResult {
-    const source = try IoDir.cwd().openFile(io, source_path, .{ .mode = .read_only });
-    defer source.close(io);
-    if ((try source.stat(io)).size < size) return error.TruncatedSourceFile;
-    const target = try IoDir.cwd().createFile(io, target_path, .{
-        .truncate = false,
-        .exclusive = true,
-    });
-    defer target.close(io);
-    var hash = std.crypto.hash.Blake3.init(.{});
-    var offset: u64 = 0;
-    while (offset < size) {
-        const count: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
-        if (try source.readPositionalAll(io, buffer[0..count], offset) != count)
-            return error.TruncatedSourceFile;
-        try target.writePositionalAll(io, buffer[0..count], offset);
-        hash.update(buffer[0..count]);
-        offset += count;
-    }
-    try target.sync(io);
-    return .{ .size = size, .checksum = hash_final(hash) };
-}
 
 fn copy_file(
     io: Io,
@@ -955,14 +679,6 @@ fn target_path_for(
             "{s}_L{d}_{d:0>8}.sst",
             .{ base, record.level, record.id },
         ),
-        .snapshot => if (config.cluster) |cluster|
-            std.fmt.allocPrint(allocator, "{s}.snapshot", .{cluster.state_path})
-        else
-            error.UnexpectedReplicatedState,
-        .raft => if (config.cluster) |cluster|
-            allocator.dupe(u8, cluster.state_path)
-        else
-            error.UnexpectedReplicatedState,
     };
 }
 
@@ -1075,170 +791,6 @@ fn flip_first_byte(io: Io, path: []const u8) !void {
     byte[0] ^= 1;
     try file.writePositionalAll(io, &byte, 0);
     try file.sync(io);
-}
-
-test "cluster backup restores the validated Raft checkpoint" {
-    const allocator = std.testing.allocator;
-    var threaded = std.Io.Threaded.init(allocator, .{ .environ = .empty });
-    defer threaded.deinit();
-    const io = threaded.io();
-    const source_base = "data/test_cluster_backup_source";
-    const target_base = "data/test_cluster_backup_target";
-    const source_state = "data/test_cluster_backup_source.raft";
-    const target_state = "data/test_cluster_backup_target.raft";
-    const archive = "data/test_cluster_backup_archive";
-    cleanup_test_store(io, source_base);
-    cleanup_test_store(io, target_base);
-    IoDir.cwd().deleteFile(io, source_state) catch {};
-    IoDir.cwd().deleteFile(io, target_state) catch {};
-    IoDir.cwd().deleteFile(io, "data/test_cluster_backup_source.raft.snapshot") catch {};
-    IoDir.cwd().deleteFile(io, "data/test_cluster_backup_target.raft.snapshot") catch {};
-    IoDir.cwd().deleteTree(io, archive) catch {};
-    defer cleanup_test_store(io, source_base);
-    defer cleanup_test_store(io, target_base);
-    defer IoDir.cwd().deleteFile(io, source_state) catch {};
-    defer IoDir.cwd().deleteFile(io, target_state) catch {};
-    defer IoDir.cwd().deleteFile(io, "data/test_cluster_backup_source.raft.snapshot") catch {};
-    defer IoDir.cwd().deleteFile(io, "data/test_cluster_backup_target.raft.snapshot") catch {};
-    defer IoDir.cwd().deleteTree(io, archive) catch {};
-
-    const source_json =
-        \\{"service_name":"cluster-backup","instance_id":"node-1",
-        \\ "listen_address":"127.0.0.1:4501",
-        \\ "wal_path":"data/test_cluster_backup_source.wal",
-        \\ "client_secret":"0123456789abcdef0123456789abcdef",
-        \\ "credentials":[{"service_name":"cluster-backup",
-        \\ "secret":"0123456789abcdef0123456789abcdef","permissions":["replicate"]}],
-        \\ "stream_capacity":4096,"stream_id_bytes_capacity":4194304,"contracts":[],
-        \\ "cluster":{"node_id":1,"state_path":"data/test_cluster_backup_source.raft",
-        \\ "log_capacity":8,"members":[
-        \\ {"node_id":1,"instance_id":"node-1","address":"127.0.0.1:4501"},
-        \\ {"node_id":2,"instance_id":"node-2","address":"127.0.0.1:4502"},
-        \\ {"node_id":3,"instance_id":"node-3","address":"127.0.0.1:4503"}]}}
-    ;
-    const target_json =
-        \\{"service_name":"cluster-backup","instance_id":"node-1",
-        \\ "listen_address":"127.0.0.1:4511",
-        \\ "wal_path":"data/test_cluster_backup_target.wal",
-        \\ "client_secret":"0123456789abcdef0123456789abcdef",
-        \\ "credentials":[{"service_name":"cluster-backup",
-        \\ "secret":"0123456789abcdef0123456789abcdef","permissions":["replicate"]}],
-        \\ "stream_capacity":4096,"stream_id_bytes_capacity":4194304,"contracts":[],
-        \\ "cluster":{"node_id":1,"state_path":"data/test_cluster_backup_target.raft",
-        \\ "log_capacity":8,"members":[
-        \\ {"node_id":1,"instance_id":"node-1","address":"127.0.0.1:4511"},
-        \\ {"node_id":2,"instance_id":"node-2","address":"127.0.0.1:4502"},
-        \\ {"node_id":3,"instance_id":"node-3","address":"127.0.0.1:4503"}]}}
-    ;
-    var source_config = try config_mod.load_from_slice(allocator, source_json);
-    defer source_config.deinit();
-    var target_config = try config_mod.load_from_slice(allocator, target_json);
-    defer target_config.deinit();
-    var source_store = try EventStore.init(allocator, source_config.wal_path, io, .{
-        .identity = source_config.identity.name,
-        .stream_capacity = source_config.stream_capacity,
-        .stream_id_bytes_capacity = source_config.stream_id_bytes_capacity,
-    });
-    defer source_store.deinit();
-    var source_runtime = try replication_mod.Runtime.init(
-        allocator,
-        io,
-        source_config.cluster.?,
-        &source_store,
-        1,
-    );
-    for (0..source_config.cluster.?.election_timeout_min_ticks) |_|
-        try source_runtime.machine.node.tick(&source_runtime.outbox);
-    source_runtime.outbox.reset();
-    try source_runtime.machine.receive(.{
-        .from = 2,
-        .to = 1,
-        .message = .{ .vote_result = .{
-            .term = source_runtime.machine.node.hard.term,
-            .voter = 2,
-            .granted = true,
-        } },
-    }, null, &source_runtime.outbox);
-    const snapshot_event = [_]protocol.AppendEvent{.{
-        .event_type = "snapshot.event",
-        .schema_version = 1,
-        .payload = "payload",
-    }};
-    for (1..5) |command_number| {
-        source_runtime.outbox.reset();
-        var command_buffer: [64]u8 = undefined;
-        const command_id = try std.fmt.bufPrint(
-            &command_buffer,
-            "cluster-backup-command-{d}",
-            .{command_number},
-        );
-        const index = try source_runtime.machine.propose_append(.{
-            .stream_id = "snapshot/stream",
-            .expected_version = if (command_number == 1)
-                .empty
-            else
-                .{ .exact = command_number - 1 },
-            .command_id = command_id,
-            .events = &snapshot_event,
-        }, @intCast(command_number), &source_runtime.outbox);
-        try source_runtime.checkpoint_and_apply();
-        source_runtime.outbox.reset();
-        try source_runtime.machine.receive(.{
-            .from = 2,
-            .to = 1,
-            .message = .{ .append_result = .{
-                .term = source_runtime.machine.node.hard.term,
-                .follower = 2,
-                .success = true,
-                .match_index = index,
-                .conflict_index = 0,
-            } },
-        }, null, &source_runtime.outbox);
-        try source_runtime.checkpoint_and_apply();
-    }
-    try std.testing.expectEqual(@as(raft.Index, 4), source_runtime.machine.node.snapshot.last_index);
-    source_runtime.deinit();
-    const saved = try create(allocator, io, &source_config, &source_store, archive);
-    try std.testing.expectEqual(@as(u16, 4), saved.files);
-    const snapshot_payload = "data/test_cluster_backup_archive/payload-0003";
-    try flip_first_byte(io, snapshot_payload);
-    try std.testing.expectError(
-        error.BackupPayloadChecksumMismatch,
-        restore(allocator, io, &target_config, archive),
-    );
-    try flip_first_byte(io, snapshot_payload);
-    const restored = try restore(allocator, io, &target_config, archive);
-    try std.testing.expectEqual(saved.files, restored.files);
-
-    var target_store = try EventStore.init(allocator, target_config.wal_path, io, .{
-        .identity = target_config.identity.name,
-        .stream_capacity = target_config.stream_capacity,
-        .stream_id_bytes_capacity = target_config.stream_id_bytes_capacity,
-    });
-    defer target_store.deinit();
-    try flip_first_byte(io, "data/test_cluster_backup_target.raft.snapshot");
-    try std.testing.expectError(
-        error.SnapshotChecksumMismatch,
-        replication_mod.Runtime.init(
-            allocator,
-            io,
-            target_config.cluster.?,
-            &target_store,
-            2,
-        ),
-    );
-    try flip_first_byte(io, "data/test_cluster_backup_target.raft.snapshot");
-    var target_runtime = try replication_mod.Runtime.init(
-        allocator,
-        io,
-        target_config.cluster.?,
-        &target_store,
-        2,
-    );
-    defer target_runtime.deinit();
-    try std.testing.expectEqual(@as(raft.Index, 4), target_runtime.machine.node.commit_index);
-    const verification = try target_store.verify_integrity();
-    try std.testing.expectEqual(@as(u64, 4), verification.events);
 }
 
 test "backup validates corruption and identity then restores a replayable store" {

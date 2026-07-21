@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const event = @import("event.zig");
 const limits = @import("limits.zig");
+const bloom = @import("bloom.zig");
 const EventValue = event.EventValue;
 
 const Io = std.Io;
@@ -9,9 +10,9 @@ const IoFile = Io.File;
 const IoDir = Io.Dir;
 
 pub const magic_number: u32 = 0xC0BEEF55;
-pub const format_version: u16 = 1;
+pub const format_version: u16 = 2;
 pub const checksum_size: u32 = 16;
-pub const footer_size: u32 = 96;
+pub const footer_size: u32 = 116;
 pub const block_size_target: u32 = 4096;
 const writer_path_capacity: u32 = limits.wal_path_length_max + 68;
 
@@ -47,9 +48,11 @@ pub const FaultInjector = struct {
 
 comptime {
     // Footer layout: [8B index_offset][4B index_size][4B num_blocks]
-    // [8B num_entries][8B min_seq][8B max_seq][4B magic][2B version]
-    // [2B flags][16B data checksum][16B index checksum][16B footer checksum].
-    assert(footer_size == 8 + 4 + 4 + 8 + 8 + 8 + 4 + 2 + 2 + 3 * checksum_size);
+    // [8B num_entries][8B min_seq][8B max_seq][4B bloom_length][4B magic]
+    // [2B version][2B flags][16B data checksum][16B index checksum]
+    // [16B bloom checksum][16B footer checksum]. The bloom filter section sits
+    // between the index and the footer: [data][index][bloom][footer].
+    assert(footer_size == 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 2 + 2 + 4 * checksum_size);
     assert(block_size_target > 0);
 }
 
@@ -60,8 +63,10 @@ pub const Footer = struct {
     num_entries: u64,
     min_seq: u64,
     max_seq: u64,
+    bloom_length: u32,
     data_checksum: [checksum_size]u8,
     index_checksum: [checksum_size]u8,
+    bloom_checksum: [checksum_size]u8,
 };
 
 pub const SSTInfo = struct {
@@ -118,6 +123,10 @@ pub const StreamingWriter = struct {
     finished: bool,
     data_hash: std.crypto.hash.Blake3,
     fault_injector: ?*FaultInjector,
+    bloom_enabled: bool,
+    bloom_params: bloom.Params,
+    bloom_bits: []u8,
+    bloom_serialize_scratch: []u8,
 
     pub fn init(
         path: []const u8,
@@ -178,7 +187,31 @@ pub const StreamingWriter = struct {
             .finished = false,
             .data_hash = std.crypto.hash.Blake3.init(.{}),
             .fault_injector = null,
+            .bloom_enabled = false,
+            .bloom_params = .{ .bits = 0, .hashes = 0 },
+            .bloom_bits = &.{},
+            .bloom_serialize_scratch = &.{},
         };
+    }
+
+    /// Opt in to writing a Bloom filter over the table's keys. `bit_scratch`
+    /// must hold `params.byte_len()` bytes and `serialize_scratch` at least
+    /// `bloom.serialized_size_max(params)`; both belong to the caller and stay
+    /// borrowed until `finish`. Call before the first `append`.
+    pub fn enable_bloom(
+        self: *StreamingWriter,
+        params: bloom.Params,
+        bit_scratch: []u8,
+        serialize_scratch: []u8,
+    ) void {
+        assert(self.entry_count == 0);
+        assert(bit_scratch.len >= params.byte_len());
+        assert(serialize_scratch.len >= bloom.serialized_size_max(params));
+        @memset(bit_scratch[0..params.byte_len()], 0);
+        self.bloom_enabled = true;
+        self.bloom_params = params;
+        self.bloom_bits = bit_scratch[0..params.byte_len()];
+        self.bloom_serialize_scratch = serialize_scratch;
     }
 
     pub fn abort(self: *StreamingWriter) void {
@@ -252,6 +285,7 @@ pub const StreamingWriter = struct {
         }
         self.max_key_length = try limits.byte_count(entry.key.len);
         @memcpy(self.max_key[0..entry.key.len], entry.key);
+        if (self.bloom_enabled) bloom.insert(self.bloom_bits, self.bloom_params, entry.key);
         self.entry_count += 1;
         self.data_size += entry_size;
         self.block_size += entry_size;
@@ -288,6 +322,25 @@ pub const StreamingWriter = struct {
             self.data_size,
         );
         try self.inject_fault(.after_index_write);
+
+        // The Bloom filter section sits between the index and the footer.
+        var bloom_length: u32 = 0;
+        var bloom_checksum: [checksum_size]u8 = @splat(0);
+        if (self.bloom_enabled) {
+            const encoded = try bloom.serialize(
+                self.bloom_bits,
+                self.bloom_params,
+                self.bloom_serialize_scratch,
+            );
+            try self.file.writePositionalAll(
+                self.io,
+                encoded,
+                self.data_size + self.index_size,
+            );
+            bloom_length = @intCast(encoded.len);
+            bloom_checksum = checksum_bytes(encoded);
+        }
+
         const footer = Footer{
             .index_offset = self.data_size,
             .index_size = self.index_size,
@@ -295,8 +348,10 @@ pub const StreamingWriter = struct {
             .num_entries = self.entry_count,
             .min_seq = if (self.entry_count == 0) 0 else self.min_sequence,
             .max_seq = self.max_sequence,
+            .bloom_length = bloom_length,
             .data_checksum = checksum_final(self.data_hash),
             .index_checksum = checksum_bytes(self.index_scratch[0..self.index_size]),
+            .bloom_checksum = bloom_checksum,
         };
         try write_footer(self.file, self.io, footer);
         try self.inject_fault(.after_footer_write);
@@ -344,15 +399,27 @@ fn write_footer(file: IoFile, io: Io, footer: Footer) !void {
     std.mem.writeInt(u64, footer_buf[16..24], footer.num_entries, .little);
     std.mem.writeInt(u64, footer_buf[24..32], footer.min_seq, .little);
     std.mem.writeInt(u64, footer_buf[32..40], footer.max_seq, .little);
-    std.mem.writeInt(u32, footer_buf[40..44], magic_number, .little);
-    std.mem.writeInt(u16, footer_buf[44..46], format_version, .little);
-    std.mem.writeInt(u16, footer_buf[46..48], 0, .little);
-    @memcpy(footer_buf[48..64], &footer.data_checksum);
-    @memcpy(footer_buf[64..80], &footer.index_checksum);
-    const checksum = checksum_bytes(footer_buf[0..80]);
-    @memcpy(footer_buf[80..96], &checksum);
-    try file.writePositionalAll(io, &footer_buf, footer.index_offset + footer.index_size);
+    std.mem.writeInt(u32, footer_buf[40..44], footer.bloom_length, .little);
+    std.mem.writeInt(u32, footer_buf[44..48], magic_number, .little);
+    std.mem.writeInt(u16, footer_buf[48..50], format_version, .little);
+    std.mem.writeInt(u16, footer_buf[50..52], 0, .little);
+    @memcpy(footer_buf[52..68], &footer.data_checksum);
+    @memcpy(footer_buf[68..84], &footer.index_checksum);
+    @memcpy(footer_buf[84..100], &footer.bloom_checksum);
+    const checksum = checksum_bytes(footer_buf[0..100]);
+    @memcpy(footer_buf[100..116], &checksum);
+    try file.writePositionalAll(
+        io,
+        &footer_buf,
+        footer.index_offset + footer.index_size + footer.bloom_length,
+    );
 }
+
+pub const LoadedBloom = struct {
+    params: bloom.Params,
+    /// Decompressed filter bits, owned by the caller's allocator.
+    bits: []u8,
+};
 
 pub const SSTableReader = struct {
     file: IoFile,
@@ -374,17 +441,17 @@ pub const SSTableReader = struct {
         if (file_size < footer_size) return error.InvalidFormat;
         var footer_buffer: [footer_size]u8 = undefined;
         try read_exact(file, io, &footer_buffer, file_size - footer_size);
-        const footer_checksum = checksum_bytes(footer_buffer[0..80]);
+        const footer_checksum = checksum_bytes(footer_buffer[0..100]);
         if (!std.crypto.timing_safe.eql(
             [checksum_size]u8,
             footer_checksum,
-            footer_buffer[80..96].*,
+            footer_buffer[100..116].*,
         )) return error.SSTableChecksumMismatch;
-        if (std.mem.readInt(u32, footer_buffer[40..44], .little) != magic_number)
+        if (std.mem.readInt(u32, footer_buffer[44..48], .little) != magic_number)
             return error.InvalidFormat;
-        if (std.mem.readInt(u16, footer_buffer[44..46], .little) != format_version)
+        if (std.mem.readInt(u16, footer_buffer[48..50], .little) != format_version)
             return error.UnsupportedSSTableVersion;
-        if (std.mem.readInt(u16, footer_buffer[46..48], .little) != 0)
+        if (std.mem.readInt(u16, footer_buffer[50..52], .little) != 0)
             return error.InvalidFormat;
         const footer = Footer{
             .index_offset = std.mem.readInt(u64, footer_buffer[0..8], .little),
@@ -393,10 +460,13 @@ pub const SSTableReader = struct {
             .num_entries = std.mem.readInt(u64, footer_buffer[16..24], .little),
             .min_seq = std.mem.readInt(u64, footer_buffer[24..32], .little),
             .max_seq = std.mem.readInt(u64, footer_buffer[32..40], .little),
-            .data_checksum = footer_buffer[48..64].*,
-            .index_checksum = footer_buffer[64..80].*,
+            .bloom_length = std.mem.readInt(u32, footer_buffer[40..44], .little),
+            .data_checksum = footer_buffer[52..68].*,
+            .index_checksum = footer_buffer[68..84].*,
+            .bloom_checksum = footer_buffer[84..100].*,
         };
-        if (footer.index_offset + footer.index_size + footer_size != file_size)
+        if (footer.index_offset + footer.index_size + footer.bloom_length + footer_size !=
+            file_size)
             return error.InvalidFormat;
         try verify_region(file, io, 0, footer.index_offset, footer.data_checksum);
         try verify_region(
@@ -406,12 +476,42 @@ pub const SSTableReader = struct {
             footer.index_size,
             footer.index_checksum,
         );
+        if (footer.bloom_length > 0) try verify_region(
+            file,
+            io,
+            footer.index_offset + footer.index_size,
+            footer.bloom_length,
+            footer.bloom_checksum,
+        );
 
         return .{
             .file = file,
             .io = io,
             .footer = footer,
         };
+    }
+
+    /// Read and decompress the table's Bloom filter into a freshly allocated
+    /// buffer the caller owns and frees. Returns null when the table has no
+    /// filter. The section bytes were already checksum-verified at open.
+    pub fn load_bloom(
+        self: *SSTableReader,
+        allocator: std.mem.Allocator,
+    ) !?LoadedBloom {
+        if (self.footer.bloom_length == 0) return null;
+        const section = try allocator.alloc(u8, self.footer.bloom_length);
+        defer allocator.free(section);
+        try read_exact(
+            self.file,
+            self.io,
+            section,
+            self.footer.index_offset + self.footer.index_size,
+        );
+        const bits = try bloom.bits_of(section);
+        const filter = try allocator.alloc(u8, @intCast(bits / 8));
+        errdefer allocator.free(filter);
+        const decoded = try bloom.deserialize(section, filter);
+        return .{ .params = decoded.params, .bits = filter };
     }
 
     pub fn deinit(self: *SSTableReader) void {
@@ -743,6 +843,70 @@ const TestVisitContext = struct {
     }
 };
 
+test "bloom-enabled table round-trips its filter and detects corruption" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "data/test_sst_bloom.sst";
+    IoDir.cwd().deleteFile(io, path) catch {};
+    defer IoDir.cwd().deleteFile(io, path) catch {};
+
+    const data = try allocator.alloc(u8, limits.sstable_block_size_max);
+    defer allocator.free(data);
+    const index = try allocator.alloc(u8, limits.sstable_index_size_max);
+    defer allocator.free(index);
+
+    const keys = [_][]const u8{ "apple", "banana", "cherry", "date", "elderberry" };
+    const params = bloom.chooseParams(keys.len, 0.01);
+    const bloom_bits = try allocator.alloc(u8, params.byte_len());
+    defer allocator.free(bloom_bits);
+    const bloom_serialize = try allocator.alloc(u8, bloom.serialized_size_max(params));
+    defer allocator.free(bloom_serialize);
+
+    {
+        var writer = try StreamingWriter.init(path, io, data, index);
+        errdefer writer.abort();
+        writer.enable_bloom(params, bloom_bits, bloom_serialize);
+        for (keys, 0..) |key, i| {
+            var value_buffer: [64]u8 = undefined;
+            const value = try std.fmt.bufPrint(&value_buffer, "{d}|100|2|s|e||{{}}", .{i + 1});
+            try writer.append(.{ .key = key, .value = value });
+        }
+        const footer = try writer.finish();
+        try std.testing.expect(footer.bloom_length > 0);
+    }
+
+    {
+        var reader = try SSTableReader.open_uncached(path, io);
+        defer reader.deinit();
+        const loaded = (try reader.load_bloom(allocator)).?;
+        defer allocator.free(loaded.bits);
+        // Every present key must survive the filter round-trip.
+        for (keys) |key| try std.testing.expect(bloom.mayContain(loaded.bits, loaded.params, key));
+    }
+
+    // Corrupt a byte inside the Bloom section: open must fail the checksum.
+    {
+        const file = try IoDir.cwd().openFile(io, path, .{ .mode = .read_write });
+        defer file.close(io);
+        const file_size = (try file.stat(io)).size;
+        var footer_buffer: [footer_size]u8 = undefined;
+        try read_exact(file, io, &footer_buffer, file_size - footer_size);
+        const index_offset = std.mem.readInt(u64, footer_buffer[0..8], .little);
+        const index_size = std.mem.readInt(u32, footer_buffer[8..12], .little);
+        const bloom_offset = index_offset + index_size;
+        var byte: [1]u8 = undefined;
+        try read_exact(file, io, &byte, bloom_offset);
+        byte[0] +%= 1;
+        try file.writePositionalAll(io, &byte, bloom_offset);
+        try std.testing.expectError(
+            error.SSTableChecksumMismatch,
+            SSTableReader.open_uncached(path, io),
+        );
+    }
+}
+
 test "sstable write and read single entry" {
     const allocator = std.testing.allocator;
 
@@ -756,7 +920,7 @@ test "sstable write and read single entry" {
 
     const entries = [_]RawEntry{.{
         .key = "hello",
-        .value = "1|100|2|svc|evt|{}",
+        .value = "1|100|2|svc|evt||{}",
     }};
 
     const footer = try write_test_table(allocator, path, io, &entries);
@@ -786,10 +950,10 @@ test "sstable write and read multiple entries" {
     defer IoDir.cwd().deleteFile(io, path) catch {};
 
     const entries = [_]RawEntry{
-        .{ .key = "a:1", .value = "1|100|2|svc|evt|{}" },
-        .{ .key = "a:2", .value = "2|200|2|svc|evt|{}" },
-        .{ .key = "b:1", .value = "3|300|2|svc|evt|{}" },
-        .{ .key = "c:1", .value = "4|400|2|svc|evt|{}" },
+        .{ .key = "a:1", .value = "1|100|2|svc|evt||{}" },
+        .{ .key = "a:2", .value = "2|200|2|svc|evt||{}" },
+        .{ .key = "b:1", .value = "3|300|2|svc|evt||{}" },
+        .{ .key = "c:1", .value = "4|400|2|svc|evt||{}" },
     };
 
     const footer = try write_test_table(allocator, path, io, &entries);
@@ -864,8 +1028,8 @@ test "sstable contains" {
     defer IoDir.cwd().deleteFile(io, path) catch {};
 
     const entries = [_]RawEntry{
-        .{ .key = "alpha", .value = "1|0|2|s|e|{}" },
-        .{ .key = "beta", .value = "2|0|2|s|e|{}" },
+        .{ .key = "alpha", .value = "1|0|2|s|e||{}" },
+        .{ .key = "beta", .value = "2|0|2|s|e||{}" },
     };
 
     _ = try write_test_table(allocator, path, io, &entries);

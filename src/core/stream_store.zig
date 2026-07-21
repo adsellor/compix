@@ -395,6 +395,7 @@ pub const StreamStore = struct {
     stream_capacity: limits.StreamCount,
     stream_count: limits.StreamCount,
     log_position_committed: protocol.LogPosition,
+    log_position_durable: protocol.LogPosition,
     append_scratch: []u8,
     batch_scratch: []u8,
     lookup_scratch: []u8,
@@ -437,6 +438,7 @@ pub const StreamStore = struct {
             .stream_capacity = options.stream_capacity,
             .stream_count = 0,
             .log_position_committed = 0,
+            .log_position_durable = 0,
             .append_scratch = append_scratch,
             .batch_scratch = batch_scratch,
             .lookup_scratch = lookup_scratch,
@@ -444,6 +446,7 @@ pub const StreamStore = struct {
             .fault_injector = null,
         };
         try target.rebuild_heads();
+        target.log_position_durable = target.log_position_committed;
         return target;
     }
 
@@ -562,7 +565,7 @@ pub const StreamStore = struct {
             .streams_max = self.stream_capacity,
             .stream_id_bytes_used = self.stream_ids.used,
             .stream_id_bytes_max = self.stream_ids.capacity(),
-            .committed_log_position = self.log_position_committed,
+            .committed_log_position = self.log_position_durable,
             .poisoned = self.poisoned,
         };
     }
@@ -651,6 +654,23 @@ pub const StreamStore = struct {
         request: protocol.AppendStream,
         timestamp: limits.Timestamp,
     ) !protocol.AppendStreamResponse {
+        return self.append_internal(request, timestamp, true);
+    }
+
+    pub fn stage_append(
+        self: *StreamStore,
+        request: protocol.AppendStream,
+        timestamp: limits.Timestamp,
+    ) !protocol.AppendStreamResponse {
+        return self.append_internal(request, timestamp, false);
+    }
+
+    fn append_internal(
+        self: *StreamStore,
+        request: protocol.AppendStream,
+        timestamp: limits.Timestamp,
+        sync_now: bool,
+    ) !protocol.AppendStreamResponse {
         if (self.poisoned) return error.StorePoisoned;
         try protocol.validate_append(request);
         const digest = request_hash(request);
@@ -689,7 +709,24 @@ pub const StreamStore = struct {
         self.log_position_committed = log_last;
         assert(try self.stream_version(request.stream_id) == stream_last);
         assert(self.log_position_committed == log_last);
+        if (sync_now) try self.durable_sync();
         return .{ .committed = result };
+    }
+
+    pub fn durable_sync(self: *StreamStore) !void {
+        if (self.fault_injector) |injector| injector.boundary(true) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
+        self.lsm.sync() catch |err| {
+            self.poisoned = true;
+            return err;
+        };
+        if (self.fault_injector) |injector| injector.boundary(false) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
+        self.log_position_durable = self.log_position_committed;
     }
 
     fn commit(
@@ -750,9 +787,6 @@ pub const StreamStore = struct {
             timestamp,
             batch_event_type,
         );
-        if (self.fault_injector) |injector| try injector.boundary(true);
-        try self.lsm.sync();
-        if (self.fault_injector) |injector| try injector.boundary(false);
     }
 
     fn put_meta(
@@ -822,6 +856,7 @@ pub const StreamStore = struct {
             request.from_version,
             request.max_count,
             head,
+            self.log_position_durable,
             output,
             output_bytes,
         );
@@ -839,7 +874,8 @@ pub const StreamStore = struct {
             null,
             request.from_position,
             request.max_count,
-            self.log_position_committed,
+            self.log_position_durable,
+            self.log_position_durable,
             output,
             output_bytes,
         );
@@ -857,6 +893,7 @@ pub const StreamStore = struct {
         from_cursor: u64,
         count_max_request: limits.EventCount,
         head: u64,
+        durable_max: u64,
         output: []protocol.ReadEvent,
         output_bytes: []u8,
     ) !ReadPage {
@@ -886,6 +923,7 @@ pub const StreamStore = struct {
                 stream_id,
                 &cursor,
                 count_max,
+                durable_max,
                 output,
                 &count,
                 &arena,
@@ -929,6 +967,7 @@ fn append_batch_events(
     stream_filter: ?[]const u8,
     cursor: *u64,
     count_max: limits.EventCount,
+    durable_max: u64,
     output: []protocol.ReadEvent,
     count: *limits.EventCount,
     arena: *fixed.ByteArena,
@@ -945,6 +984,7 @@ fn append_batch_events(
         if (count.* == count_max) return false;
         const stream_version = decoder.result.stream_version_first + event_index;
         const log_position = decoder.result.log_position_first + event_index;
+        if (log_position > durable_max) return false;
         const expected_cursor = if (stream_filter) |_| stream_version else log_position;
         if (cursor.* != expected_cursor) return error.CorruptStreamData;
         const event_wire_size = try read_event_wire_size(decoder.*, batch_event);
@@ -1390,4 +1430,60 @@ test "bounded stream and ordered log reads survive restart" {
     try std.testing.expectEqualStrings("request", log_page.events[0].payload);
     try std.testing.expectEqualStrings("plan", log_page.events[1].payload);
     try std.testing.expectEqual(@as(u64, 3), log_page.next_position);
+}
+
+test "staged appends stay invisible to reads until durable_sync" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const stem = "test_stream_staged_durability";
+    delete_test_files(io, stem);
+    defer delete_test_files(io, stem);
+    var lsm = try LSMEngine.init(allocator, "data/test_stream_staged_durability.wal", io);
+    defer lsm.deinit();
+    var streams = try StreamStore.init(allocator, &lsm, .{
+        .stream_capacity = limits.stream_capacity_test_default,
+        .stream_id_bytes_capacity = limits.stream_id_bytes_capacity_test_default,
+    });
+    defer streams.deinit();
+
+    const events = [_]protocol.AppendEvent{.{
+        .event_type = "source.generation.requested",
+        .schema_version = 1,
+        .payload = "staged",
+    }};
+    const request: protocol.AppendStream = .{
+        .stream_id = "source-generation/staged",
+        .expected_version = .empty,
+        .command_id = "staged-1",
+        .events = &events,
+    };
+    _ = try expect_committed(try streams.stage_append(request, 100));
+
+    var output: [protocol.read_events_max]protocol.ReadEvent = undefined;
+    var output_bytes: [4096]u8 = undefined;
+
+    const staged_log = try streams.read_log(.{ .from_position = 1, .max_count = 0 }, &output, &output_bytes);
+    try std.testing.expectEqual(@as(usize, 0), staged_log.events.len);
+    const staged_stream = try streams.read_stream(.{
+        .stream_id = "source-generation/staged",
+        .from_version = 0,
+        .max_count = 0,
+    }, &output, &output_bytes);
+    try std.testing.expectEqual(@as(usize, 0), staged_stream.events.len);
+    try std.testing.expectEqual(@as(u64, 0), streams.metrics().committed_log_position);
+
+    try streams.durable_sync();
+
+    const durable_log = try streams.read_log(.{ .from_position = 1, .max_count = 0 }, &output, &output_bytes);
+    try std.testing.expectEqual(@as(usize, 1), durable_log.events.len);
+    try std.testing.expectEqualStrings("staged", durable_log.events[0].payload);
+    const durable_stream = try streams.read_stream(.{
+        .stream_id = "source-generation/staged",
+        .from_version = 0,
+        .max_count = 0,
+    }, &output, &output_bytes);
+    try std.testing.expectEqual(@as(usize, 1), durable_stream.events.len);
+    try std.testing.expectEqual(@as(u64, 1), streams.metrics().committed_log_position);
 }

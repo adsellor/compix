@@ -63,18 +63,6 @@ pub fn build(b: *std.Build) void {
     check_backup.step.dependOn(&verify_command.step);
     test_step.dependOn(&check_backup.step);
 
-    const cluster_process = b.addExecutable(.{
-        .name = "cluster-process-test",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cluster_process_test.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_cluster_process = b.addRunArtifact(cluster_process);
-    run_cluster_process.addArtifactArg(exe);
-    test_step.dependOn(&run_cluster_process.step);
-
     const bench_exe = b.addExecutable(.{
         .name = "bench",
         .root_module = b.createModule(.{

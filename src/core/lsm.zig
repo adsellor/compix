@@ -11,6 +11,7 @@ const Memtable = memtable_mod.Memtable;
 const sstable = @import("sstable.zig");
 const SSTableReader = sstable.SSTableReader;
 const SSTInfo = sstable.SSTInfo;
+const bloom = @import("bloom.zig");
 
 const manifest_mod = @import("manifest.zig");
 const Manifest = manifest_mod.Manifest;
@@ -28,6 +29,11 @@ const limits = @import("limits.zig");
 
 const flush_bytes_max: u64 = limits.memtable_bytes_max;
 const flush_count_max: u32 = limits.memtable_entries_max;
+const flush_high_water_bytes: u64 = flush_bytes_max / 2;
+const flush_high_water_count: u32 = flush_count_max / 2;
+// Per event: a log index, a stream index, and a signed evt: entry for pull
+// serving; plus the command index and the batch record per transaction.
+const transaction_entries_max: u32 = 3 * @as(u32, limits.append_events_max) + 2;
 const compaction_trigger_l0: u32 = 4;
 const orphan_candidates_max: u16 = 4096;
 
@@ -35,6 +41,8 @@ comptime {
     assert(flush_bytes_max > 0);
     assert(flush_count_max > 0);
     assert(compaction_trigger_l0 >= 2);
+    assert(flush_count_max - flush_high_water_count > transaction_entries_max);
+    assert(flush_bytes_max - flush_high_water_bytes > limits.payload_size_max + 2 * 1024 * 1024);
 }
 
 pub const FaultPoint = enum {
@@ -75,7 +83,100 @@ const CachedTable = struct {
     id: u64,
     level: u32,
     reader: SSTableReader,
+    /// Decompressed Bloom filter over this table's keys, or empty when the
+    /// table predates filters. Owned by the LSM allocator.
+    bloom_bits: []u8,
+    bloom_params: bloom.Params,
+
+    /// True if this table definitely does not contain `key` (skip probing it).
+    fn definitely_absent(self: *const CachedTable, key: []const u8) bool {
+        if (self.bloom_bits.len == 0) return false;
+        return !bloom.mayContain(self.bloom_bits, self.bloom_params, key);
+    }
 };
+
+/// Transient buffers for building a table's Bloom filter, sized from an upper
+/// bound on the entry count. The filter is over-provisioned when the actual
+/// count is lower, which only lowers the false-positive rate.
+const BloomScratch = struct {
+    params: bloom.Params,
+    bits: []u8,
+    serialize: []u8,
+
+    fn init(allocator: std.mem.Allocator, entry_upper_bound: u64) !BloomScratch {
+        const params = bloom.chooseParams(
+            entry_upper_bound,
+            bloom.target_false_positive_default,
+        );
+        const bits = try allocator.alloc(u8, params.byte_len());
+        errdefer allocator.free(bits);
+        const serialize = try allocator.alloc(u8, bloom.serialized_size_max(params));
+        return .{ .params = params, .bits = bits, .serialize = serialize };
+    }
+
+    fn enable(self: *BloomScratch, writer: *sstable.StreamingWriter) void {
+        writer.enable_bloom(self.params, self.bits, self.serialize);
+    }
+
+    fn deinit(self: *BloomScratch, allocator: std.mem.Allocator) void {
+        allocator.free(self.bits);
+        allocator.free(self.serialize);
+    }
+};
+
+const FlushResult = struct {
+    id: u64,
+    level: u32,
+    num_entries: u64,
+    min_seq: u64,
+    max_seq: u64,
+    file_size: u64,
+    min_key_buffer: [limits.key_length_max]u8,
+    min_key_length: limits.ByteCount,
+    max_key_buffer: [limits.key_length_max]u8,
+    max_key_length: limits.ByteCount,
+
+    fn min_key(self: *const FlushResult) []const u8 {
+        return self.min_key_buffer[0..self.min_key_length];
+    }
+
+    fn max_key(self: *const FlushResult) []const u8 {
+        return self.max_key_buffer[0..self.max_key_length];
+    }
+};
+
+const CompactionPlan = struct {
+    level: u32,
+    new_level: u32,
+    new_id: u64,
+    ids: [limits.compaction_fan_in_max]u64,
+    count: limits.SSTableCount,
+};
+
+fn make_flush_result(
+    id: u64,
+    level: u32,
+    footer: anytype,
+    file_size: u64,
+    min_key: []const u8,
+    max_key: []const u8,
+) FlushResult {
+    var result = FlushResult{
+        .id = id,
+        .level = level,
+        .num_entries = footer.num_entries,
+        .min_seq = footer.min_seq,
+        .max_seq = footer.max_seq,
+        .file_size = file_size,
+        .min_key_buffer = undefined,
+        .min_key_length = @intCast(min_key.len),
+        .max_key_buffer = undefined,
+        .max_key_length = @intCast(max_key.len),
+    };
+    @memcpy(result.min_key_buffer[0..min_key.len], min_key);
+    @memcpy(result.max_key_buffer[0..max_key.len], max_key);
+    return result;
+}
 
 const ScanSource = struct {
     cursor: u64,
@@ -94,6 +195,7 @@ const ScanSource = struct {
 const StartupMemory = struct {
     read_scratch: []u8,
     event_scratch: []u8,
+    flush_event_scratch: []u8,
     sst_data_scratch: []u8,
     sst_index_scratch: []u8,
     compaction_sources: []FixedMergeSource,
@@ -107,6 +209,8 @@ const StartupMemory = struct {
         errdefer allocator.free(read_scratch);
         const event_scratch = try allocator.alloc(u8, limits.event_serialized_size_max);
         errdefer allocator.free(event_scratch);
+        const flush_event_scratch = try allocator.alloc(u8, limits.event_serialized_size_max);
+        errdefer allocator.free(flush_event_scratch);
         const sst_data_scratch = try allocator.alloc(u8, limits.sstable_block_size_max);
         errdefer allocator.free(sst_data_scratch);
         const sst_index_scratch = try allocator.alloc(u8, limits.sstable_index_size_max);
@@ -130,6 +234,7 @@ const StartupMemory = struct {
         return .{
             .read_scratch = read_scratch,
             .event_scratch = event_scratch,
+            .flush_event_scratch = flush_event_scratch,
             .sst_data_scratch = sst_data_scratch,
             .sst_index_scratch = sst_index_scratch,
             .compaction_sources = compaction_sources,
@@ -143,6 +248,7 @@ const StartupMemory = struct {
     fn deinit(self: StartupMemory, allocator: std.mem.Allocator) void {
         allocator.free(self.read_scratch);
         allocator.free(self.event_scratch);
+        allocator.free(self.flush_event_scratch);
         allocator.free(self.sst_data_scratch);
         allocator.free(self.sst_index_scratch);
         allocator.free(self.compaction_sources);
@@ -158,6 +264,11 @@ pub const LSMEngine = struct {
     io: Io,
     wal: *WriteAheadLog,
     active_memtable: *Memtable,
+    flushing_memtable: *Memtable,
+    flush_pending: bool,
+    flushing_sst_id: u64,
+    pending_flush: ?FlushResult,
+    background_flush: bool,
     manifest: *Manifest,
     tables: fixed.List(CachedTable),
     table_storage: []CachedTable,
@@ -167,6 +278,7 @@ pub const LSMEngine = struct {
     next_sst_id: u64,
     read_scratch: []u8,
     event_scratch: []u8,
+    flush_event_scratch: []u8,
     sst_data_scratch: []u8,
     sst_index_scratch: []u8,
     compaction_sources: []FixedMergeSource,
@@ -217,16 +329,24 @@ pub const LSMEngine = struct {
         mt_ptr.* = try Memtable.init(allocator);
         errdefer mt_ptr.deinit();
 
+        const flushing_mt_ptr = try allocator.create(Memtable);
+        errdefer allocator.destroy(flushing_mt_ptr);
+        flushing_mt_ptr.* = try Memtable.init(allocator);
+        errdefer flushing_mt_ptr.deinit();
+
         const memory = try StartupMemory.init(allocator);
         errdefer memory.deinit(allocator);
-
-        _ = try wal_ptr.replay(mt_ptr);
 
         var self = LSMEngine{
             .allocator = allocator,
             .io = io,
             .wal = wal_ptr,
             .active_memtable = mt_ptr,
+            .flushing_memtable = flushing_mt_ptr,
+            .flush_pending = false,
+            .flushing_sst_id = 0,
+            .pending_flush = null,
+            .background_flush = false,
             .manifest = manifest_ptr,
             .tables = try fixed.List(CachedTable).init(memory.table_storage),
             .table_storage = memory.table_storage,
@@ -236,6 +356,7 @@ pub const LSMEngine = struct {
             .next_sst_id = next_id,
             .read_scratch = memory.read_scratch,
             .event_scratch = memory.event_scratch,
+            .flush_event_scratch = memory.flush_event_scratch,
             .sst_data_scratch = memory.sst_data_scratch,
             .sst_index_scratch = memory.sst_index_scratch,
             .compaction_sources = memory.compaction_sources,
@@ -253,6 +374,21 @@ pub const LSMEngine = struct {
         }
 
         assert(self.tables.count == self.manifest.live.count);
+
+        if (try self.wal.flushing_exists()) {
+            try self.wal.replay_flushing(self.active_memtable);
+            if (self.active_memtable.count() > 0) {
+                const sst_id = self.next_sst_id;
+                self.next_sst_id += 1;
+                const result = try self.materialize_table(self.active_memtable, sst_id);
+                try self.publish_table(result);
+            }
+            try self.wal.retire_flushing();
+            self.active_memtable.reset();
+        }
+
+        _ = try self.wal.replay(self.active_memtable);
+
         return self;
     }
 
@@ -260,12 +396,15 @@ pub const LSMEngine = struct {
         self.close_tables();
         self.active_memtable.deinit();
         self.allocator.destroy(self.active_memtable);
+        self.flushing_memtable.deinit();
+        self.allocator.destroy(self.flushing_memtable);
         self.wal.deinit();
         self.allocator.destroy(self.wal);
         self.manifest.deinit();
         self.allocator.destroy(self.manifest);
         self.allocator.free(self.read_scratch);
         self.allocator.free(self.event_scratch);
+        self.allocator.free(self.flush_event_scratch);
         self.allocator.free(self.sst_data_scratch);
         self.allocator.free(self.sst_index_scratch);
         self.allocator.free(self.compaction_sources);
@@ -279,6 +418,7 @@ pub const LSMEngine = struct {
 
     fn close_tables(self: *LSMEngine) void {
         for (self.tables.items()) |*t| {
+            self.allocator.free(t.bloom_bits);
             t.reader.deinit();
         }
         self.tables.reset();
@@ -293,6 +433,8 @@ pub const LSMEngine = struct {
         const path = try self.sst_path_into(&path_buffer, level, id);
         var reader = try SSTableReader.open_uncached(path, self.io);
         errdefer reader.deinit();
+        const loaded = try reader.load_bloom(self.allocator);
+        errdefer if (loaded) |l| self.allocator.free(l.bits);
 
         var insert_at: limits.SSTableIndex = @intCast(self.tables.count);
         for (self.tables.items_const(), 0..) |t, i| {
@@ -306,6 +448,8 @@ pub const LSMEngine = struct {
             .id = id,
             .level = level,
             .reader = reader,
+            .bloom_bits = if (loaded) |l| l.bits else &.{},
+            .bloom_params = if (loaded) |l| l.params else .{ .bits = 0, .hashes = 0 },
         }) catch unreachable;
     }
 
@@ -313,6 +457,7 @@ pub const LSMEngine = struct {
         for (self.tables.items_const(), 0..) |t, i| {
             if (t.id == id) {
                 var removed = self.tables.ordered_remove(@intCast(i));
+                self.allocator.free(removed.bloom_bits);
                 removed.reader.deinit();
                 return;
             }
@@ -323,12 +468,20 @@ pub const LSMEngine = struct {
     pub fn put(self: *LSMEngine, key: []const u8, value: EventValue) !void {
         assert(key.len > 0);
 
-        // Flush before insertion so no fallible operation follows the pool copy.
-        if (self.active_memtable.size_bytes >= flush_bytes_max) try self.flush();
-        if (self.active_memtable.count() >= flush_count_max) try self.flush();
-        if (!self.active_memtable.can_insert(key, &value)) try self.flush();
-        if (!self.active_memtable.can_insert(key, &value)) {
-            return error.EventExceedsMemtableCapacity;
+        if (self.background_flush) {
+            // The server freezes and reserves room before staging a transaction,
+            // so a background-mode put never flushes on the append path.
+            if (!self.active_memtable.can_insert(key, &value)) {
+                return error.EventExceedsMemtableCapacity;
+            }
+        } else {
+            // Flush before insertion so no fallible operation follows the pool copy.
+            if (self.active_memtable.size_bytes >= flush_bytes_max) try self.flush();
+            if (self.active_memtable.count() >= flush_count_max) try self.flush();
+            if (!self.active_memtable.can_insert(key, &value)) try self.flush();
+            if (!self.active_memtable.can_insert(key, &value)) {
+                return error.EventExceedsMemtableCapacity;
+            }
         }
 
         try self.wal.append_event(key, value);
@@ -351,7 +504,11 @@ pub const LSMEngine = struct {
         if (self.active_memtable.get_ptr(key)) |value| {
             return try copy_event_bounded(&arena, value.*);
         }
+        if (self.flushing_memtable.get_ptr(key)) |value| {
+            return try copy_event_bounded(&arena, value.*);
+        }
         for (self.tables.items()) |*table| {
+            if (table.definitely_absent(key)) continue;
             if (try table.reader.get_into(key, self.read_scratch)) |value| {
                 return try copy_event_bounded(&arena, value);
             }
@@ -361,18 +518,21 @@ pub const LSMEngine = struct {
 
     fn copy_event_bounded(arena: *fixed.ByteArena, value: EventValue) !EventValue {
         const bytes_required = try limits.byte_count(
-            value.origin_service.len + value.event_type.len + value.payload.len,
+            value.origin_service.len + value.event_type.len + value.payload.len +
+                value.signature.len,
         );
         if (bytes_required > arena.remaining()) return error.ResultBufferTooSmall;
         const origin = arena.write(value.origin_service) catch unreachable;
         const event_type = arena.write(value.event_type) catch unreachable;
         const payload = arena.write(value.payload) catch unreachable;
+        const signature = arena.write(value.signature) catch unreachable;
         return .{
             .sequence = value.sequence,
             .event_type = event_type,
             .payload = payload,
             .timestamp = value.timestamp,
             .origin_service = origin,
+            .signature = signature,
         };
     }
 
@@ -380,8 +540,10 @@ pub const LSMEngine = struct {
         assert(key.len > 0);
 
         if (self.active_memtable.contains(key)) return true;
+        if (self.flushing_memtable.contains(key)) return true;
 
         for (self.tables.items()) |*t| {
+            if (t.definitely_absent(key)) continue;
             if (try t.reader.contains_into(key, self.read_scratch)) return true;
         }
 
@@ -395,11 +557,18 @@ pub const LSMEngine = struct {
         comptime visit: anytype,
     ) !event.VisitControl {
         try self.initialize_scan_sources();
-        var memtable_iterator = self.active_memtable.iterator();
-        var memtable_entry = memtable_iterator.next();
+        var active_iterator = self.active_memtable.iterator();
+        var active_entry = active_iterator.next();
+        var flushing_iterator = self.flushing_memtable.iterator();
+        var flushing_entry = flushing_iterator.next();
         var key_storage: [limits.key_length_max]u8 = undefined;
         while (true) {
-            var minimum: ?[]const u8 = if (memtable_entry) |entry| entry.key else null;
+            var minimum: ?[]const u8 = null;
+            if (active_entry) |entry| minimum = entry.key;
+            if (flushing_entry) |entry| {
+                if (minimum == null or std.mem.order(u8, entry.key, minimum.?) == .lt)
+                    minimum = entry.key;
+            }
             for (self.scan_sources[0..self.tables.count]) |*source| {
                 if (!source.current) continue;
                 const key = source.current_key();
@@ -414,14 +583,22 @@ pub const LSMEngine = struct {
                 return .continue_scan;
 
             if (std.mem.startsWith(u8, key, prefix)) {
-                const value = if (memtable_entry) |entry|
-                    if (std.mem.eql(u8, entry.key, key)) entry.value else try self.scan_value(key)
-                else
-                    try self.scan_value(key);
+                const value = value_blk: {
+                    if (active_entry) |entry| {
+                        if (std.mem.eql(u8, entry.key, key)) break :value_blk entry.value;
+                    }
+                    if (flushing_entry) |entry| {
+                        if (std.mem.eql(u8, entry.key, key)) break :value_blk entry.value;
+                    }
+                    break :value_blk try self.scan_value(key);
+                };
                 if (try visit(context, key, value) == .stop) return .stop;
             }
-            if (memtable_entry) |entry| {
-                if (std.mem.eql(u8, entry.key, key)) memtable_entry = memtable_iterator.next();
+            if (active_entry) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) active_entry = active_iterator.next();
+            }
+            if (flushing_entry) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) flushing_entry = flushing_iterator.next();
             }
             for (self.scan_sources[0..self.tables.count], 0..) |*source, index| {
                 if (source.current and std.mem.eql(u8, source.current_key(), key))
@@ -508,47 +685,14 @@ pub const LSMEngine = struct {
     pub fn flush(self: *LSMEngine) !void {
         if (self.active_memtable.count() == 0) return;
         const tables_before = self.tables.count;
-
-        const frozen = self.active_memtable;
-
         const sst_id = self.next_sst_id;
         self.next_sst_id += 1;
-
-        var path_buffer: [limits.wal_path_length_max + 64]u8 = undefined;
-        const path = try self.sst_path_into(&path_buffer, 0, sst_id);
-        var writer = try sstable.StreamingWriter.init(
-            path,
-            self.io,
-            self.sst_data_scratch,
-            self.sst_index_scratch,
-        );
-        errdefer writer.abort();
-        var iter = frozen.iterator();
-        while (iter.next()) |entry| {
-            const serialized = try entry.value.serialize_into(self.event_scratch);
-            try writer.append(.{ .key = entry.key, .value = serialized });
-        }
-        const footer = try writer.finish();
-        try self.inject_fault(.flush_after_sstable_publish);
-        assert(footer.num_entries == frozen.count());
-        const file_size = footer.index_offset + footer.index_size + sstable.footer_size;
-        try self.manifest.add_sstable(.{
-            .id = sst_id,
-            .level = 0,
-            .min_key = writer.minimum_key(),
-            .max_key = writer.maximum_key(),
-            .num_entries = footer.num_entries,
-            .min_seq = footer.min_seq,
-            .max_seq = footer.max_seq,
-            .file_size = file_size,
-        });
-        try self.inject_fault(.flush_after_manifest_publish);
-        try self.open_table(0, sst_id);
-        try self.inject_fault(.flush_after_cache_publish);
+        const result = try self.materialize_table(self.active_memtable, sst_id);
+        try self.publish_table(result);
         try self.wal.truncate();
         try self.inject_fault(.flush_after_wal_retire);
 
-        frozen.reset();
+        self.active_memtable.reset();
 
         assert(self.active_memtable.count() == 0);
         assert(self.tables.count == tables_before + 1);
@@ -563,6 +707,109 @@ pub const LSMEngine = struct {
             };
             self.compaction_active = false;
         }
+    }
+
+    fn materialize_table(
+        self: *LSMEngine,
+        memtable: *Memtable,
+        sst_id: u64,
+    ) !FlushResult {
+        var path_buffer: [limits.wal_path_length_max + 64]u8 = undefined;
+        const path = try self.sst_path_into(&path_buffer, 0, sst_id);
+        var writer = try sstable.StreamingWriter.init(
+            path,
+            self.io,
+            self.sst_data_scratch,
+            self.sst_index_scratch,
+        );
+        errdefer writer.abort();
+        var bloom_scratch = try BloomScratch.init(self.allocator, memtable.count());
+        defer bloom_scratch.deinit(self.allocator);
+        bloom_scratch.enable(&writer);
+        var iter = memtable.iterator();
+        while (iter.next()) |entry| {
+            const serialized = try entry.value.serialize_into(self.flush_event_scratch);
+            try writer.append(.{ .key = entry.key, .value = serialized });
+        }
+        const footer = try writer.finish();
+        try self.inject_fault(.flush_after_sstable_publish);
+        assert(footer.num_entries == memtable.count());
+        const file_size = footer.index_offset + footer.index_size +
+            footer.bloom_length + sstable.footer_size;
+        return make_flush_result(
+            sst_id,
+            0,
+            footer,
+            file_size,
+            writer.minimum_key(),
+            writer.maximum_key(),
+        );
+    }
+
+    fn publish_table(self: *LSMEngine, result: FlushResult) !void {
+        try self.manifest.add_sstable(.{
+            .id = result.id,
+            .level = result.level,
+            .min_key = result.min_key(),
+            .max_key = result.max_key(),
+            .num_entries = result.num_entries,
+            .min_seq = result.min_seq,
+            .max_seq = result.max_seq,
+            .file_size = result.file_size,
+        });
+        try self.inject_fault(.flush_after_manifest_publish);
+        try self.open_table(result.level, result.id);
+        try self.inject_fault(.flush_after_cache_publish);
+    }
+
+    pub fn enable_background_flush(self: *LSMEngine) void {
+        self.background_flush = true;
+    }
+
+    pub fn active_has_room(self: *const LSMEngine) bool {
+        return self.active_memtable.size_bytes < flush_high_water_bytes and
+            self.active_memtable.count() < flush_high_water_count;
+    }
+
+    pub fn flush_pending_now(self: *const LSMEngine) bool {
+        return self.flush_pending;
+    }
+
+    pub fn can_freeze(self: *const LSMEngine) bool {
+        return !self.flush_pending and self.active_memtable.count() > 0;
+    }
+
+    pub fn freeze(self: *LSMEngine) !void {
+        assert(!self.flush_pending);
+        assert(self.flushing_memtable.count() == 0);
+        assert(self.active_memtable.count() > 0);
+        const spare = self.flushing_memtable;
+        self.flushing_memtable = self.active_memtable;
+        self.active_memtable = spare;
+        self.flushing_sst_id = self.next_sst_id;
+        self.next_sst_id += 1;
+        try self.wal.rotate();
+        self.flush_pending = true;
+    }
+
+    pub fn flush_frozen_write(self: *LSMEngine) !void {
+        assert(self.flush_pending);
+        assert(self.pending_flush == null);
+        self.pending_flush = try self.materialize_table(
+            self.flushing_memtable,
+            self.flushing_sst_id,
+        );
+    }
+
+    pub fn flush_frozen_publish(self: *LSMEngine) !void {
+        assert(self.flush_pending);
+        const result = self.pending_flush orelse return error.NoPendingFlush;
+        try self.publish_table(result);
+        try self.wal.retire_flushing();
+        try self.inject_fault(.flush_after_wal_retire);
+        self.flushing_memtable.reset();
+        self.pending_flush = null;
+        self.flush_pending = false;
     }
 
     pub fn compact_level(self: *LSMEngine, level: u32) !void {
@@ -601,11 +848,17 @@ pub const LSMEngine = struct {
             self.sst_index_scratch,
         );
         errdefer writer.abort();
+        var entry_upper_bound: u64 = 0;
+        for (readers[0..count]) |r| entry_upper_bound += r.footer.num_entries;
+        var bloom_scratch = try BloomScratch.init(self.allocator, entry_upper_bound);
+        defer bloom_scratch.deinit(self.allocator);
+        bloom_scratch.enable(&writer);
         while (try merge.next()) |entry| try writer.append(entry);
         const footer = try writer.finish();
         try self.inject_fault(.compaction_after_sstable_publish);
         if (footer.num_entries == 0) return;
-        const file_size = footer.index_offset + footer.index_size + sstable.footer_size;
+        const file_size = footer.index_offset + footer.index_size +
+            footer.bloom_length + sstable.footer_size;
 
         try self.manifest.atomic_compaction(ids[0..count], .{
             .id = new_id,
@@ -635,6 +888,112 @@ pub const LSMEngine = struct {
         }
         try sync_parent_directory(self.base_path, self.io);
         try self.inject_fault(.compaction_after_directory_sync);
+    }
+
+    pub fn compaction_prepare(self: *LSMEngine, level: u32) ?CompactionPlan {
+        var plan = CompactionPlan{
+            .level = level,
+            .new_level = level + 1,
+            .new_id = 0,
+            .ids = undefined,
+            .count = 0,
+        };
+        for (self.tables.items()) |*t| {
+            if (t.level == level) {
+                if (plan.count == limits.compaction_fan_in_max) break;
+                plan.ids[plan.count] = t.id;
+                plan.count += 1;
+            }
+        }
+        if (plan.count < 2) return null;
+        plan.new_id = self.next_sst_id;
+        self.next_sst_id += 1;
+        self.compaction_active = true;
+        return plan;
+    }
+
+    pub fn compaction_write(self: *LSMEngine, plan: CompactionPlan) !?FlushResult {
+        var readers: [limits.compaction_fan_in_max]SSTableReader = undefined;
+        var reader_ptrs: [limits.compaction_fan_in_max]*SSTableReader = undefined;
+        var opened: usize = 0;
+        defer for (0..opened) |i| readers[i].deinit();
+        for (0..plan.count) |i| {
+            var path_buffer: [limits.wal_path_length_max + 64]u8 = undefined;
+            const path = try self.sst_path_into(&path_buffer, plan.level, plan.ids[i]);
+            readers[i] = try SSTableReader.open_uncached(path, self.io);
+            opened += 1;
+            reader_ptrs[i] = &readers[i];
+        }
+        var merge = try FixedMergeIterator.init(
+            self.compaction_sources,
+            reader_ptrs[0..plan.count],
+            plan.ids[0..plan.count],
+            self.compaction_blocks,
+            self.compaction_result,
+        );
+        var new_path_buffer: [limits.wal_path_length_max + 64]u8 = undefined;
+        const new_path = try self.sst_path_into(&new_path_buffer, plan.new_level, plan.new_id);
+        var writer = try sstable.StreamingWriter.init(
+            new_path,
+            self.io,
+            self.sst_data_scratch,
+            self.sst_index_scratch,
+        );
+        errdefer writer.abort();
+        var entry_upper_bound: u64 = 0;
+        for (0..plan.count) |i| entry_upper_bound += readers[i].footer.num_entries;
+        var bloom_scratch = try BloomScratch.init(self.allocator, entry_upper_bound);
+        defer bloom_scratch.deinit(self.allocator);
+        bloom_scratch.enable(&writer);
+        while (try merge.next()) |entry| try writer.append(entry);
+        const footer = try writer.finish();
+        try self.inject_fault(.compaction_after_sstable_publish);
+        if (footer.num_entries == 0) return null;
+        const file_size = footer.index_offset + footer.index_size +
+            footer.bloom_length + sstable.footer_size;
+        return make_flush_result(
+            plan.new_id,
+            plan.new_level,
+            footer,
+            file_size,
+            writer.minimum_key(),
+            writer.maximum_key(),
+        );
+    }
+
+    pub fn compaction_publish(
+        self: *LSMEngine,
+        plan: CompactionPlan,
+        result: FlushResult,
+    ) !void {
+        try self.manifest.atomic_compaction(plan.ids[0..plan.count], .{
+            .id = result.id,
+            .level = result.level,
+            .min_key = result.min_key(),
+            .max_key = result.max_key(),
+            .num_entries = result.num_entries,
+            .min_seq = result.min_seq,
+            .max_seq = result.max_seq,
+            .file_size = result.file_size,
+        });
+        try self.inject_fault(.compaction_after_manifest_publish);
+        for (plan.ids[0..plan.count]) |id| self.remove_table(id);
+        try self.open_table(plan.new_level, plan.new_id);
+        try self.inject_fault(.compaction_after_cache_publish);
+        for (plan.ids[0..plan.count]) |id| {
+            var old_path_buffer: [limits.wal_path_length_max + 64]u8 = undefined;
+            const old_path = try self.sst_path_into(&old_path_buffer, plan.level, id);
+            try IoDir.cwd().deleteFile(self.io, old_path);
+            try self.after_retired_table();
+        }
+        try sync_parent_directory(self.base_path, self.io);
+        try self.inject_fault(.compaction_after_directory_sync);
+        self.compaction_active = false;
+    }
+
+    pub fn compaction_abandon(self: *LSMEngine) void {
+        self.compaction_active = false;
+        self.compaction_failures += 1;
     }
 
     fn inject_fault(self: *LSMEngine, point: FaultPoint) !void {
@@ -767,7 +1126,11 @@ fn cleanup_test_lsm(allocator: std.mem.Allocator, io: Io, base: []const u8) void
     const manifest = std.fmt.allocPrint(allocator, "{s}.manifest", .{base}) catch return;
     defer allocator.free(manifest);
 
+    const flushing = std.fmt.allocPrint(allocator, "{s}.wal.flushing", .{base}) catch return;
+    defer allocator.free(flushing);
+
     IoDir.cwd().deleteFile(io, wal_path) catch {};
+    IoDir.cwd().deleteFile(io, flushing) catch {};
     IoDir.cwd().deleteFile(io, crumb) catch {};
     IoDir.cwd().deleteFile(io, manifest) catch {};
     const quarantine = std.fmt.allocPrint(allocator, "{s}.quarantine", .{base}) catch return;
@@ -784,6 +1147,59 @@ fn cleanup_test_lsm(allocator: std.mem.Allocator, io: Io, base: []const u8) void
             defer allocator.free(p);
             IoDir.cwd().deleteFile(io, p) catch {};
         }
+    }
+}
+
+test "bloom-filtered tables never miss a present key across many tables" {
+    const base = "data/test_lsm_bloom_correctness";
+    const wal_path = "data/test_lsm_bloom_correctness.wal";
+    const io = Io.Threaded.global_single_threaded.io();
+    cleanup_test_lsm(std.testing.allocator, io, base);
+    defer cleanup_test_lsm(std.testing.allocator, io, base);
+
+    var lsm = try LSMEngine.init(std.testing.allocator, wal_path, io);
+    defer lsm.deinit();
+
+    const total = 1500;
+    var seq: u64 = 0;
+    // Many small flushes produce many filtered L0 tables and trigger compaction.
+    for (0..total) |i| {
+        seq += 1;
+        var key_buffer: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "present:{d}", .{i});
+        try lsm.put(key, .{
+            .sequence = seq,
+            .event_type = "e",
+            .payload = "{}",
+            .timestamp = 1,
+            .origin_service = "svc",
+        });
+        if (i % 25 == 24) try lsm.flush();
+    }
+    try lsm.flush();
+
+    var buffer: [limits.event_serialized_size_max]u8 = undefined;
+    // Every present key must be found — a bloom false negative would fail here.
+    for (0..total) |i| {
+        var key_buffer: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "present:{d}", .{i});
+        const value = try lsm.get_bounded(key, &buffer);
+        try std.testing.expect(value != null);
+    }
+    // Absent keys exercise the skip path and must report not-found.
+    for (0..total) |i| {
+        var key_buffer: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "absent:{d}", .{i});
+        try std.testing.expect((try lsm.get_bounded(key, &buffer)) == null);
+    }
+
+    // Survives restart: filters are reloaded from disk and still correct.
+    lsm.deinit();
+    lsm = try LSMEngine.init(std.testing.allocator, wal_path, io);
+    for (0..total) |i| {
+        var key_buffer: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "present:{d}", .{i});
+        try std.testing.expect((try lsm.get_bounded(key, &buffer)) != null);
     }
 }
 
@@ -823,6 +1239,73 @@ fn scan_count(lsm: *LSMEngine, prefix: []const u8) !limits.CollectionCount {
     var context = TestScanCount{};
     _ = try lsm.visit_prefix(prefix, &context, TestScanCount.visit);
     return context.count;
+}
+
+test "background flush serves the flushing tier then publishes to a table" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const base = "data/test_lsm_bg_flush";
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
+
+    var lsm = try LSMEngine.init(allocator, "data/test_lsm_bg_flush.wal", io);
+    defer lsm.deinit();
+    lsm.enable_background_flush();
+
+    try lsm.put("k1", try test_event_value(1, "svc", "e", "a", 0));
+    try lsm.put("k2", try test_event_value(2, "svc", "e", "b", 0));
+    try lsm.sync();
+
+    try lsm.freeze();
+    try std.testing.expect(lsm.flush_pending_now());
+    try expect_sequence(&lsm, "k1", 1);
+    try expect_sequence(&lsm, "k2", 2);
+    try std.testing.expectEqual(@as(limits.CollectionCount, 2), try scan_count(&lsm, "k"));
+
+    try lsm.put("k3", try test_event_value(3, "svc", "e", "c", 0));
+    try lsm.sync();
+    try std.testing.expectEqual(@as(limits.CollectionCount, 3), try scan_count(&lsm, "k"));
+
+    try lsm.flush_frozen_write();
+    try lsm.flush_frozen_publish();
+    try std.testing.expect(!lsm.flush_pending_now());
+
+    try expect_sequence(&lsm, "k1", 1);
+    try expect_sequence(&lsm, "k3", 3);
+    try std.testing.expectEqual(@as(limits.CollectionCount, 3), try scan_count(&lsm, "k"));
+    try std.testing.expect(!try lsm.wal.flushing_exists());
+}
+
+test "startup consolidates an interrupted background flush from the flushing segment" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const base = "data/test_lsm_bg_consolidate";
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
+
+    {
+        var lsm = try LSMEngine.init(allocator, "data/test_lsm_bg_consolidate.wal", io);
+        defer lsm.deinit();
+        lsm.enable_background_flush();
+        try lsm.put("s1", try test_event_value(1, "svc", "e", "x", 0));
+        try lsm.put("s2", try test_event_value(2, "svc", "e", "y", 0));
+        try lsm.sync();
+        try lsm.freeze();
+        try lsm.put("s3", try test_event_value(3, "svc", "e", "z", 0));
+        try lsm.sync();
+    }
+
+    var lsm = try LSMEngine.init(allocator, "data/test_lsm_bg_consolidate.wal", io);
+    defer lsm.deinit();
+    try std.testing.expect(!lsm.flush_pending_now());
+    try std.testing.expect(!try lsm.wal.flushing_exists());
+    try expect_sequence(&lsm, "s1", 1);
+    try expect_sequence(&lsm, "s2", 2);
+    try expect_sequence(&lsm, "s3", 3);
 }
 
 test "lsm basic put and get" {
@@ -1186,6 +1669,158 @@ test "compaction crash boundaries preserve data and quarantine superseded tables
     }
 }
 
+fn run_background_flush_fault_recovery_case(
+    allocator: std.mem.Allocator,
+    io: Io,
+    point: FaultPoint,
+    expected_quarantine: u16,
+    case_index: usize,
+) !void {
+    var base_buffer: [96]u8 = undefined;
+    const base = try std.fmt.bufPrint(
+        &base_buffer,
+        "data/test_lsm_bg_flush_fault_{d}",
+        .{case_index},
+    );
+    var wal_buffer: [104]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&wal_buffer, "{s}.wal", .{base});
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
+
+    {
+        var lsm = try LSMEngine.init(allocator, wal_path, io);
+        defer lsm.deinit();
+        lsm.enable_background_flush();
+        for (1..5) |sequence| {
+            var key_buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "bgf:k{d}", .{sequence});
+            try lsm.put(key, try test_event_value(sequence, "svc", "evt", "{}", 0));
+        }
+        try lsm.sync();
+        try lsm.freeze();
+        for (5..8) |sequence| {
+            var key_buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "bgf:k{d}", .{sequence});
+            try lsm.put(key, try test_event_value(sequence, "svc", "evt", "{}", 0));
+        }
+        try lsm.sync();
+        var injector = FaultInjector{ .fail_at = point };
+        lsm.set_fault_injector(&injector);
+        if (point == .flush_after_sstable_publish) {
+            try std.testing.expectError(error.InjectedLSMFault, lsm.flush_frozen_write());
+        } else {
+            try lsm.flush_frozen_write();
+            try std.testing.expectError(error.InjectedLSMFault, lsm.flush_frozen_publish());
+        }
+        try std.testing.expect(injector.triggered);
+    }
+
+    {
+        var recovered = try LSMEngine.init(allocator, wal_path, io);
+        defer recovered.deinit();
+        try std.testing.expectEqual(expected_quarantine, recovered.startup_quarantine_count());
+        try std.testing.expect(!try recovered.wal.flushing_exists());
+        try std.testing.expectEqual(@as(limits.CollectionCount, 7), try scan_count(&recovered, "bgf:"));
+        for (1..8) |sequence| {
+            var key_buffer: [32]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "bgf:k{d}", .{sequence});
+            try expect_sequence(&recovered, key, sequence);
+        }
+        try recovered.put("bgf:after-restart", try test_event_value(100, "svc", "evt", "{}", 0));
+        try recovered.sync();
+        try recovered.flush();
+        try expect_sequence(&recovered, "bgf:after-restart", 100);
+    }
+}
+
+test "background flush crash boundaries recover complete data via the flushing segment" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const points = [_]FaultPoint{
+        .flush_after_sstable_publish,
+        .flush_after_manifest_publish,
+        .flush_after_cache_publish,
+        .flush_after_wal_retire,
+    };
+    const quarantine_counts = [_]u16{ 1, 0, 0, 0 };
+    for (points, quarantine_counts, 0..) |point, quarantine, case_index| {
+        try run_background_flush_fault_recovery_case(allocator, io, point, quarantine, case_index);
+    }
+}
+
+fn run_bg_compaction_fault_recovery_case(
+    allocator: std.mem.Allocator,
+    io: Io,
+    point: FaultPoint,
+    expected_quarantine: u16,
+    case_index: usize,
+) !void {
+    var base_buffer: [96]u8 = undefined;
+    const base = try std.fmt.bufPrint(
+        &base_buffer,
+        "data/test_lsm_bg_compact_fault_{d}",
+        .{case_index},
+    );
+    var wal_buffer: [104]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&wal_buffer, "{s}.wal", .{base});
+    cleanup_test_lsm(allocator, io, base);
+    defer cleanup_test_lsm(allocator, io, base);
+
+    {
+        var lsm = try LSMEngine.init(allocator, wal_path, io);
+        defer lsm.deinit();
+        for (0..3) |round| try put_compaction_round(&lsm, round);
+        var injector = FaultInjector{ .fail_at = point };
+        lsm.set_fault_injector(&injector);
+        const plan = lsm.compaction_prepare(0) orelse return error.ExpectedCompactionPlan;
+        if (point == .compaction_after_sstable_publish) {
+            try std.testing.expectError(error.InjectedLSMFault, lsm.compaction_write(plan));
+        } else {
+            const result = (try lsm.compaction_write(plan)) orelse
+                return error.ExpectedCompactionResult;
+            try std.testing.expectError(
+                error.InjectedLSMFault,
+                lsm.compaction_publish(plan, result),
+            );
+        }
+        try std.testing.expect(injector.triggered);
+    }
+
+    {
+        var recovered = try LSMEngine.init(allocator, wal_path, io);
+        defer recovered.deinit();
+        try std.testing.expectEqual(expected_quarantine, recovered.startup_quarantine_count());
+        try std.testing.expectEqual(
+            @as(limits.CollectionCount, 3),
+            try scan_count(&recovered, "compact-fault:"),
+        );
+        try expect_sequence(&recovered, "compact-fault:k2", 23);
+        try recovered.put("compact-fault:after-restart", try test_event_value(100, "svc", "evt", "{}", 0));
+        try recovered.sync();
+        try recovered.flush();
+        try expect_sequence(&recovered, "compact-fault:after-restart", 100);
+    }
+}
+
+test "background compaction crash boundaries preserve data and quarantine orphans" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const points = [_]FaultPoint{
+        .compaction_after_sstable_publish,
+        .compaction_after_manifest_publish,
+        .compaction_after_cache_publish,
+        .compaction_after_directory_sync,
+    };
+    const quarantine_counts = [_]u16{ 1, 3, 3, 0 };
+    for (points, quarantine_counts, 0..) |point, quarantine, case_index| {
+        try run_bg_compaction_fault_recovery_case(allocator, io, point, quarantine, case_index);
+    }
+}
+
 test "lsm compaction merges L0 tables and reads survive" {
     const allocator = std.testing.allocator;
 
@@ -1218,7 +1853,11 @@ test "lsm compaction merges L0 tables and reads survive" {
     try std.testing.expectEqual(@as(limits.CollectionCount, 5), try scan_count(&lsm, "c:"));
 }
 
-test "storage operations allocate nothing after initialization" {
+test "read operations allocate nothing after initialization" {
+    // Bloom filters need per-table memory proportional to table size, so
+    // flush/compaction/table-open allocate bounded filter buffers (freed on
+    // table removal). The read path — get_bounded and visit_prefix — must still
+    // allocate nothing, using only preallocated scratch and resident filters.
     const base = "data/test_lsm_no_post_init_alloc";
     const wal_path = "data/test_lsm_no_post_init_alloc.wal";
     const io = Io.Threaded.global_single_threaded.io();
@@ -1229,9 +1868,6 @@ test "storage operations allocate nothing after initialization" {
     const allocator = failing.allocator();
     var lsm = try LSMEngine.init(allocator, wal_path, io);
     defer lsm.deinit();
-
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
 
     for (0..4) |round| {
         for (0..8) |entry_index| {
@@ -1252,6 +1888,10 @@ test "storage operations allocate nothing after initialization" {
         try lsm.sync();
         try lsm.flush();
     }
+
+    // Tables (and their filters) are built; the read path below must not allocate.
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
 
     var result_buffer: [limits.event_serialized_size_max]u8 = undefined;
     const found = try lsm.get_bounded("fixed:3:7", &result_buffer);

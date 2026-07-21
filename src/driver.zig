@@ -324,13 +324,8 @@ fn copy_endpoints(
 }
 
 fn retryable_server_response(response: protocol.Message) bool {
-    return switch (response) {
-        .err => |server_error| switch (server_error.code) {
-            .not_leader, .quorum_unavailable, .replication_unavailable => true,
-            else => false,
-        },
-        else => false,
-    };
+    _ = response;
+    return false;
 }
 
 test "bounded endpoint lists reject empty duplicate and excess entries" {

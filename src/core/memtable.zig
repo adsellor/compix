@@ -56,7 +56,8 @@ pub const Memtable = struct {
         const total = key.len +
             value.event_type.len +
             value.payload.len +
-            value.origin_service.len;
+            value.origin_service.len +
+            value.signature.len;
         return try limits.byte_count(total);
     }
 
@@ -96,6 +97,7 @@ pub const Memtable = struct {
         const origin_stored = self.bytes.write(value.origin_service) catch unreachable;
         const type_stored = self.bytes.write(value.event_type) catch unreachable;
         const payload_stored = self.bytes.write(value.payload) catch unreachable;
+        const signature_stored = self.bytes.write(value.signature) catch unreachable;
         const stored = Entry{
             .key = key_stored,
             .value = .{
@@ -104,6 +106,7 @@ pub const Memtable = struct {
                 .payload = payload_stored,
                 .timestamp = value.timestamp,
                 .origin_service = origin_stored,
+                .signature = signature_stored,
             },
         };
 

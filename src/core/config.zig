@@ -4,7 +4,7 @@ const Io = std.Io;
 const auth = @import("auth.zig");
 const limits = @import("limits.zig");
 const protocol = @import("protocol.zig");
-const raft = @import("raft.zig");
+const signing = @import("signing.zig");
 
 const identity_mod = @import("identity.zig");
 const contract_mod = @import("contract.zig");
@@ -16,31 +16,15 @@ pub const ContractEntry = struct {
     source_service: []const u8,
     event_types: []const []const u8,
     peer_address: []const u8,
+    /// Optional hex-encoded Ed25519 public key of the owning service. When
+    /// present, pulled events from this origin must be validly signed.
+    origin_public_key: ?[]const u8 = null,
 };
 
 pub const CredentialEntry = struct {
     service_name: []const u8,
     secret: []const u8,
     permissions: []const auth.Permission,
-};
-
-pub const ClusterMemberEntry = struct {
-    node_id: raft.NodeId,
-    instance_id: []const u8,
-    address: []const u8,
-};
-
-pub const ClusterEntry = struct {
-    node_id: raft.NodeId,
-    state_path: []const u8,
-    members: []const ClusterMemberEntry,
-    heartbeat_interval_ms: u32 = 100,
-    election_timeout_min_ms: u32 = 600,
-    election_timeout_max_ms: u32 = 1_200,
-    rpc_timeout_ms: u32 = 500,
-    log_capacity: u16 = 64,
-    command_slot_size: limits.ByteCount = protocol.replicated_command_size_max,
-    snapshot_size_max: u64 = limits.snapshot_size_default_max,
 };
 
 pub const ServiceConfig = struct {
@@ -54,26 +38,9 @@ pub const ServiceConfig = struct {
     connection_capacity: limits.ConnectionCount = limits.connection_capacity_default,
     stream_capacity: limits.StreamCount = limits.stream_capacity_default,
     stream_id_bytes_capacity: limits.ByteCount = limits.stream_id_bytes_capacity_default,
-    cluster: ?ClusterEntry = null,
-};
-
-pub const ClusterMember = struct {
-    node_id: raft.NodeId,
-    instance_id: []const u8,
-    address: []const u8,
-};
-
-pub const Cluster = struct {
-    node_id: raft.NodeId,
-    state_path: []const u8,
-    members: []const ClusterMember,
-    heartbeat_interval_ms: u32,
-    election_timeout_min_ticks: u16,
-    election_timeout_max_ticks: u16,
-    rpc_timeout_ms: u32,
-    log_capacity: u16,
-    command_slot_size: limits.ByteCount,
-    snapshot_size_max: u64 = limits.snapshot_size_default_max,
+    /// Optional hex-encoded 32-byte Ed25519 seed this service signs its own
+    /// events with. Absent means events are emitted unsigned.
+    signing_key: ?[]const u8 = null,
 };
 
 pub const LoadedConfig = struct {
@@ -85,7 +52,7 @@ pub const LoadedConfig = struct {
     connection_capacity: limits.ConnectionCount,
     stream_capacity: limits.StreamCount,
     stream_id_bytes_capacity: limits.ByteCount,
-    cluster: ?Cluster,
+    signing_key: ?signing.SigningKey,
     allocator: Allocator,
 
     pub fn deinit(self: *LoadedConfig) void {
@@ -106,14 +73,6 @@ pub const LoadedConfig = struct {
             self.allocator.free(contract.peer_address);
         }
         self.allocator.free(self.contracts);
-        if (self.cluster) |cluster| {
-            for (cluster.members) |member| {
-                self.allocator.free(member.instance_id);
-                self.allocator.free(member.address);
-            }
-            self.allocator.free(cluster.members);
-            self.allocator.free(cluster.state_path);
-        }
         self.allocator.free(self.wal_path);
         var id = self.identity;
         id.deinit(self.allocator);
@@ -184,11 +143,18 @@ pub fn load_from_slice(allocator: Allocator, data: []const u8) !LoadedConfig {
 
         const peer_address = try allocator.dupe(u8, entry.peer_address);
 
+        const origin_public_key: ?[signing.public_key_length]u8 =
+            if (entry.origin_public_key) |hex|
+                signing.parse_public_key_hex(hex) catch return error.InvalidOriginPublicKey
+            else
+                null;
+
         contracts[contracts_built] = .{
             .source_service = source_service,
             .event_types = event_types,
             .peer_address = peer_address,
             .retention_hint = null,
+            .origin_public_key = origin_public_key,
         };
         contracts_built += 1;
     }
@@ -227,8 +193,9 @@ pub fn load_from_slice(allocator: Allocator, data: []const u8) !LoadedConfig {
 
     const wal_path = try allocator.dupe(u8, config.wal_path);
     errdefer allocator.free(wal_path);
-    const cluster = if (config.cluster) |entry|
-        try clone_cluster(allocator, entry)
+
+    const signing_key: ?signing.SigningKey = if (config.signing_key) |seed_hex|
+        signing.SigningKey.from_seed_hex(seed_hex) catch return error.InvalidSigningKey
     else
         null;
 
@@ -241,56 +208,9 @@ pub fn load_from_slice(allocator: Allocator, data: []const u8) !LoadedConfig {
         .connection_capacity = config.connection_capacity,
         .stream_capacity = config.stream_capacity,
         .stream_id_bytes_capacity = config.stream_id_bytes_capacity,
-        .cluster = cluster,
+        .signing_key = signing_key,
         .allocator = allocator,
     };
-}
-
-fn clone_cluster(allocator: Allocator, entry: ClusterEntry) !Cluster {
-    const state_path = try allocator.dupe(u8, entry.state_path);
-    errdefer allocator.free(state_path);
-    const members = try allocator.alloc(ClusterMember, entry.members.len);
-    var built: u8 = 0;
-    errdefer {
-        for (members[0..built]) |member| {
-            allocator.free(member.instance_id);
-            allocator.free(member.address);
-        }
-        allocator.free(members);
-    }
-    for (entry.members) |member| {
-        const instance_id = try allocator.dupe(u8, member.instance_id);
-        errdefer allocator.free(instance_id);
-        const address = try allocator.dupe(u8, member.address);
-        members[built] = .{
-            .node_id = member.node_id,
-            .instance_id = instance_id,
-            .address = address,
-        };
-        built += 1;
-    }
-    return .{
-        .node_id = entry.node_id,
-        .state_path = state_path,
-        .members = members,
-        .heartbeat_interval_ms = entry.heartbeat_interval_ms,
-        .election_timeout_min_ticks = timeout_ticks(
-            entry.election_timeout_min_ms,
-            entry.heartbeat_interval_ms,
-        ),
-        .election_timeout_max_ticks = timeout_ticks(
-            entry.election_timeout_max_ms,
-            entry.heartbeat_interval_ms,
-        ),
-        .rpc_timeout_ms = entry.rpc_timeout_ms,
-        .log_capacity = entry.log_capacity,
-        .command_slot_size = entry.command_slot_size,
-        .snapshot_size_max = entry.snapshot_size_max,
-    };
-}
-
-fn timeout_ticks(timeout_ms: u32, heartbeat_ms: u32) u16 {
-    return @intCast(std.math.divCeil(u32, timeout_ms, heartbeat_ms) catch unreachable);
 }
 
 fn validate_config(config: *const ServiceConfig) !void {
@@ -321,8 +241,6 @@ fn validate_config(config: *const ServiceConfig) !void {
         }
     }
 
-    if (config.cluster) |cluster| try validate_cluster(config, cluster, client_secret);
-
     for (config.contracts) |entry| {
         if (entry.source_service.len > limits.service_name_length_max)
             return error.ServiceNameTooLong;
@@ -335,82 +253,6 @@ fn validate_config(config: *const ServiceConfig) !void {
                 return error.EventTypeTooLong;
         }
     }
-}
-
-fn validate_cluster(
-    config: *const ServiceConfig,
-    cluster: ClusterEntry,
-    client_secret: []const u8,
-) !void {
-    if (cluster.members.len < raft.nodes_min or cluster.members.len > raft.nodes_max or
-        cluster.members.len % 2 == 0)
-        return error.InvalidClusterSize;
-    if (cluster.state_path.len == 0 or cluster.state_path.len > limits.wal_path_length_max)
-        return error.InvalidReplicatedStatePath;
-    if (std.mem.eql(u8, cluster.state_path, config.wal_path))
-        return error.ReplicatedStatePathConflictsWithWal;
-    if (cluster.heartbeat_interval_ms == 0 or
-        cluster.heartbeat_interval_ms > std.math.maxInt(u32) / 2 or
-        cluster.election_timeout_min_ms < cluster.heartbeat_interval_ms * 2 or
-        cluster.election_timeout_max_ms < cluster.election_timeout_min_ms or
-        cluster.rpc_timeout_ms == 0 or
-        cluster.rpc_timeout_ms >= cluster.election_timeout_min_ms)
-        return error.InvalidRaftTimeout;
-    const min_ticks = std.math.divCeil(
-        u32,
-        cluster.election_timeout_min_ms,
-        cluster.heartbeat_interval_ms,
-    ) catch return error.InvalidRaftTimeout;
-    const max_ticks = std.math.divCeil(
-        u32,
-        cluster.election_timeout_max_ms,
-        cluster.heartbeat_interval_ms,
-    ) catch return error.InvalidRaftTimeout;
-    if (min_ticks < 2 or max_ticks > std.math.maxInt(u16))
-        return error.InvalidRaftTimeout;
-    if (cluster.log_capacity < 8 or cluster.log_capacity > 1024)
-        return error.InvalidRaftLogCapacity;
-    if (cluster.command_slot_size < protocol.replicated_command_size_max or
-        cluster.command_slot_size > protocol.frame_size_max + 8)
-        return error.InvalidReplicationSlotSize;
-    if (cluster.snapshot_size_max < protocol.replicated_command_size_max or
-        cluster.snapshot_size_max > limits.snapshot_size_hard_max)
-        return error.InvalidSnapshotCapacity;
-
-    var own_count: u8 = 0;
-    for (cluster.members, 0..) |member, index| {
-        if (member.instance_id.len == 0 or
-            member.instance_id.len > limits.instance_id_length_max)
-            return error.InvalidClusterInstance;
-        if (member.address.len == 0 or member.address.len > limits.peer_address_length_max)
-            return error.InvalidClusterAddress;
-        _ = std.Io.net.IpAddress.parseLiteral(member.address) catch
-            return error.InvalidClusterAddress;
-        if (member.node_id == cluster.node_id) {
-            own_count += 1;
-            if (!std.mem.eql(u8, member.instance_id, config.instance_id))
-                return error.ClusterIdentityMismatch;
-            if (!std.mem.eql(u8, member.address, config.listen_address))
-                return error.ClusterAddressMismatch;
-        }
-        for (cluster.members[0..index]) |previous| {
-            if (previous.node_id == member.node_id) return error.DuplicateClusterMember;
-            if (std.mem.eql(u8, previous.instance_id, member.instance_id))
-                return error.DuplicateClusterInstance;
-            if (std.mem.eql(u8, previous.address, member.address))
-                return error.DuplicateClusterAddress;
-        }
-    }
-    if (own_count != 1) return error.NodeNotInCluster;
-
-    const cluster_credential = for (config.credentials) |credential| {
-        if (std.mem.eql(u8, credential.service_name, config.service_name))
-            break credential;
-    } else return error.MissingClusterCredential;
-    const permissions = try auth.Permissions.from_list(cluster_credential.permissions);
-    if (!permissions.replicate) return error.MissingClusterPermission;
-    if (!std.mem.eql(u8, cluster_credential.secret, client_secret))
-        return error.ClusterSecretMismatch;
 }
 
 test "parse valid config" {
@@ -487,77 +329,6 @@ test "empty contracts array is valid" {
 
     try std.testing.expectEqualStrings("standalone", cfg.identity.name);
     try std.testing.expectEqual(@as(usize, 0), cfg.contracts.len);
-}
-
-test "cluster config binds membership identity timeouts and replication credential" {
-    const json =
-        \\{
-        \\  "service_name":"compix-orders",
-        \\  "instance_id":"orders-2",
-        \\  "listen_address":"127.0.0.1:4302",
-        \\  "wal_path":"data/orders-2.wal",
-        \\  "client_secret":"0123456789abcdef0123456789abcdef",
-        \\  "credentials":[{"service_name":"compix-orders",
-        \\    "secret":"0123456789abcdef0123456789abcdef",
-        \\    "permissions":["replicate"]}],
-        \\  "contracts":[],
-        \\  "cluster":{
-        \\    "node_id":2,
-        \\    "state_path":"data/orders-2.raft",
-        \\    "heartbeat_interval_ms":75,
-        \\    "election_timeout_min_ms":500,
-        \\    "election_timeout_max_ms":900,
-        \\    "rpc_timeout_ms":250,
-        \\    "log_capacity":32,
-        \\    "members":[
-        \\      {"node_id":1,"instance_id":"orders-1","address":"127.0.0.1:4301"},
-        \\      {"node_id":2,"instance_id":"orders-2","address":"127.0.0.1:4302"},
-        \\      {"node_id":3,"instance_id":"orders-3","address":"127.0.0.1:4303"}
-        \\    ]
-        \\  }
-        \\}
-    ;
-    var cfg = try load_from_slice(std.testing.allocator, json);
-    defer cfg.deinit();
-    const cluster = cfg.cluster.?;
-    try std.testing.expectEqual(@as(raft.NodeId, 2), cluster.node_id);
-    try std.testing.expectEqual(@as(u16, 7), cluster.election_timeout_min_ticks);
-    try std.testing.expectEqual(@as(u16, 12), cluster.election_timeout_max_ticks);
-    try std.testing.expectEqual(@as(u16, 32), cluster.log_capacity);
-    try std.testing.expectEqualStrings("orders-3", cluster.members[2].instance_id);
-    try std.testing.expectEqualStrings("127.0.0.1:4301", cluster.members[0].address);
-}
-
-test "cluster config fails closed on identity and credential mismatch" {
-    const wrong_identity =
-        \\{"service_name":"c","instance_id":"node-9","listen_address":"127.0.0.1:1",
-        \\ "wal_path":"data/c.wal","client_secret":"0123456789abcdef0123456789abcdef",
-        \\ "credentials":[{"service_name":"c","secret":"0123456789abcdef0123456789abcdef",
-        \\ "permissions":["replicate"]}],"contracts":[],"cluster":{"node_id":1,
-        \\ "state_path":"data/c.raft","members":[
-        \\ {"node_id":1,"instance_id":"node-1","address":"127.0.0.1:1"},
-        \\ {"node_id":2,"instance_id":"node-2","address":"127.0.0.1:2"},
-        \\ {"node_id":3,"instance_id":"node-3","address":"127.0.0.1:3"}]}}
-    ;
-    try std.testing.expectError(
-        error.ClusterIdentityMismatch,
-        load_from_slice(std.testing.allocator, wrong_identity),
-    );
-
-    const no_replicate =
-        \\{"service_name":"c","instance_id":"node-1","listen_address":"127.0.0.1:1",
-        \\ "wal_path":"data/c.wal","client_secret":"0123456789abcdef0123456789abcdef",
-        \\ "credentials":[{"service_name":"c","secret":"0123456789abcdef0123456789abcdef",
-        \\ "permissions":["observe"]}],"contracts":[],"cluster":{"node_id":1,
-        \\ "state_path":"data/c.raft","members":[
-        \\ {"node_id":1,"instance_id":"node-1","address":"127.0.0.1:1"},
-        \\ {"node_id":2,"instance_id":"node-2","address":"127.0.0.1:2"},
-        \\ {"node_id":3,"instance_id":"node-3","address":"127.0.0.1:3"}]}}
-    ;
-    try std.testing.expectError(
-        error.MissingClusterPermission,
-        load_from_slice(std.testing.allocator, no_replicate),
-    );
 }
 
 test "capacity configuration rejects zero and compiled-limit overflow" {

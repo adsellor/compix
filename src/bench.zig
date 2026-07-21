@@ -697,7 +697,7 @@ fn bench_protocol_encode_decode(allocator: std.mem.Allocator, log: *BenchLog) !v
         for (&entries, 0..) |*e, i| {
             e.* = .{
                 .key = try std.fmt.allocPrint(allocator, "evt:svc:type:{x:0>16}", .{i + 1}),
-                .value = try std.fmt.allocPrint(allocator, "{}|100|2|svc|type|{{}}", .{i + 1}),
+                .value = try std.fmt.allocPrint(allocator, "{}|100|2|svc|type||{{}}", .{i + 1}),
             };
         }
         defer for (&entries) |e| {
@@ -841,7 +841,7 @@ fn bench_transport_pull_throughput(allocator: std.mem.Allocator, log: *BenchLog)
             ),
             .value = try std.fmt.allocPrint(
                 allocator,
-                "{}|100|2|order-svc|order.created|{{}}",
+                "{}|100|2|order-svc|order.created||{{}}",
                 .{i + 1},
             ),
         };
@@ -1041,7 +1041,7 @@ fn bench_sstable_write(allocator: std.mem.Allocator, log: *BenchLog) !void {
     for (0..count) |i| {
         entries[i] = .{
             .key = try std.fmt.allocPrint(allocator, "sst:k{d:0>8}", .{i}),
-            .value = try std.fmt.allocPrint(allocator, "{}|0|2|bench-svc|bench.evt|{{}}", .{i + 1}),
+            .value = try std.fmt.allocPrint(allocator, "{}|0|2|bench-svc|bench.evt||{{}}", .{i + 1}),
         };
     }
 
@@ -1087,7 +1087,7 @@ fn bench_sstable_read(allocator: std.mem.Allocator, log: *BenchLog) !void {
         const k = try std.fmt.allocPrint(allocator, "sst:k{d:0>8}", .{i});
         entries[i] = .{
             .key = k,
-            .value = try std.fmt.allocPrint(allocator, "{}|0|2|bench-svc|bench.evt|{{}}", .{i + 1}),
+            .value = try std.fmt.allocPrint(allocator, "{}|0|2|bench-svc|bench.evt||{{}}", .{i + 1}),
         };
         keys[i] = k;
     }

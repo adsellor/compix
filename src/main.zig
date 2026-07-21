@@ -74,9 +74,6 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("Restored store failed integrity verification: {}\n", .{err});
             return err;
         };
-        if (cfg.cluster) |cluster| {
-            try backup.verify_cluster_state(allocator, io, cluster);
-        }
         if (verification.committed_log_position != restored.committed_log_position)
             return error.RestoredPositionMismatch;
         std.debug.print(
@@ -100,6 +97,7 @@ pub fn main(init: std.process.Init) !void {
         .contracts = cfg.contracts,
         .stream_capacity = cfg.stream_capacity,
         .stream_id_bytes_capacity = cfg.stream_id_bytes_capacity,
+        .signing_key = cfg.signing_key,
     }) catch |err| {
         std.debug.print("Failed to initialize store at '{s}': {}\n", .{ cfg.wal_path, err });
         return err;
@@ -108,9 +106,6 @@ pub fn main(init: std.process.Init) !void {
 
     if (command == .verify) {
         const verification = try event_store.verify_integrity();
-        if (cfg.cluster) |cluster| {
-            try backup.verify_cluster_state(allocator, io, cluster);
-        }
         std.debug.print(
             "{{\"ok\":true,\"streams\":{d},\"batches\":{d}," ++
                 "\"events\":{d},\"committed_log_position\":{d}}}\n",
@@ -125,9 +120,6 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (command == .scrub) {
-        if (cfg.cluster) |cluster| {
-            try backup.verify_cluster_state(allocator, io, cluster);
-        }
         const result = scrub.run(allocator, io, cfg.wal_path, &event_store) catch |err| {
             std.debug.print("Scrub failed: {}\n", .{err});
             return err;
@@ -184,59 +176,31 @@ pub fn main(init: std.process.Init) !void {
         .integrity_verified = true,
         .backups_completed = backup_state.completed,
         .last_backup_unix_seconds = backup_state.last_success_unix_seconds,
-        .cluster = cfg.cluster,
     }) catch |err| {
         std.debug.print("Failed to start server: {}\n", .{err});
         return err;
     };
     defer srv.deinit();
 
-    if (cfg.cluster == null) {
-        srv.run_recovery() catch |err| {
-            std.debug.print("Recovery warning: {}\n", .{err});
-        };
-    } else if (cfg.contracts.len > 0) {
-        std.debug.print(
-            "compix: peer recovery is disabled in clustered mode; ingest must use Raft\n",
-            .{},
-        );
-    }
+    srv.run_recovery() catch |err| {
+        std.debug.print("Recovery warning: {}\n", .{err});
+    };
 
     server.register_signal_handlers();
 
-    if (cfg.cluster) |cluster| {
-        std.debug.print(
-            "compix: {s}/{s} cluster node {d} starting election; members={d}; " ++
-                "streams={d}/{d}; committed_position={d}; connections={d}; " ++
-                "raft_log={d}; snapshot_max={d}\n",
-            .{
-                cfg.identity.name,
-                cfg.identity.instance_id,
-                cluster.node_id,
-                cluster.members.len,
-                startup_verification.streams,
-                cfg.stream_capacity,
-                startup_verification.committed_log_position,
-                cfg.connection_capacity,
-                cluster.log_capacity,
-                cluster.snapshot_size_max,
-            },
-        );
-    } else {
-        std.debug.print(
-            "compix: {s}/{s} ready in single-node degraded mode; streams={d}/{d}; " ++
-                "committed_position={d}; stream_id_bytes={d}; connections={d}\n",
-            .{
-                cfg.identity.name,
-                cfg.identity.instance_id,
-                startup_verification.streams,
-                cfg.stream_capacity,
-                startup_verification.committed_log_position,
-                cfg.stream_id_bytes_capacity,
-                cfg.connection_capacity,
-            },
-        );
-    }
+    std.debug.print(
+        "compix: {s}/{s} ready; streams={d}/{d}; " ++
+            "committed_position={d}; stream_id_bytes={d}; connections={d}\n",
+        .{
+            cfg.identity.name,
+            cfg.identity.instance_id,
+            startup_verification.streams,
+            cfg.stream_capacity,
+            startup_verification.committed_log_position,
+            cfg.stream_id_bytes_capacity,
+            cfg.connection_capacity,
+        },
+    );
 
     try srv.serve();
 

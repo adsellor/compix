@@ -6,6 +6,11 @@ const EventValue = event.EventValue;
 pub const key_prefix = "_bc:";
 pub const breadcrumb_event_type = "_breadcrumb";
 
+/// A breadcrumb is a per-(source_service, event_type, peer_address) high-water
+/// mark: the last sequence this node has pulled for one remote stream from one
+/// peer. Keying on the peer address lets a node track catch-up progress against
+/// several peers that can each serve the same logical stream, without any of
+/// them being authoritative here — the payload stays at its owner.
 pub const Breadcrumb = struct {
     source_service: []const u8,
     event_type: []const u8,
@@ -17,13 +22,19 @@ pub const Breadcrumb = struct {
         buffer: []u8,
         source_service: []const u8,
         event_type: []const u8,
+        peer_address: []const u8,
     ) ![]const u8 {
         assert(source_service.len > 0);
+        assert(peer_address.len > 0);
         assert(std.mem.indexOfScalar(u8, source_service, ':') == null);
-        return std.fmt.bufPrint(buffer, "{s}{s}:{s}", .{
+        assert(std.mem.indexOfScalar(u8, event_type, ':') == null);
+        // peer_address is the trailing component and may itself contain ':'
+        // (host:port), so it is parsed back as "the rest" of the key.
+        return std.fmt.bufPrint(buffer, "{s}{s}:{s}:{s}", .{
             key_prefix,
             source_service,
             event_type,
+            peer_address,
         }) catch return error.BufferTooSmall;
     }
 
@@ -32,21 +43,12 @@ pub const Breadcrumb = struct {
     }
 
     pub fn serialize_payload_into(self: *const Breadcrumb, buffer: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buffer, "{}|{s}", .{
-            self.last_sequence,
-            self.peer_address,
-        }) catch return error.BufferTooSmall;
+        return std.fmt.bufPrint(buffer, "{}", .{self.last_sequence}) catch
+            return error.BufferTooSmall;
     }
 
-    const ParsedPayload = struct { last_sequence: u64, peer_address: []const u8 };
-
-    pub fn deserialize_payload_borrowed(payload: []const u8) !ParsedPayload {
-        var iter = std.mem.splitSequence(u8, payload, "|");
-        const sequence_string = iter.next() orelse return error.InvalidFormat;
-        return .{
-            .last_sequence = try std.fmt.parseInt(u64, sequence_string, 10),
-            .peer_address = iter.rest(),
-        };
+    pub fn deserialize_sequence(payload: []const u8) !u64 {
+        return std.fmt.parseInt(u64, payload, 10) catch return error.InvalidFormat;
     }
 
     pub fn from_wal_entry_borrowed(
@@ -56,17 +58,21 @@ pub const Breadcrumb = struct {
         if (!is_system_key(key)) return null;
 
         const after_prefix = key[key_prefix.len..];
-        const colon_pos = std.mem.indexOfScalar(u8, after_prefix, ':') orelse
+        const service_end = std.mem.indexOfScalar(u8, after_prefix, ':') orelse
             return error.InvalidFormat;
-        const source_service = after_prefix[0..colon_pos];
-        const event_type_from_key = after_prefix[colon_pos + 1 ..];
+        const source_service = after_prefix[0..service_end];
+        const after_service = after_prefix[service_end + 1 ..];
+        const type_end = std.mem.indexOfScalar(u8, after_service, ':') orelse
+            return error.InvalidFormat;
+        const event_type_from_key = after_service[0..type_end];
+        const peer_address = after_service[type_end + 1 ..];
+        if (peer_address.len == 0) return error.InvalidFormat;
 
-        const parsed = try deserialize_payload_borrowed(value.payload);
         return .{
             .source_service = source_service,
             .event_type = event_type_from_key,
-            .last_sequence = parsed.last_sequence,
-            .peer_address = parsed.peer_address,
+            .last_sequence = try deserialize_sequence(value.payload),
+            .peer_address = peer_address,
             .updated_at = value.timestamp,
         };
     }
@@ -74,12 +80,17 @@ pub const Breadcrumb = struct {
 
 test "make_key produces correct format" {
     var buffer: [128]u8 = undefined;
-    const key = try Breadcrumb.make_key_into(&buffer, "order-service", "order.created");
-    try std.testing.expectEqualStrings("_bc:order-service:order.created", key);
+    const key = try Breadcrumb.make_key_into(
+        &buffer,
+        "order-service",
+        "order.created",
+        "10.0.0.5:4200",
+    );
+    try std.testing.expectEqualStrings("_bc:order-service:order.created:10.0.0.5:4200", key);
 }
 
 test "is_system_key correctly identifies breadcrumb keys" {
-    try std.testing.expect(Breadcrumb.is_system_key("_bc:order-service:order.created"));
+    try std.testing.expect(Breadcrumb.is_system_key("_bc:order-service:order.created:10.0.0.5:4200"));
     try std.testing.expect(Breadcrumb.is_system_key("_bc:"));
     try std.testing.expect(!Breadcrumb.is_system_key("user-service:u123:profile"));
     try std.testing.expect(!Breadcrumb.is_system_key(""));
@@ -96,7 +107,12 @@ test "to_event_value and from_wal_entry round-trip" {
     };
 
     var key_buffer: [128]u8 = undefined;
-    const key = try Breadcrumb.make_key_into(&key_buffer, bc.source_service, bc.event_type);
+    const key = try Breadcrumb.make_key_into(
+        &key_buffer,
+        bc.source_service,
+        bc.event_type,
+        bc.peer_address,
+    );
     var payload_buffer: [128]u8 = undefined;
     const payload = try bc.serialize_payload_into(&payload_buffer);
     const ev = EventValue{
@@ -134,7 +150,7 @@ test "from_wal_entry returns null for non-breadcrumb keys" {
     try std.testing.expect(result == null);
 }
 
-test "serialize_payload/deserialize_payload round-trip" {
+test "serialize_payload/deserialize_sequence round-trip" {
     const bc = Breadcrumb{
         .source_service = "svc",
         .event_type = "evt",
@@ -145,8 +161,13 @@ test "serialize_payload/deserialize_payload round-trip" {
 
     var buffer: [128]u8 = undefined;
     const payload = try bc.serialize_payload_into(&buffer);
-    const parsed = try Breadcrumb.deserialize_payload_borrowed(payload);
+    try std.testing.expectEqual(@as(u64, 99), try Breadcrumb.deserialize_sequence(payload));
+}
 
-    try std.testing.expectEqual(@as(u64, 99), parsed.last_sequence);
-    try std.testing.expectEqualStrings("192.168.1.1:5000", parsed.peer_address);
+test "distinct peers keep independent high-water marks for one stream" {
+    var buffer_a: [128]u8 = undefined;
+    var buffer_b: [128]u8 = undefined;
+    const key_a = try Breadcrumb.make_key_into(&buffer_a, "orders", "created", "10.0.0.1:4200");
+    const key_b = try Breadcrumb.make_key_into(&buffer_b, "orders", "created", "10.0.0.2:4200");
+    try std.testing.expect(!std.mem.eql(u8, key_a, key_b));
 }
