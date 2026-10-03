@@ -6,11 +6,13 @@ const event = @import("event.zig");
 const fixed = @import("fixed.zig");
 const protocol = @import("protocol.zig");
 const stream_store_mod = @import("stream_store.zig");
+const attestation_mod = @import("attestation.zig");
 const breadcrumb_mod = @import("breadcrumb.zig");
 const contract_mod = @import("contract.zig");
 const signing = @import("signing.zig");
 const limits = @import("limits.zig");
 const time_mod = @import("time.zig");
+const vc_mod = @import("vc.zig");
 
 const DependencyContract = contract_mod.DependencyContract;
 
@@ -28,9 +30,12 @@ pub const MakeEventKeyOptions = struct {
     sequence: u64,
 };
 
+// NOTE: fixed-width hex, so key order matches sequence order.
+const event_key_format = "evt:{s}:{s}:{x:0>16}";
+
 pub fn make_event_key_into(buffer: []u8, options: MakeEventKeyOptions) ![]const u8 {
     assert(options.origin.len > 0);
-    const key = std.fmt.bufPrint(buffer, "evt:{s}:{s}:{x:0>16}", .{
+    const key = std.fmt.bufPrint(buffer, event_key_format, .{
         options.origin,
         options.event_type,
         options.sequence,
@@ -41,12 +46,20 @@ pub fn make_event_key_into(buffer: []u8, options: MakeEventKeyOptions) ![]const 
 
 pub const Config = struct {
     identity: ?[]const u8 = null,
+    /// Zero disables vector-clock stamping.
+    vc_node_key: u64 = 0,
     contracts: []const DependencyContract = &.{},
+    /// Empty disables reclaim. The most specific rule wins; no match keeps the event forever.
+    retention: []const RetentionRule = &.{},
     stream_capacity: limits.StreamCount = limits.stream_capacity_test_default,
     stream_id_bytes_capacity: limits.ByteCount = limits.stream_id_bytes_capacity_test_default,
-    /// When set, the store signs each of its own appended events as it indexes
-    /// them under `evt:` keys for pull serving.
     signing_key: ?signing.SigningKey = null,
+};
+
+pub const RetentionRule = struct {
+    origin: []const u8 = "*",
+    event_type: []const u8 = "*",
+    ttl_seconds: u64,
 };
 
 pub const QueryResult = struct {
@@ -54,14 +67,33 @@ pub const QueryResult = struct {
     complete: bool,
 };
 
+const VcRebuildContext = struct {
+    clock: *vc_mod.Clock,
+
+    fn visit(self: *VcRebuildContext, _: []const u8, value: EventValue) !event.VisitControl {
+        if (value.vector_clock.len == 0) return .continue_scan;
+        const remote = vc_mod.Clock.decode(value.vector_clock) catch return .continue_scan;
+        self.clock.observe(&remote) catch {};
+        return .continue_scan;
+    }
+};
+
+const pull_response_wire_size_empty: limits.ByteCount = 4;
+
+fn pull_entry_wire_size(key: []const u8, value: *const EventValue) !limits.ByteCount {
+    return limits.byte_count(4 + key.len + 4 + @as(usize, value.serialized_size()));
+}
+
+// NOTE: a page ends early when the next event would overflow; resume from the last sequence.
 const QueryContext = struct {
     output: []EventValue,
     arena: fixed.ByteArena,
     from_sequence: limits.Sequence,
     count: limits.EventCount,
     complete: bool,
+    wire_size: limits.ByteCount = pull_response_wire_size_empty,
 
-    fn visit(self: *QueryContext, _: []const u8, value: EventValue) !event.VisitControl {
+    fn visit(self: *QueryContext, key: []const u8, value: EventValue) !event.VisitControl {
         if (value.sequence < self.from_sequence) return .continue_scan;
         if (self.count == self.output.len) {
             self.complete = false;
@@ -70,13 +102,22 @@ const QueryContext = struct {
 
         const bytes_required = try limits.byte_count(
             value.origin_service.len + value.event_type.len + value.payload.len +
-                value.signature.len,
+                value.signature.len + value.vector_clock.len,
         );
-        if (bytes_required > self.arena.remaining()) return error.QueryBufferTooSmall;
+        assert(self.wire_size <= protocol.frame_payload_size_max);
+        const entry_wire_size = try pull_entry_wire_size(key, &value);
+        const fits_frame = entry_wire_size <= protocol.frame_payload_size_max - self.wire_size;
+        if (!fits_frame or bytes_required > self.arena.remaining()) {
+            if (self.count == 0) return error.QueryBufferTooSmall;
+            self.complete = false;
+            return .stop;
+        }
+        self.wire_size += entry_wire_size;
         const origin = self.arena.write(value.origin_service) catch unreachable;
         const event_type = self.arena.write(value.event_type) catch unreachable;
         const payload = self.arena.write(value.payload) catch unreachable;
         const signature = self.arena.write(value.signature) catch unreachable;
+        const vector_clock = self.arena.write(value.vector_clock) catch unreachable;
         self.output[self.count] = .{
             .sequence = value.sequence,
             .event_type = event_type,
@@ -84,6 +125,7 @@ const QueryContext = struct {
             .timestamp = value.timestamp,
             .origin_service = origin,
             .signature = signature,
+            .vector_clock = vector_clock,
         };
         self.count += 1;
         return .continue_scan;
@@ -95,11 +137,13 @@ pub const EventStore = struct {
     lsm: *LSMEngine,
     streams: StreamStore,
     identity: ?[]const u8,
+    vc_node_key: u64,
     contracts: []const DependencyContract,
+    retention: []const RetentionRule,
     signing_key: ?signing.SigningKey,
-    /// Buffer for the one-shot signing message; allocated only when signing is
-    /// enabled. Sized for a full serialized event (payload plus header).
     sign_scratch: []u8,
+    /// Rebuilt at init from `evt:` entries, so it has no durable record of its own.
+    vc_clock: vc_mod.Clock,
 
     pub const Metrics = struct {
         streams_used: limits.StreamCount,
@@ -129,6 +173,8 @@ pub const EventStore = struct {
         lsm_ptr.* = try LSMEngine.init(allocator, wal_path, io);
         errdefer lsm_ptr.deinit();
 
+        _ = try lsm_ptr.compact_until_stable();
+
         var streams = try StreamStore.init(allocator, lsm_ptr, .{
             .stream_capacity = config.stream_capacity,
             .stream_id_bytes_capacity = config.stream_id_bytes_capacity,
@@ -141,14 +187,25 @@ pub const EventStore = struct {
             &.{};
         errdefer allocator.free(sign_scratch);
 
+        var vc_clock: vc_mod.Clock = .{};
+        if (config.vc_node_key != 0) {
+            // NOTE: reserve this node's slot first so later bumps cannot fail on capacity.
+            try vc_clock.bump(config.vc_node_key, 0);
+            var rebuild: VcRebuildContext = .{ .clock = &vc_clock };
+            _ = try lsm_ptr.visit_prefix(event_prefix, &rebuild, VcRebuildContext.visit);
+        }
+
         return EventStore{
             .allocator = allocator,
             .lsm = lsm_ptr,
             .streams = streams,
             .identity = config.identity,
+            .vc_node_key = config.vc_node_key,
             .contracts = config.contracts,
+            .retention = config.retention,
             .signing_key = config.signing_key,
             .sign_scratch = sign_scratch,
+            .vc_clock = vc_clock,
         };
     }
 
@@ -177,8 +234,7 @@ pub const EventStore = struct {
         request: protocol.AppendStream,
         timestamp: limits.Timestamp,
     ) !protocol.AppendStreamResponse {
-        // Stage (no fsync) so the canonical batch and the pull-servable evt:
-        // events are made durable together by one durable_sync below.
+        // NOTE: no fsync here; durable_sync commits the batch and `evt:` events together.
         const response = try self.streams.stage_append(request, timestamp);
         switch (response) {
             .committed => |result| {
@@ -197,16 +253,12 @@ pub const EventStore = struct {
     ) !protocol.AppendStreamResponse {
         const response = try self.streams.stage_append(request, timestamp);
         switch (response) {
-            // The caller (server) fsyncs the whole staged set via group commit.
             .committed => |result| try self.index_owned_events(request, result, timestamp),
             else => {},
         }
         return response;
     }
 
-    /// Index each of this node's own appended events under an `evt:` key so
-    /// dependents can pull them, signing with the configured key so consumers
-    /// can verify authorship. Skipped without an identity (dev mode).
     fn index_owned_events(
         self: *EventStore,
         request: protocol.AppendStream,
@@ -214,6 +266,12 @@ pub const EventStore = struct {
         timestamp: limits.Timestamp,
     ) !void {
         const origin = self.identity orelse return;
+        var clock_buffer: [vc_mod.encoded_length_max]u8 = undefined;
+        var stamp: []const u8 = "";
+        if (self.vc_node_key != 0) {
+            try self.vc_clock.bump(self.vc_node_key, result.log_position_last);
+            stamp = try self.vc_clock.encodeInto(&clock_buffer);
+        }
         for (request.events, 0..) |append_event, index| {
             const log_position = result.log_position_first + index;
             var value = try EventValue.init(.{
@@ -222,9 +280,9 @@ pub const EventStore = struct {
                 .event_type = append_event.event_type,
                 .payload = append_event.payload,
                 .timestamp = timestamp,
+                .vector_clock = stamp,
             });
-            // The hex signature buffer must outlive put_buffered below, which
-            // serializes `value` (whose `signature` slice points into it).
+            // WARN: `value.signature` points here; it must outlive put_buffered.
             var signature_hex: [signing.signature_hex_length]u8 = undefined;
             if (self.signing_key) |*key| {
                 try value.sign(key, self.sign_scratch, &signature_hex);
@@ -264,6 +322,45 @@ pub const EventStore = struct {
 
     pub fn verify_integrity(self: *EventStore) !StreamStore.Verification {
         return self.streams.verify_integrity();
+    }
+
+    pub const TrustedState = struct {
+        streams: limits.StreamCount,
+        committed_log_position: protocol.LogPosition,
+    };
+
+    fn attestation_path_into(self: *const EventStore, buffer: []u8) ![]const u8 {
+        return attestation_mod.derive_path_into(buffer, self.lsm.wal_path);
+    }
+
+    pub fn trusted_state(self: *EventStore) !?TrustedState {
+        var buffer: [limits.wal_path_length_max]u8 = undefined;
+        const path = self.attestation_path_into(&buffer) catch return null;
+        const found = (try attestation_mod.load_path(path, self.lsm.io)) orelse return null;
+        if (!found.covers(self.lsm.manifest.version, self.streams.log_position_committed))
+            return null;
+        if (found.streams != self.streams.stream_count) return null;
+        return .{
+            .streams = self.streams.stream_count,
+            .committed_log_position = self.streams.log_position_committed,
+        };
+    }
+
+    pub fn revoke_attestation(self: *EventStore) void {
+        var buffer: [limits.wal_path_length_max]u8 = undefined;
+        const path = self.attestation_path_into(&buffer) catch return;
+        attestation_mod.remove_path(path, self.lsm.io);
+    }
+
+    pub fn attest_verified(self: *EventStore) !void {
+        if (self.streams.poisoned) return error.StorePoisoned;
+        var buffer: [limits.wal_path_length_max]u8 = undefined;
+        const path = try self.attestation_path_into(&buffer);
+        try attestation_mod.save_path(path, .{
+            .manifest_version = self.lsm.manifest.version,
+            .committed_log_position = self.streams.log_position_durable,
+            .streams = self.streams.stream_count,
+        }, self.lsm.io);
     }
 
     pub fn metrics(self: *const EventStore) Metrics {
@@ -334,16 +431,11 @@ pub const EventStore = struct {
     }
 
     pub fn ingest_event(self: *EventStore, value: EventValue) !void {
-        // A configured identity authorizes cross-service intake by contract. A
-        // node's own events and the no-identity dev mode bypass the check.
         if (self.identity) |identity| {
             if (!std.mem.eql(u8, value.origin_service, identity)) {
                 const contract = self.find_contract(value.origin_service, value.event_type) orelse
                     return error.UnauthorizedOrigin;
-                // Provenance: when the contract declares the owner's public key,
-                // the event must carry a valid origin signature — this is what
-                // makes a pulled event trustworthy regardless of which peer
-                // relayed it. Unsigned or forged events are rejected.
+                // NOTE: a valid signature makes a pulled event trustworthy, whoever relayed it.
                 if (contract.origin_public_key) |public_key| {
                     if (!value.verify_provenance(public_key))
                         return error.InvalidProvenance;
@@ -357,9 +449,202 @@ pub const EventStore = struct {
             .event_type = value.event_type,
             .sequence = value.sequence,
         });
-        if (try self.lsm.contains(key)) return;
-        try self.put(key, value);
+        if (!try self.lsm.contains(key)) {
+            try self.put(key, value);
+        }
+        // NOTE: merge even for duplicates, which can carry a clock this store has not seen.
+        if (value.vector_clock.len != 0) {
+            const remote = vc_mod.Clock.decode(value.vector_clock) catch return;
+            self.vc_clock.observe(&remote) catch {};
+        }
     }
+
+    /// View into store state; copy under `store_mutex`.
+    pub fn vc_summary(self: *const EventStore) []const vc_mod.Entry {
+        return self.vc_clock.entries[0..self.vc_clock.len];
+    }
+
+    pub fn retentionTtl(
+        self: *const EventStore,
+        origin: []const u8,
+        event_type: []const u8,
+    ) ?u64 {
+        var best: ?u64 = null;
+        var best_score: u8 = 0;
+        for (self.retention) |rule| {
+            const origin_match = std.mem.eql(u8, rule.origin, "*") or
+                std.mem.eql(u8, rule.origin, origin);
+            if (!origin_match) continue;
+            const type_match = std.mem.eql(u8, rule.event_type, "*") or
+                std.mem.eql(u8, rule.event_type, event_type);
+            if (!type_match) continue;
+            const score: u8 =
+                @as(u8, if (std.mem.eql(u8, rule.origin, "*")) 0 else 2) +
+                @as(u8, if (std.mem.eql(u8, rule.event_type, "*")) 0 else 1);
+            if (best == null or score > best_score) {
+                best = rule.ttl_seconds;
+                best_score = score;
+            }
+        }
+        return best;
+    }
+
+    pub const ExpiredKey = struct {
+        bytes: [limits.key_length_max]u8,
+        len: u16,
+    };
+
+    pub const ReclaimScan = struct {
+        keys: []ExpiredKey,
+        complete: bool,
+    };
+
+    pub fn collect_expired(
+        self: *EventStore,
+        now: limits.Timestamp,
+        out: []ExpiredKey,
+    ) !ReclaimScan {
+        var context = ReclaimContext{
+            .store = self,
+            .now = now,
+            .out = out,
+        };
+        _ = try self.lsm.visit_prefix(event_prefix, &context, ReclaimContext.visit);
+        return .{
+            .keys = context.out[0..context.count],
+            .complete = context.complete,
+        };
+    }
+
+    const ReclaimContext = struct {
+        store: *const EventStore,
+        now: limits.Timestamp,
+        out: []ExpiredKey,
+        count: usize = 0,
+        complete: bool = true,
+
+        fn visit(self: *ReclaimContext, key: []const u8, value: EventValue) !event.VisitControl {
+            const ttl = self.store.retentionTtl(value.origin_service, value.event_type) orelse
+                return .continue_scan;
+            const age_seconds = self.now - value.timestamp;
+            if (age_seconds < 0) return .continue_scan;
+            if (@as(u64, @intCast(age_seconds)) < ttl) return .continue_scan;
+            if (self.count == self.out.len) {
+                self.complete = false;
+                return .stop;
+            }
+            self.out[self.count] = .{ .bytes = undefined, .len = @intCast(key.len) };
+            @memcpy(self.out[self.count].bytes[0..key.len], key);
+            self.count += 1;
+            return .continue_scan;
+        }
+    };
+
+    pub const reclaim_batch_max = 64;
+
+    pub fn reclaim_expired(self: *EventStore, now: limits.Timestamp) !usize {
+        if (self.retention.len == 0) return 0;
+        const keys = try self.allocator.alloc(ExpiredKey, reclaim_batch_max);
+        defer self.allocator.free(keys);
+
+        var reclaimed_total: usize = 0;
+        var batches: u32 = 0;
+        while (batches < reclaim_batches_max) : (batches += 1) {
+            const scan = try self.collect_expired(now, keys);
+            for (scan.keys) |expired| {
+                try self.lsm.delete(expired.bytes[0..expired.len], now);
+                reclaimed_total += 1;
+            }
+            if (scan.complete and scan.keys.len < keys.len) return reclaimed_total;
+            if (scan.keys.len == 0) return reclaimed_total;
+        }
+        return reclaimed_total;
+    }
+
+    const reclaim_batches_max: u32 = 4_096;
+
+    pub const BootstrapScanResult = struct {
+        events: []EventValue,
+        next_cursor_len: usize,
+        complete: bool,
+    };
+
+    /// One bounded page in key order. Empty `cursor` starts over; slices borrow caller buffers.
+    pub fn bootstrap_into(
+        self: *EventStore,
+        cursor: []const u8,
+        output: []EventValue,
+        byte_buffer: []u8,
+        next_cursor_out: *[limits.key_length_max]u8,
+    ) !BootstrapScanResult {
+        const origin = self.identity orelse return error.NoIdentity;
+        var prefix_buffer: [limits.key_length_max]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(
+            &prefix_buffer,
+            "evt:{s}:",
+            .{origin},
+        );
+        if (cursor.len != 0 and !std.mem.startsWith(u8, cursor, prefix))
+            return error.InvalidCursor;
+
+        var context = BootstrapContext{
+            .arena = try fixed.ByteArena.init(byte_buffer),
+            .output = output,
+            .cursor = cursor,
+            .next_cursor = next_cursor_out,
+        };
+        _ = try self.lsm.visit_prefix(prefix, &context, BootstrapContext.visit);
+        return .{
+            .events = context.output[0..context.count],
+            .next_cursor_len = context.next_cursor_len,
+            .complete = context.complete,
+        };
+    }
+
+    const BootstrapContext = struct {
+        arena: fixed.ByteArena,
+        output: []EventValue,
+        cursor: []const u8,
+        next_cursor: *[limits.key_length_max]u8,
+        count: usize = 0,
+        next_cursor_len: usize = 0,
+        complete: bool = true,
+
+        fn visit(self: *BootstrapContext, key: []const u8, value: EventValue) !event.VisitControl {
+            if (self.cursor.len != 0 and std.mem.order(u8, key, self.cursor) != .gt)
+                return .continue_scan;
+            if (self.count == self.output.len) {
+                self.complete = false;
+                return .stop;
+            }
+            const bytes_required = try limits.byte_count(
+                value.origin_service.len + value.event_type.len + value.payload.len +
+                    value.signature.len + value.vector_clock.len,
+            );
+            if (bytes_required > self.arena.remaining()) {
+                self.complete = false;
+                return .stop;
+            }
+            const origin = self.arena.write(value.origin_service) catch unreachable;
+            const event_type = self.arena.write(value.event_type) catch unreachable;
+            const payload = self.arena.write(value.payload) catch unreachable;
+            const signature = self.arena.write(value.signature) catch unreachable;
+            const vector_clock = self.arena.write(value.vector_clock) catch unreachable;
+            self.output[self.count] = .{
+                .sequence = value.sequence,
+                .event_type = event_type,
+                .payload = payload,
+                .timestamp = value.timestamp,
+                .origin_service = origin,
+                .signature = signature,
+                .vector_clock = vector_clock,
+            };
+            @memcpy(self.next_cursor[0..key.len], key);
+            self.next_cursor_len = key.len;
+            self.count += 1;
+            return .continue_scan;
+        }
+    };
 
     fn find_contract(
         self: *const EventStore,
@@ -385,6 +670,13 @@ pub const EventStore = struct {
             origin,
             event_type,
         }) catch return error.BufferTooSmall;
+        var start_buffer: [limits.key_length_max]u8 = undefined;
+        const start_key = std.fmt.bufPrint(&start_buffer, event_key_format, .{
+            origin,
+            event_type,
+            from_sequence,
+        }) catch return error.BufferTooSmall;
+        assert(std.mem.startsWith(u8, start_key, prefix));
         var context = QueryContext{
             .output = output,
             .arena = try fixed.ByteArena.init(byte_buffer),
@@ -392,7 +684,7 @@ pub const EventStore = struct {
             .count = 0,
             .complete = true,
         };
-        _ = try self.lsm.visit_prefix(prefix, &context, QueryContext.visit);
+        _ = try self.lsm.visit_prefix_from(prefix, start_key, &context, QueryContext.visit);
         const events = output[0..context.count];
         std.mem.sort(EventValue, events, {}, struct {
             fn less_than(_: void, left: EventValue, right: EventValue) bool {
@@ -424,6 +716,7 @@ test {
     _ = @import("manifest.zig");
     _ = @import("merge_iterator.zig");
     _ = @import("lsm.zig");
+    _ = @import("owner.zig");
 }
 
 test "storage surface exposes only bounded operational APIs" {
@@ -1492,7 +1785,6 @@ fn signed_test_event(
     event_type: []const u8,
     payload: []const u8,
     timestamp: limits.Timestamp,
-    // Caller-owned; backs the returned event's borrowed signature slice.
     signature_hex_out: *[signing.signature_hex_length]u8,
 ) !EventValue {
     var ev = try test_event_value(sequence, origin, event_type, payload, timestamp);
@@ -1535,7 +1827,6 @@ test "ingest_event accepts a validly signed event when the contract declares a p
     var query_buffer: TestQueryBuffer = undefined;
     const results = try query_buffer.query(&store, "order-service", "order.created", 0);
     try std.testing.expectEqual(@as(usize, 1), results.events.len);
-    // The signature survives storage and is served back verbatim.
     try std.testing.expect(results.events[0].is_signed());
     try std.testing.expect(results.events[0].verify_provenance(key.public_key()));
 }
@@ -1599,7 +1890,6 @@ test "ingest_event rejects a forged event signed by the wrong key" {
         Io.Dir.cwd().deleteFile(io, "data/test_ingest_forged.crumb") catch {};
     }
 
-    // Attacker signs an event attributed to order-service with its own key.
     var signature_hex: [signing.signature_hex_length]u8 = undefined;
     const forged = try signed_test_event(&attacker_key, 1, "order-service", "order.created", "{}", 100, &signature_hex);
     try std.testing.expectError(error.InvalidProvenance, store.ingest_event(forged));
@@ -1653,8 +1943,6 @@ test "owned appended events are signed, indexed for pull, and ingest-verifiable 
 
     const key = try signing.SigningKey.from_seed(@splat(21));
 
-    // Origin service appends its own events; the store auto-indexes them under
-    // evt: keys, signed with its key, for pull serving.
     var origin = try EventStore.init(allocator, "data/test_owned_origin.wal", io, .{
         .identity = "order-service",
         .signing_key = key,
@@ -1676,7 +1964,6 @@ test "owned appended events are signed, indexed for pull, and ingest-verifiable 
     }, 100);
     try std.testing.expect(append_response == .committed);
 
-    // The owned events are now servable via the pull query, signed.
     var origin_query: TestQueryBuffer = undefined;
     const served = try origin_query.query(&origin, "order-service", "order.created", 0);
     try std.testing.expectEqual(@as(usize, 2), served.events.len);
@@ -1685,8 +1972,6 @@ test "owned appended events are signed, indexed for pull, and ingest-verifiable 
         try std.testing.expect(ev.verify_provenance(key.public_key()));
     }
 
-    // A consumer that declares the owner's public key ingests them, verifying
-    // authorship — the full producer -> signed pull -> verified ingest loop.
     const contracts = [_]DependencyContract{.{
         .source_service = "order-service",
         .event_types = &[_][]const u8{"order.created"},
@@ -1822,7 +2107,6 @@ test "ingest_event silently deduplicates same (origin, type, sequence)" {
     var query_buffer: TestQueryBuffer = undefined;
     const results = try query_buffer.query(&store, "order-service", "order.created", 0);
     try std.testing.expectEqual(@as(usize, 1), results.events.len);
-    // First write wins
     try std.testing.expectEqualStrings("{\"first\":true}", results.events[0].payload);
 }
 
@@ -1949,4 +2233,495 @@ test "event store append and bounded query allocate nothing after initialization
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(failing.fail_index, failing.alloc_index);
     try std.testing.expectEqual(failing.resize_fail_index, failing.resize_index);
+}
+
+const vc_mod_test = @import("vc.zig");
+
+test "append stamps vector clocks and the summary exposes the high-water mark" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().deleteFile(io, "data/test_vc_append.wal") catch {};
+    defer Io.Dir.cwd().deleteFile(io, "data/test_vc_append.wal") catch {};
+
+    var event_store = try EventStore.init(allocator, "data/test_vc_append.wal", io, .{
+        .identity = "order-service",
+        .vc_node_key = vc_mod_test.nodeKey("node-a"),
+    });
+    defer event_store.deinit();
+
+    const append_events = [_]protocol.AppendEvent{
+        .{ .event_type = "order.created", .schema_version = 1, .payload = "{}" },
+    };
+    _ = try event_store.append_stream(.{
+        .stream_id = "orders/1",
+        .expected_version = .empty,
+        .command_id = "vc-1",
+        .events = &append_events,
+    }, 100);
+
+    var get_buffer: TestGetBuffer = undefined;
+    const indexed = (try get_buffer.get(
+        &event_store,
+        "evt:order-service:order.created:0000000000000001",
+    )).?;
+    try std.testing.expect(indexed.vector_clock.len > 0);
+    const stamped = try vc_mod_test.Clock.decode(indexed.vector_clock);
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        stamped.get(vc_mod_test.nodeKey("node-a")).?,
+    );
+
+    const summary = event_store.vc_summary();
+    try std.testing.expectEqual(@as(usize, 1), summary.len);
+    try std.testing.expectEqual(vc_mod_test.nodeKey("node-a"), summary[0].node);
+    try std.testing.expectEqual(@as(u64, 1), summary[0].counter);
+
+    _ = try event_store.append_stream(.{
+        .stream_id = "orders/2",
+        .expected_version = .empty,
+        .command_id = "vc-2",
+        .events = &append_events,
+    }, 200);
+    try std.testing.expectEqual(@as(u64, 2), event_store.vc_summary()[0].counter);
+}
+
+test "ingest merges remote vector clocks into the high-water mark" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().deleteFile(io, "data/test_vc_ingest.wal") catch {};
+    defer Io.Dir.cwd().deleteFile(io, "data/test_vc_ingest.wal") catch {};
+
+    var event_store = try EventStore.init(allocator, "data/test_vc_ingest.wal", io, .{
+        .identity = "my-service",
+        .vc_node_key = vc_mod_test.nodeKey("self"),
+        .contracts = &.{
+            .{
+                .source_service = "peer-service",
+                .event_types = &[_][]const u8{ "peer.event", "peer.other" },
+                .peer_address = "127.0.0.1:1",
+                .retention_hint = null,
+            },
+        },
+    });
+    defer event_store.deinit();
+
+    const remote_clock_text = "111=5,222=9";
+    const remote = try EventValue.init(.{
+        .sequence = 3,
+        .origin_service = "peer-service",
+        .event_type = "peer.event",
+        .payload = "{}",
+        .timestamp = 1,
+        .vector_clock = remote_clock_text,
+    });
+    try event_store.ingest_event(remote);
+
+    const summary = event_store.vc_summary();
+    try std.testing.expectEqual(@as(usize, 3), summary.len);
+    try std.testing.expectEqual(@as(u64, 5), event_store.vc_clock.get(111).?);
+    try std.testing.expectEqual(@as(u64, 9), event_store.vc_clock.get(222).?);
+    try std.testing.expectEqual(@as(u64, 0), event_store.vc_clock.get(vc_mod_test.nodeKey("self")).?);
+
+    try event_store.ingest_event(remote);
+    try std.testing.expectEqual(@as(u64, 9), event_store.vc_clock.get(222).?);
+    var stamped_again = remote;
+    stamped_again.vector_clock = "222=99";
+    try event_store.ingest_event(stamped_again);
+    try std.testing.expectEqual(@as(u64, 99), event_store.vc_clock.get(222).?);
+
+    const corrupt = try EventValue.init(.{
+        .sequence = 4,
+        .origin_service = "peer-service",
+        .event_type = "peer.other",
+        .payload = "{}",
+        .timestamp = 2,
+    });
+    var corrupted = corrupt;
+    corrupted.vector_clock = "garbage";
+    try std.testing.expectError(error.InvalidVectorClock, EventValue.init(.{
+        .sequence = 5,
+        .origin_service = "peer-service",
+        .event_type = "peer.bad",
+        .payload = "{}",
+        .timestamp = 3,
+        .vector_clock = "garbage",
+    }));
+    try event_store.ingest_event(corrupted);
+}
+
+test "vector-clock knowledge survives restart by folding stored events" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().deleteFile(io, "data/test_vc_restart.wal") catch {};
+    defer Io.Dir.cwd().deleteFile(io, "data/test_vc_restart.wal") catch {};
+
+    {
+        var event_store = try EventStore.init(allocator, "data/test_vc_restart.wal", io, .{
+            .identity = "svc",
+            .vc_node_key = vc_mod_test.nodeKey("n1"),
+            .contracts = &.{
+                .{
+                    .source_service = "other",
+                    .event_types = &[_][]const u8{"e"},
+                    .peer_address = "127.0.0.1:1",
+                    .retention_hint = null,
+                },
+            },
+        });
+        defer event_store.deinit();
+        const append_events = [_]protocol.AppendEvent{
+            .{ .event_type = "e", .schema_version = 1, .payload = "x" },
+            .{ .event_type = "e", .schema_version = 1, .payload = "y" },
+        };
+        _ = try event_store.append_stream(.{
+            .stream_id = "s/1",
+            .expected_version = .empty,
+            .command_id = "cmd-1",
+            .events = &append_events,
+        }, 1);
+        const remote = try EventValue.init(.{
+            .sequence = 1,
+            .origin_service = "other",
+            .event_type = "e",
+            .payload = "z",
+            .timestamp = 1,
+            .vector_clock = "777=12",
+        });
+        try event_store.ingest_event(remote);
+    }
+
+    {
+        var event_store = try EventStore.init(allocator, "data/test_vc_restart.wal", io, .{
+            .identity = "svc",
+            .vc_node_key = vc_mod_test.nodeKey("n1"),
+            .contracts = &.{
+                .{
+                    .source_service = "other",
+                    .event_types = &[_][]const u8{"e"},
+                    .peer_address = "127.0.0.1:1",
+                    .retention_hint = null,
+                },
+            },
+        });
+        defer event_store.deinit();
+        const summary = event_store.vc_summary();
+        try std.testing.expectEqual(@as(usize, 2), summary.len);
+        try std.testing.expectEqual(@as(u64, 2), event_store.vc_clock.get(vc_mod_test.nodeKey("n1")).?);
+        try std.testing.expectEqual(@as(u64, 12), event_store.vc_clock.get(777).?);
+
+        const append_events = [_]protocol.AppendEvent{
+            .{ .event_type = "e", .schema_version = 1, .payload = "w" },
+        };
+        _ = try event_store.append_stream(.{
+            .stream_id = "s/2",
+            .expected_version = .empty,
+            .command_id = "cmd-2",
+            .events = &append_events,
+        }, 2);
+        try std.testing.expectEqual(@as(u64, 3), event_store.vc_clock.get(vc_mod_test.nodeKey("n1")).?);
+    }
+}
+
+test "bootstrap pagination streams every own event exactly once" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().deleteFile(io, "data/test_bootstrap_scan.wal") catch {};
+    defer Io.Dir.cwd().deleteFile(io, "data/test_bootstrap_scan.wal") catch {};
+
+    var event_store = try EventStore.init(allocator, "data/test_bootstrap_scan.wal", io, .{
+        .identity = "my-service",
+        .vc_node_key = 12345,
+        .contracts = &.{
+            .{
+                .source_service = "peer-service",
+                .event_types = &[_][]const u8{"peer.event"},
+                .peer_address = "127.0.0.1:1",
+                .retention_hint = null,
+            },
+        },
+    });
+    defer event_store.deinit();
+
+    const own_events = [_]protocol.AppendEvent{
+        .{ .event_type = "alpha.event", .schema_version = 1, .payload = "a1" },
+        .{ .event_type = "beta.event", .schema_version = 1, .payload = "b1" },
+        .{ .event_type = "alpha.event", .schema_version = 1, .payload = "a2" },
+    };
+    _ = try event_store.append_stream(.{
+        .stream_id = "s/1",
+        .expected_version = .empty,
+        .command_id = "boot-1",
+        .events = own_events[0..2],
+    }, 1);
+    _ = try event_store.append_stream(.{
+        .stream_id = "s/2",
+        .expected_version = .empty,
+        .command_id = "boot-2",
+        .events = own_events[2..3],
+    }, 2);
+    const foreign = try EventValue.init(.{
+        .sequence = 9,
+        .origin_service = "peer-service",
+        .event_type = "peer.event",
+        .payload = "nope",
+        .timestamp = 3,
+        .vector_clock = "999=4",
+    });
+    try event_store.ingest_event(foreign);
+
+    var seen: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (seen.items) |item| allocator.free(item);
+        seen.deinit(allocator);
+    }
+    var cursor: [limits.key_length_max]u8 = undefined;
+    var cursor_len: usize = 0;
+    var undefined_cursor: [limits.key_length_max]u8 = undefined;
+    var pages: usize = 0;
+    var complete = false;
+    while (!complete) {
+        pages += 1;
+        try std.testing.expect(pages < 32);
+        var output: [2]EventValue = undefined;
+        var bytes: [8192]u8 = undefined;
+        var next_cursor: [limits.key_length_max]u8 = undefined;
+        const scan = try event_store.bootstrap_into(
+            cursor[0..cursor_len],
+            &output,
+            &bytes,
+            &next_cursor,
+        );
+        complete = scan.complete;
+        if (scan.next_cursor_len > 0) {
+            @memcpy(cursor[0..scan.next_cursor_len], next_cursor[0..scan.next_cursor_len]);
+            cursor_len = scan.next_cursor_len;
+        }
+        for (scan.events) |value| {
+            try seen.append(allocator, try allocator.dupe(u8, value.payload));
+            try std.testing.expectEqualStrings("my-service", value.origin_service);
+            try std.testing.expect(value.vector_clock.len > 0);
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), seen.items.len);
+    try std.testing.expectEqualStrings("a1", seen.items[0]);
+    try std.testing.expectEqualStrings("a2", seen.items[1]);
+    try std.testing.expectEqualStrings("b1", seen.items[2]);
+    try std.testing.expect(pages >= 2);
+
+    try std.testing.expectError(
+        error.InvalidCursor,
+        event_store.bootstrap_into("evt:other-service:", &.{}, &.{}, &undefined_cursor),
+    );
+
+    {
+        Io.Dir.cwd().deleteFile(io, "data/test_bootstrap_anon.wal") catch {};
+        var anonymous = try EventStore.init(
+            allocator,
+            "data/test_bootstrap_anon.wal",
+            io,
+            .{},
+        );
+        defer anonymous.deinit();
+        try std.testing.expectError(
+            error.NoIdentity,
+            anonymous.bootstrap_into("", &.{}, &.{}, &undefined_cursor),
+        );
+    }
+}
+
+test "reclaim_expired tombstones only rule-matched expired events" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().deleteFile(io, "data/test_reclaim.wal") catch {};
+    defer Io.Dir.cwd().deleteFile(io, "data/test_reclaim.wal") catch {};
+
+    const now: limits.Timestamp = 10_000;
+    {
+        var event_store = try EventStore.init(allocator, "data/test_reclaim.wal", io, .{
+            .identity = "my-service",
+            .vc_node_key = vc_mod_test.nodeKey("n1"),
+            .contracts = &.{
+                .{
+                    .source_service = "peer-service",
+                    .event_types = &[_][]const u8{"whatever.event"},
+                    .peer_address = "127.0.0.1:1",
+                    .retention_hint = null,
+                },
+            },
+            .retention = &.{
+                .{ .event_type = "ephemeral.event", .ttl_seconds = 100 },
+                .{ .origin = "peer-service", .ttl_seconds = 50 },
+                .{ .ttl_seconds = 10_000 },
+            },
+        });
+        defer event_store.deinit();
+
+        const own = [_]protocol.AppendEvent{
+            .{ .event_type = "ephemeral.event", .schema_version = 1, .payload = "old" },
+            .{ .event_type = "kept.event", .schema_version = 1, .payload = "young" },
+            .{ .event_type = "decision_recorded", .schema_version = 1, .payload = "durable" },
+        };
+        _ = try event_store.append_stream(.{
+            .stream_id = "s/1",
+            .expected_version = .empty,
+            .command_id = "reclaim-1",
+            .events = own[0..2],
+        }, now - 500);
+        _ = try event_store.append_stream(.{
+            .stream_id = "s/2",
+            .expected_version = .empty,
+            .command_id = "reclaim-2",
+            .events = own[2..3],
+        }, now - 500);
+
+        try event_store.ingest_event(try EventValue.init(.{
+            .sequence = 9,
+            .origin_service = "peer-service",
+            .event_type = "whatever.event",
+            .payload = "stale",
+            .timestamp = now - 200,
+            .vector_clock = "42=7",
+        }));
+
+        try std.testing.expectEqual(
+            @as(u64, 100),
+            event_store.retentionTtl("my-service", "ephemeral.event").?,
+        );
+        try std.testing.expectEqual(
+            @as(u64, 10_000),
+            event_store.retentionTtl("my-service", "kept.event").?,
+        );
+        try std.testing.expectEqual(
+            @as(u64, 50),
+            event_store.retentionTtl("peer-service", "whatever.event").?,
+        );
+
+        const reclaimed = try event_store.reclaim_expired(now);
+        try std.testing.expectEqual(@as(usize, 2), reclaimed);
+
+        var get_buffer: TestGetBuffer = undefined;
+        try std.testing.expectEqual(@as(?EventValue, null), try get_buffer.get(
+            &event_store,
+            "evt:my-service:ephemeral.event:0000000000000001",
+        ));
+        try std.testing.expectEqual(@as(?EventValue, null), try get_buffer.get(
+            &event_store,
+            "evt:peer-service:whatever.event:0000000000000009",
+        ));
+        const durable = (try get_buffer.get(
+            &event_store,
+            "evt:my-service:decision_recorded:0000000000000003",
+        )).?;
+        try std.testing.expectEqualStrings("durable", durable.payload);
+
+        try std.testing.expectEqual(@as(usize, 0), try event_store.reclaim_expired(now));
+
+        var query_buffer: TestQueryBuffer = undefined;
+        const pull = try query_buffer.query(&event_store, "peer-service", "whatever.event", 0);
+        try std.testing.expectEqual(@as(usize, 0), pull.events.len);
+    }
+    {
+        var reopened = try EventStore.init(allocator, "data/test_reclaim.wal", io, .{
+            .identity = "my-service",
+            .vc_node_key = vc_mod_test.nodeKey("n1"),
+        });
+        defer reopened.deinit();
+        var reopened_buffer: TestGetBuffer = undefined;
+        try std.testing.expectEqual(@as(?EventValue, null), try reopened_buffer.get(
+            &reopened,
+            "evt:my-service:ephemeral.event:0000000000000001",
+        ));
+        try std.testing.expect((try reopened_buffer.get(
+            &reopened,
+            "evt:my-service:decision_recorded:0000000000000003",
+        )).?.payload.len > 0);
+    }
+}
+
+test "empty retention config disables reclamation entirely" {
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    Io.Dir.cwd().deleteFile(io, "data/test_reclaim_off.wal") catch {};
+    defer Io.Dir.cwd().deleteFile(io, "data/test_reclaim_off.wal") catch {};
+
+    var event_store = try EventStore.init(allocator, "data/test_reclaim_off.wal", io, .{
+        .identity = "svc",
+    });
+    defer event_store.deinit();
+    const ev = try test_event_value(1, "svc", "t", "{}", 0);
+    try event_store.ingest_event(ev);
+    try std.testing.expectEqual(@as(usize, 0), try event_store.reclaim_expired(1_000_000));
+    var get_buffer: TestGetBuffer = undefined;
+    try std.testing.expect((try get_buffer.get(&event_store, "evt:svc:t:0000000000000001")) != null);
+}
+
+test "query pages stop at the pull frame budget and resume from the last sequence" {
+    const allocator = std.testing.allocator;
+
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    Io.Dir.cwd().deleteFile(io, "data/test_event_frame_budget.wal") catch {};
+    Io.Dir.cwd().deleteFile(io, "data/test_event_frame_budget.crumb") catch {};
+
+    var store = try EventStore.init(allocator, "data/test_event_frame_budget.wal", io, .{});
+    defer {
+        store.deinit();
+        Io.Dir.cwd().deleteFile(io, "data/test_event_frame_budget.wal") catch {};
+        Io.Dir.cwd().deleteFile(io, "data/test_event_frame_budget.crumb") catch {};
+    }
+
+    const payload: [6000]u8 = @splat('x');
+    const event_count: u64 = 300;
+    for (1..event_count + 1) |i| {
+        try store.ingest_event(try test_event_value(i, "big-service", "note", &payload, 1));
+        if (i == 150) try store.lsm.flush();
+    }
+
+    const query_buffer = try allocator.create(TestQueryBuffer);
+    defer allocator.destroy(query_buffer);
+
+    var from: u64 = 1;
+    var pages: u32 = 0;
+    while (pages < 16) : (pages += 1) {
+        const page = try query_buffer.query(&store, "big-service", "note", from);
+        if (page.events.len == 0) break;
+
+        var wire_size: limits.ByteCount = pull_response_wire_size_empty;
+        for (page.events, 0..) |*value, index| {
+            try std.testing.expectEqual(from + index, value.sequence);
+            var key_buffer: [limits.key_length_max]u8 = undefined;
+            const key = try make_event_key_into(&key_buffer, .{
+                .origin = value.origin_service,
+                .event_type = value.event_type,
+                .sequence = value.sequence,
+            });
+            wire_size += try pull_entry_wire_size(key, value);
+        }
+        try std.testing.expect(wire_size <= protocol.frame_payload_size_max);
+        const last = page.events[page.events.len - 1].sequence;
+        try std.testing.expectEqual(last == event_count, page.complete);
+        from = last + 1;
+    }
+    try std.testing.expectEqual(event_count + 1, from);
+    try std.testing.expect(pages >= 2);
 }

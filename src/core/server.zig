@@ -14,6 +14,7 @@ const contract_mod = @import("contract.zig");
 const identity_mod = @import("identity.zig");
 const time_mod = @import("time.zig");
 const limits = @import("limits.zig");
+const owner_mod = @import("owner.zig");
 
 const EventStore = store_mod.EventStore;
 const EventValue = event_mod.EventValue;
@@ -22,8 +23,14 @@ const ServiceIdentity = identity_mod.ServiceIdentity;
 const Breadcrumb = breadcrumb_mod.Breadcrumb;
 
 const log = std.log.scoped(.server);
-const connection_idle_deadline_ms: u32 = 5 * 60 * 1000;
+// NOTE: a leak bound, not a liveness mechanism; keep it above any client stall.
+const connection_idle_deadline_ms: u32 = 60 * 60 * 1000;
 const handshake_deadline_ms: u32 = if (builtin.is_test) 50 else 3_000;
+const bootstrap_pages_max: u32 = 4_096;
+const gossip_dial_timeout_ms: u32 = if (builtin.is_test) 50 else 5_000;
+const gossip_interval_ms: u64 = if (builtin.is_test) 20 else 60_000;
+const gossip_retry_first_ms: u64 = if (builtin.is_test) 20 else 1_000;
+const gossip_tick_ms: u64 = 100;
 
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -57,6 +64,7 @@ pub const Server = struct {
     listener: transport.Listener,
     io: Io,
     running: std.atomic.Value(bool),
+    gossip_started: std.atomic.Value(bool) = .init(false),
     connection_group: Io.Group,
     connection_pool: []ConnectionSlot,
     connection_pool_mutex: Io.Mutex,
@@ -80,6 +88,8 @@ pub const Server = struct {
     recovery_scratch: []u8,
     integrity_verified: bool,
     connections_active: std.atomic.Value(u16),
+    /// When set, store access routes through it and skips `store_mutex`.
+    store_owner: ?*owner_mod.Owner,
     auth_failures: std.atomic.Value(u64),
     permission_denials: std.atomic.Value(u64),
     admission_saturation: std.atomic.Value(u64),
@@ -96,6 +106,8 @@ pub const Server = struct {
     const ConnectionScratch = struct {
         query_events: [limits.pull_events_max]EventValue,
         read_events: [limits.read_events_max]protocol.ReadEvent,
+        vc_entries: [protocol.vc_entries_max]protocol.VcEntry,
+        bootstrap_cursor: [limits.key_length_max]u8,
         query_bytes: [protocol.frame_size_max]u8,
         receive_completions: [2]ReceiveCompletion,
     };
@@ -118,6 +130,7 @@ pub const Server = struct {
         client_secret: []const u8 = "",
         credentials: []const auth.Credential = &.{},
         integrity_verified: bool = true,
+        use_store_owner: bool = false,
         backups_completed: u64 = 0,
         last_backup_unix_seconds: i64 = 0,
     };
@@ -180,6 +193,21 @@ pub const Server = struct {
         errdefer allocator.free(replay_entries);
         for (replay_entries) |*entry| entry.* = .{};
 
+        var store_owner: ?*owner_mod.Owner = null;
+        if (options.use_store_owner) {
+            const owner = try allocator.create(owner_mod.Owner);
+            errdefer allocator.destroy(owner);
+            owner.* = try owner_mod.Owner.init(
+                allocator,
+                options.store,
+                options.io,
+                owner_mod.capacity_default,
+            );
+            errdefer owner.deinit();
+            try owner.start();
+            store_owner = owner;
+        }
+
         target.* = .{
             .allocator = allocator,
             .store = options.store,
@@ -212,6 +240,7 @@ pub const Server = struct {
             .recovery_tasks = recovery_tasks,
             .recovery_scratch = recovery_scratch,
             .integrity_verified = options.integrity_verified,
+            .store_owner = store_owner,
             .connections_active = .init(0),
             .auth_failures = .init(0),
             .permission_denials = .init(0),
@@ -228,6 +257,12 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.connection_group.cancel(self.io);
+        if (self.store_owner) |owner| {
+            owner.stop();
+            owner.deinit();
+            self.allocator.destroy(owner);
+            self.store_owner = null;
+        }
         for (self.connection_pool) |slot| {
             std.debug.assert(!slot.in_use);
         }
@@ -239,20 +274,32 @@ pub const Server = struct {
         self.listener.deinit();
     }
 
-    /// Run startup recovery: compute recovery plan from breadcrumbs,
-    /// connect to each peer, send PullRequest, ingest responses,
-    /// update breadcrumbs.
     pub fn run_recovery(self: *Server) !void {
+        return self.recoveryPass(true);
+    }
+
+    pub fn gossipOnce(self: *Server) void {
+        self.recoveryPass(false) catch |err| {
+            log.warn("gossip pass failed: {}", .{err});
+        };
+    }
+
+    fn recoveryPass(self: *Server, startup: bool) !void {
         var task_count: u32 = 0;
         for (self.contracts) |contract| {
             for (contract.event_types) |event_type| {
                 std.debug.assert(task_count < self.recovery_tasks.len);
-                const last_sequence = try self.store.get_breadcrumb_sequence(
+                self.store_mutex.lockUncancelable(self.io);
+                const last_sequence = self.store.get_breadcrumb_sequence(
                     contract.source_service,
                     event_type,
                     contract.peer_address,
                     self.recovery_scratch,
-                );
+                ) catch |err| {
+                    self.store_mutex.unlock(self.io);
+                    return err;
+                };
+                self.store_mutex.unlock(self.io);
                 const from_sequence = if (last_sequence) |sequence| blk: {
                     const addition = @addWithOverflow(sequence, 1);
                     if (addition[1] != 0) return error.SequenceOverflow;
@@ -263,30 +310,196 @@ pub const Server = struct {
                     .source_service = contract.source_service,
                     .event_type = event_type,
                     .from_sequence = from_sequence,
+                    .had_breadcrumb = last_sequence != null,
                 };
                 task_count += 1;
             }
         }
 
         if (task_count == 0) {
-            log.info("recovery: no tasks to run", .{});
+            if (startup) log.info("recovery: no tasks to run", .{});
             return;
         }
 
         var total_ingested: u32 = 0;
         var errors_skipped: u32 = 0;
 
-        for (self.recovery_tasks[0..task_count]) |task| {
-            self.execute_recovery_task(task, &total_ingested) catch {
-                errors_skipped += 1;
+        var processed: u32 = 0;
+        while (processed < task_count) : (processed += 1) {
+            if (self.recovery_tasks[processed].bootstrap_done) continue;
+            const peer_address = self.recovery_tasks[processed].peer_address;
+            const source_service = self.recovery_tasks[processed].source_service;
+
+            var peer_fresh = true;
+            var span_end = processed;
+            while (span_end < task_count) : (span_end += 1) {
+                const task = self.recovery_tasks[span_end];
+                if (!std.mem.eql(u8, task.peer_address, peer_address)) continue;
+                if (!std.mem.eql(u8, task.source_service, source_service)) continue;
+                if (task.had_breadcrumb) peer_fresh = false;
+            }
+            var inner = processed;
+            while (inner < task_count) : (inner += 1) {
+                const task = self.recovery_tasks[inner];
+                if (!std.mem.eql(u8, task.peer_address, peer_address)) continue;
+                if (!std.mem.eql(u8, task.source_service, source_service)) continue;
+                if (peer_fresh) {
+                    self.recovery_tasks[inner].bootstrap_done = true;
+                }
+            }
+
+            if (peer_fresh) {
+                const contract_types = self.contractTypesFor(
+                    source_service,
+                    peer_address,
+                ) orelse &.{};
+                self.execute_bootstrap_drain(
+                    peer_address,
+                    source_service,
+                    contract_types,
+                    &total_ingested,
+                ) catch |err| {
+                    log.warn("bootstrap from {s} failed: {}", .{ peer_address, err });
+                    errors_skipped += 1;
+                };
                 continue;
-            };
+            }
+
+            var inner_index = processed;
+            while (inner_index < task_count) : (inner_index += 1) {
+                const task = self.recovery_tasks[inner_index];
+                if (!std.mem.eql(u8, task.peer_address, peer_address)) continue;
+                if (!std.mem.eql(u8, task.source_service, source_service)) continue;
+                if (task.bootstrap_done) continue;
+                self.execute_recovery_task(task, &total_ingested) catch {
+                    errors_skipped += 1;
+                    continue;
+                };
+            }
         }
 
-        log.info("recovery complete: {d} events ingested, {d} tasks skipped", .{
-            total_ingested,
-            errors_skipped,
-        });
+        if (startup or total_ingested > 0 or errors_skipped > 0) {
+            log.info("recovery complete: {d} events ingested, {d} tasks skipped", .{
+                total_ingested,
+                errors_skipped,
+            });
+        }
+    }
+
+    fn contractTypesFor(
+        self: *Server,
+        source_service: []const u8,
+        peer_address: []const u8,
+    ) ?[]const []const u8 {
+        for (self.contracts) |*contract| {
+            if (std.mem.eql(u8, contract.source_service, source_service) and
+                std.mem.eql(u8, contract.peer_address, peer_address))
+                return contract.event_types;
+        }
+        return null;
+    }
+
+    fn execute_bootstrap_drain(
+        self: *Server,
+        peer_address: []const u8,
+        source_service: []const u8,
+        contract_types: []const []const u8,
+        total_ingested: *u32,
+    ) !void {
+        try transport.dial_into_timeout(
+            self.recovery_connection,
+            peer_address,
+            self.io,
+            gossip_dial_timeout_ms,
+        );
+        const conn = self.recovery_connection;
+        defer conn.close();
+
+        if (self.client_secret.len == 0) {
+            try conn.send_message(.{ .handshake = .{
+                .service_name = self.identity.name,
+                .instance_id = self.identity.instance_id,
+            } });
+        } else {
+            try self.authenticate_as_client(conn);
+        }
+
+        const maxima = try self.allocator.alloc(limits.Sequence, contract_types.len);
+        defer self.allocator.free(maxima);
+        @memset(maxima, 0);
+
+        var cursor: [limits.key_length_max]u8 = undefined;
+        var cursor_len: usize = 0;
+        var complete = false;
+        var pages: u32 = 0;
+        while (!complete) {
+            pages += 1;
+            if (pages > bootstrap_pages_max) return error.BootstrapPageLimitExceeded;
+            try conn.send_message(.{ .bootstrap_request = .{
+                .cursor = cursor[0..cursor_len],
+                .max_count = 0,
+            } });
+            const response = try conn.recv_message();
+            switch (response) {
+                .bootstrap_response => |page| {
+                    for (page.events) |entry| {
+                        const ev = EventValue.deserialize_borrowed(entry.value) catch |err| {
+                            log.warn("bootstrap: corrupt event from {s}: {}", .{
+                                peer_address,
+                                err,
+                            });
+                            continue;
+                        };
+                        for (contract_types, 0..) |contract_type, index| {
+                            if (std.mem.eql(u8, ev.event_type, contract_type) and
+                                ev.sequence > maxima[index])
+                                maxima[index] = ev.sequence;
+                        }
+                        // WARN: runs beside request handlers and syncs the WAL; hold store_mutex.
+                        self.store_mutex.lockUncancelable(self.io);
+                        const ingested = self.store.ingest_event(ev);
+                        self.store_mutex.unlock(self.io);
+                        ingested catch |err| {
+                            log.debug("bootstrap: skipped event from {s}: {}", .{
+                                peer_address,
+                                err,
+                            });
+                            continue;
+                        };
+                        total_ingested.* += 1;
+                    }
+                    if (page.next_cursor.len > cursor.len) return error.InvalidCursor;
+                    @memcpy(cursor[0..page.next_cursor.len], page.next_cursor);
+                    cursor_len = page.next_cursor.len;
+                    complete = page.complete;
+                },
+                .err => |e| {
+                    log.warn("bootstrap error from {s}: {s}", .{ peer_address, e.message });
+                    return error.RecoveryTaskFailed;
+                },
+                else => return error.UnexpectedMessage,
+            }
+        }
+
+        const now: limits.Timestamp = @intCast(time_mod.Instant.now(self.io).timestamp.sec);
+        self.store_mutex.lockUncancelable(self.io);
+        defer self.store_mutex.unlock(self.io);
+        for (contract_types, 0..) |contract_type, index| {
+            if (maxima[index] == 0) continue;
+            const breadcrumb = Breadcrumb{
+                .source_service = source_service,
+                .event_type = contract_type,
+                .last_sequence = maxima[index],
+                .peer_address = peer_address,
+                .updated_at = now,
+            };
+            try self.store.put_breadcrumb(
+                breadcrumb,
+                maxima[index],
+                self.identity.name,
+                now,
+            );
+        }
     }
 
     fn execute_recovery_task(
@@ -294,10 +507,11 @@ pub const Server = struct {
         task: recovery_mod.RecoveryTask,
         total_ingested: *u32,
     ) !void {
-        try transport.dial_into(
+        try transport.dial_into_timeout(
             self.recovery_connection,
             task.peer_address,
             self.io,
+            gossip_dial_timeout_ms,
         );
         const conn = self.recovery_connection;
         defer conn.close();
@@ -334,7 +548,11 @@ pub const Server = struct {
 
                     if (ev.sequence > highest_seq) highest_seq = ev.sequence;
 
-                    self.store.ingest_event(ev) catch |err| {
+                    // WARN: runs beside request handlers and syncs the WAL; hold store_mutex.
+                    self.store_mutex.lockUncancelable(self.io);
+                    const ingested = self.store.ingest_event(ev);
+                    self.store_mutex.unlock(self.io);
+                    ingested catch |err| {
                         log.warn("recovery: rejected event from {s}: {}", .{
                             task.peer_address,
                             err,
@@ -369,6 +587,8 @@ pub const Server = struct {
             .peer_address = task.peer_address,
             .updated_at = now,
         };
+        self.store_mutex.lockUncancelable(self.io);
+        defer self.store_mutex.unlock(self.io);
         try self.store.put_breadcrumb(breadcrumb, sequence, self.identity.name, now);
     }
 
@@ -408,6 +628,50 @@ pub const Server = struct {
                 },
                 .health_request => {
                     try conn.send_message(.{ .health_response = self.health() });
+                },
+                .vc_summary_request => {
+                    if (self.store_owner) |owner| {
+                        var summary_len: usize = 0;
+                        var outcome: owner_mod.Outcome =
+                            .{ .failed = error.Unset };
+                        var done: Io.Semaphore = .{ .permits = 0 };
+                        owner.submit(.{
+                            .payload = .{ .vc_summary = .{
+                                .out = &scratch.vc_entries,
+                                .out_len = &summary_len,
+                            } },
+                            .outcome = &outcome,
+                            .done = &done,
+                        }) catch {
+                            try conn.send_message(.{ .err = .{
+                                .code = .internal_error,
+                                .message = "store busy",
+                            } });
+                            return;
+                        };
+                        switch (outcome) {
+                            .done => {},
+                            .failed => |err| {
+                                try send_store_error(conn, err);
+                                return;
+                            },
+                        }
+                        try conn.send_message(.{ .vc_summary_response = .{
+                            .entries = scratch.vc_entries[0..summary_len],
+                        } });
+                        return;
+                    }
+                    self.store_mutex.lockUncancelable(self.io);
+                    const entries = self.store.vc_summary();
+                    const count = @min(entries.len, scratch.vc_entries.len);
+                    @memcpy(scratch.vc_entries[0..count], entries[0..count]);
+                    self.store_mutex.unlock(self.io);
+                    try conn.send_message(.{ .vc_summary_response = .{
+                        .entries = scratch.vc_entries[0..count],
+                    } });
+                },
+                .bootstrap_request => |request| {
+                    try self.serve_bootstrap_request(conn, scratch, request);
                 },
                 else => {
                     conn.send_message(.{ .err = .{
@@ -655,12 +919,7 @@ pub const Server = struct {
         try conn.send_message(.{ .append_stream_response = response });
     }
 
-    /// Returns true holding `store_mutex` with the active memtable guaranteed to
-    /// have room for a full transaction; freezes and hands the frozen memtable to
-    /// the background flush task when the active one crosses the high-water mark,
-    /// and applies bounded backpressure (off `store_mutex`, so the flush task can
-    /// always publish) when a flush is already in flight. Returns false after
-    /// sending an error frame.
+    // NOTE: true holds `store_mutex` with room for a transaction; false has sent an error frame.
     fn reserve_flush_room(self: *Server, conn: *transport.Connection) !bool {
         while (true) {
             self.store_mutex.lockUncancelable(self.io);
@@ -723,6 +982,17 @@ pub const Server = struct {
             self.flush_active_bg = false;
             self.flush_done.broadcast(self.io);
             self.flush_mutex.unlock(self.io);
+
+            if (self.store.retention.len != 0) {
+                self.store_mutex.lockUncancelable(self.io);
+                _ = self.store.reclaim_expired(
+                    @intCast(time_mod.Instant.now(self.io).timestamp.sec),
+                ) catch |err| blk: {
+                    log.warn("retention reclaim failed: {}", .{err});
+                    break :blk @as(usize, 0);
+                };
+                self.store_mutex.unlock(self.io);
+            }
         }
     }
 
@@ -755,6 +1025,86 @@ pub const Server = struct {
                 self.store.lsm.compaction_abandon();
             }
         }
+    }
+
+    fn serve_bootstrap_request(
+        self: *Server,
+        conn: *transport.Connection,
+        scratch: *ConnectionScratch,
+        request: protocol.BootstrapRequest,
+    ) !void {
+        const cap: usize = if (request.max_count == 0)
+            limits.pull_events_max
+        else
+            @min(request.max_count, limits.pull_events_max);
+
+        self.store_mutex.lockUncancelable(self.io);
+        const scan = self.store.bootstrap_into(
+            request.cursor,
+            scratch.query_events[0..cap],
+            &scratch.query_bytes,
+            &scratch.bootstrap_cursor,
+        ) catch |err| {
+            self.store_mutex.unlock(self.io);
+            self.record_store_error(err);
+            switch (err) {
+                error.InvalidCursor, error.NoIdentity => try conn.send_message(.{ .err = .{
+                    .code = .invalid_message,
+                    .message = "invalid bootstrap cursor",
+                } }),
+                else => try send_store_error(conn, err),
+            }
+            return;
+        };
+        const vc_entries = self.store.vc_summary();
+        const vc_count = @min(vc_entries.len, scratch.vc_entries.len);
+        @memcpy(scratch.vc_entries[0..vc_count], vc_entries[0..vc_count]);
+        self.store_mutex.unlock(self.io);
+
+        const wire = conn.response_scratch();
+        var used: u32 = 0;
+        var built: usize = 0;
+        const budget: u32 = protocol.frame_payload_size_max - 512;
+        while (built < scan.events.len) : (built += 1) {
+            const size = scan.events[built].serialized_size();
+            if (used + 4 + size > budget) break;
+            std.mem.writeInt(u32, wire[used..][0..4], @intCast(size), .big);
+            _ = scan.events[built].serialize_into(wire[used + 4 ..]) catch unreachable;
+            used += 4 + @as(u32, @intCast(size));
+        }
+
+        var cursor_len = scan.next_cursor_len;
+        var complete = scan.complete;
+        if (built < scan.events.len) {
+            if (built == 0) {
+                try send_store_error(conn, error.ReadEventTooLarge);
+                return;
+            }
+            complete = false;
+            const resumed_key = store_mod.make_event_key_into(
+                &scratch.bootstrap_cursor,
+                .{
+                    .origin = scan.events[built - 1].origin_service,
+                    .event_type = scan.events[built - 1].event_type,
+                    .sequence = scan.events[built - 1].sequence,
+                },
+            ) catch unreachable;
+            cursor_len = resumed_key.len;
+        }
+
+        var entries: [limits.pull_events_max]protocol.BootstrapEvent = undefined;
+        var offset: u32 = 0;
+        for (entries[0..built]) |*entry| {
+            const value_len = std.mem.readInt(u32, wire[offset..][0..4], .big);
+            entry.* = .{ .value = wire[offset + 4 ..][0..value_len] };
+            offset += 4 + value_len;
+        }
+        try conn.send_message(.{ .bootstrap_response = .{
+            .events = entries[0..built],
+            .next_cursor = scratch.bootstrap_cursor[0..cursor_len],
+            .complete = complete,
+            .vc = scratch.vc_entries[0..vc_count],
+        } });
     }
 
     fn serve_read_stream(
@@ -812,6 +1162,15 @@ pub const Server = struct {
             background_flush_loop,
             .{self},
         );
+        // NOTE: never run this before accept: two peers booting together would deadlock.
+        // Spawn at most once, because serve() can re-enter.
+        if (!self.gossip_started.swap(true, .acq_rel)) {
+            try self.connection_group.concurrent(
+                self.io,
+                gossip_loop,
+                .{self},
+            );
+        }
 
         while (self.running.load(.acquire)) {
             if (shutdown_requested.load(.acquire)) break;
@@ -863,6 +1222,23 @@ pub const Server = struct {
                 return;
             }
             try self.io.sleep(.fromMilliseconds(10), .awake);
+        }
+    }
+
+    fn gossip_loop(self: *Server) Io.Cancelable!void {
+        var first_pass = true;
+        while (self.running.load(.acquire)) {
+            self.gossipOnce();
+            const delay_ms: u64 = if (first_pass)
+                gossip_retry_first_ms
+            else
+                gossip_interval_ms;
+            first_pass = false;
+            var waited_ms: u64 = 0;
+            while (waited_ms < delay_ms and self.running.load(.acquire)) {
+                try self.io.sleep(.fromMilliseconds(gossip_tick_ms), .awake);
+                waited_ms += gossip_tick_ms;
+            }
         }
     }
 
@@ -955,9 +1331,7 @@ pub const Server = struct {
     }
 
     pub fn health(self: *Server) protocol.HealthResponse {
-        // Single-node posture: durability is local WAL fsync, so there is no
-        // cross-node quorum. These fields remain on the wire for compatibility
-        // and report neutral values.
+        // NOTE: single node, so no quorum; these fields stay for wire compatibility.
         const clustered = false;
         const replication_quorum = false;
         const replication_poisoned = false;
@@ -1009,8 +1383,7 @@ pub const Server = struct {
         };
     }
 
-    // Called with store_mutex held so a corruption finding and the poison bit
-    // become visible as one state transition to health readers.
+    // WARN: hold store_mutex so the finding and poison bit publish as one state change.
     fn record_store_error(self: *Server, store_error: anyerror) void {
         switch (store_error) {
             error.CorruptStreamData,
@@ -1033,8 +1406,8 @@ fn message_permitted(permissions: auth.Permissions, message: protocol.Message) b
         .append_stream => permissions.append,
         .read_stream => permissions.read_stream,
         .read_log => permissions.read_log,
-        .pull_request => permissions.recover,
-        .health_request => permissions.observe,
+        .pull_request, .bootstrap_request => permissions.recover,
+        .health_request, .vc_summary_request => permissions.observe,
         .handshake,
         .pull_response,
         .err,
@@ -1042,6 +1415,8 @@ fn message_permitted(permissions: auth.Permissions, message: protocol.Message) b
         .read_stream_response,
         .read_log_response,
         .health_response,
+        .vc_summary_response,
+        .bootstrap_response,
         => false,
     };
 }
@@ -1068,12 +1443,19 @@ test "operation permissions are least privilege" {
         .max_count = 1,
     } };
     const observe: protocol.Message = .{ .health_request = .{} };
+    const observe_vc: protocol.Message = .{ .vc_summary_request = .{} };
+    const recover_bootstrap: protocol.Message = .{ .bootstrap_request = .{
+        .cursor = "",
+        .max_count = 1,
+    } };
     const messages = [_]protocol.Message{
         append,
         read_stream,
         read_log,
         recover,
         observe,
+        observe_vc,
+        recover_bootstrap,
     };
     const grants = [_]auth.Permissions{
         .{ .append = true },
@@ -1081,10 +1463,20 @@ test "operation permissions are least privilege" {
         .{ .read_log = true },
         .{ .recover = true },
         .{ .observe = true },
+        .{ .observe = true },
+        .{ .recover = true },
     };
-    for (grants, 0..) |grant, allowed| {
-        for (messages, 0..) |message, operation| {
-            try std.testing.expectEqual(allowed == operation, message_permitted(grant, message));
+    for (messages, 0..) |message, operation| {
+        for (grants) |grant| {
+            const expected = switch (operation) {
+                0 => grant.append,
+                1 => grant.read_stream,
+                2 => grant.read_log,
+                3, 6 => grant.recover,
+                4, 5 => grant.observe,
+                else => unreachable,
+            };
+            try std.testing.expectEqual(expected, message_permitted(grant, message));
         }
     }
     try std.testing.expect(!message_permitted(.{
@@ -1353,11 +1745,9 @@ test "recovery ingests events from peer" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Clean up test files
     Io.Dir.cwd().deleteFile(io, "data/test_recovery_server.wal") catch {};
     Io.Dir.cwd().deleteFile(io, "data/test_recovery_server.crumb") catch {};
 
-    // Start a mock peer that serves events
     var peer_listener = try transport.Listener.init("127.0.0.1:0", io);
     defer peer_listener.deinit();
     const peer_port = peer_listener.get_port();
@@ -1370,19 +1760,15 @@ test "recovery ingests events from peer" {
     );
     var peer_connection: transport.Connection = undefined;
 
-    // Peer thread: respond to handshake + pull request with 2 events
     const peer_thread = try std.Thread.spawn(.{}, struct {
         fn run(l: *transport.Listener, conn: *transport.Connection) void {
             l.accept_into(conn) catch return;
             defer conn.close();
 
-            // Receive handshake
             _ = conn.recv_message() catch return;
 
-            // Receive pull request
             _ = conn.recv_message() catch return;
 
-            // Send 2 events
             const entries = [_]protocol.PullResponse.EventEntry{
                 .{
                     .key = "evt:order-service:order.created:0000000000000001",
@@ -1397,7 +1783,6 @@ test "recovery ingests events from peer" {
         }
     }.run, .{ &peer_listener, &peer_connection });
 
-    // Contract pointing to mock peer
     const event_types = [_][]const u8{"order.created"};
     const contracts = [_]DependencyContract{.{
         .source_service = "order-service",
@@ -1415,6 +1800,13 @@ test "recovery ingests events from peer" {
         Io.Dir.cwd().deleteFile(io, "data/test_recovery_server.wal") catch {};
         Io.Dir.cwd().deleteFile(io, "data/test_recovery_server.crumb") catch {};
     }
+    try event_store.put_breadcrumb(.{
+        .source_service = "order-service",
+        .event_type = "order.created",
+        .last_sequence = 0,
+        .peer_address = peer_address,
+        .updated_at = 1,
+    }, 0, "my-service", 1);
 
     const identity = ServiceIdentity{
         .name = "my-service",
@@ -1429,7 +1821,6 @@ test "recovery ingests events from peer" {
 
     peer_thread.join();
 
-    // Verify events were ingested
     var events: [limits.pull_events_max]EventValue = undefined;
     var bytes: [1024 * 1024]u8 = undefined;
     const results = try event_store.query_events_into(
@@ -1450,11 +1841,9 @@ test "handle_connection serves PullRequest" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Clean up
     Io.Dir.cwd().deleteFile(io, "data/test_serve_pull.wal") catch {};
     Io.Dir.cwd().deleteFile(io, "data/test_serve_pull.crumb") catch {};
 
-    // Create store with events
     var event_store = try EventStore.init(allocator, "data/test_serve_pull.wal", io, .{
         .identity = "my-service",
     });
@@ -1464,7 +1853,6 @@ test "handle_connection serves PullRequest" {
         Io.Dir.cwd().deleteFile(io, "data/test_serve_pull.crumb") catch {};
     }
 
-    // Put 3 events
     for (1..4) |i| {
         const payload = try std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{i});
         defer allocator.free(payload);
@@ -1491,7 +1879,6 @@ test "handle_connection serves PullRequest" {
     var accepted_connection: transport.Connection = undefined;
     var connection_scratch: Server.ConnectionScratch = undefined;
 
-    // Server thread: accept one connection and handle it
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(
             s: *Server,
@@ -1507,7 +1894,6 @@ test "handle_connection serves PullRequest" {
         }
     }.run, .{ &srv, &accepted_connection, &connection_scratch });
 
-    // Client: connect, handshake, pull request, receive response
     var address_buffer: [32]u8 = undefined;
     const address = try std.fmt.bufPrint(&address_buffer, "127.0.0.1:{d}", .{port});
     var client: transport.Connection = undefined;
@@ -1528,12 +1914,10 @@ test "handle_connection serves PullRequest" {
 
     try std.testing.expectEqual(@as(usize, 3), response.pull_response.events.len);
 
-    // Verify events are deserializable and in sequence order
     const ev0 = try EventValue.deserialize_borrowed(response.pull_response.events[0].value);
     try std.testing.expectEqual(@as(u64, 1), ev0.sequence);
     try std.testing.expectEqualStrings("my-service", ev0.origin_service);
 
-    // Close client to unblock server thread
     client.close();
     server_thread.join();
 }
@@ -1882,6 +2266,134 @@ test "network driver appends and reads committed streams" {
     server_thread.join();
 }
 
+test "vector-clock summary serves high-water marks over the wire" {
+    const vc = @import("vc.zig");
+    const driver = @import("../driver.zig");
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wal_path = "data/test_vc_summary_wire.wal";
+    Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    var event_store = try EventStore.init(allocator, wal_path, io, .{
+        .identity = "compix-test",
+        .vc_node_key = vc.nodeKey("node-1"),
+        .contracts = &.{
+            .{
+                .source_service = "peer-service",
+                .event_types = &[_][]const u8{"peer.event"},
+                .peer_address = "127.0.0.1:1",
+                .retention_hint = null,
+            },
+        },
+    });
+    defer event_store.deinit();
+    const identity: ServiceIdentity = .{
+        .name = "compix-test",
+        .instance_id = "node-1",
+        .listen_address = "127.0.0.1:0",
+    };
+    const client_secret = "0123456789abcdef0123456789abcdef";
+    const credentials = [_]auth.Credential{ .{
+        .service_name = "writer-observer",
+        .secret = client_secret,
+        .permissions = .{ .append = true, .observe = true },
+    }, .{
+        .service_name = "plain-reader",
+        .secret = client_secret,
+        .permissions = .{ .read_stream = true },
+    } };
+    var srv: Server = undefined;
+    try Server.init_in_place(&srv, allocator, .{
+        .store = &event_store,
+        .identity = identity,
+        .contracts = event_store.contracts,
+        .io = io,
+        .credentials = &credentials,
+    });
+    defer srv.deinit();
+    var accepted_connection: transport.Connection = undefined;
+    var connection_scratch: Server.ConnectionScratch = undefined;
+    const server_thread = try std.Thread.spawn(
+        .{},
+        serve_test_connections,
+        .{ &srv, &accepted_connection, &connection_scratch, 3 },
+    );
+    var address_buffer: [32]u8 = undefined;
+    const address = try std.fmt.bufPrint(
+        &address_buffer,
+        "127.0.0.1:{d}",
+        .{srv.listener.get_port()},
+    );
+
+    var client: driver.Client = undefined;
+    try driver.Client.connect(&client, .{
+        .address = address,
+        .service_name = "writer-observer",
+        .instance_id = "watch-1",
+        .secret = client_secret,
+        .io = io,
+    });
+    const events = [_]driver.AppendEvent{.{
+        .event_type = "order.created",
+        .schema_version = 1,
+        .payload = "{}",
+    }};
+    const append_reply = try client.append(.{
+        .stream_id = "orders/wire",
+        .expected_version = .empty,
+        .command_id = "wire-command-1",
+        .events = &events,
+    });
+    try std.testing.expect(append_reply.response == .committed);
+
+    const summary_reply = try client.vc_summary();
+    try std.testing.expect(summary_reply == .response);
+    try std.testing.expectEqual(@as(usize, 1), summary_reply.response.entries.len);
+    try std.testing.expectEqual(vc.nodeKey("node-1"), summary_reply.response.entries[0].node);
+    try std.testing.expectEqual(@as(u64, 1), summary_reply.response.entries[0].counter);
+    client.deinit();
+
+    var restricted: driver.Client = undefined;
+    try driver.Client.connect(&restricted, .{
+        .address = address,
+        .service_name = "plain-reader",
+        .instance_id = "reader-1",
+        .secret = client_secret,
+        .io = io,
+    });
+    const denied = try restricted.vc_summary();
+    try std.testing.expectEqual(protocol.ErrorCode.permission_denied, denied.rejected.code);
+    restricted.deinit();
+
+    const remote = try EventValue.init(.{
+        .sequence = 1,
+        .origin_service = "peer-service",
+        .event_type = "peer.event",
+        .payload = "{}",
+        .timestamp = 1,
+        .vector_clock = "555=12",
+    });
+    try event_store.ingest_event(remote);
+
+    var client_two: driver.Client = undefined;
+    try driver.Client.connect(&client_two, .{
+        .address = address,
+        .service_name = "writer-observer",
+        .instance_id = "watch-2",
+        .secret = client_secret,
+        .io = io,
+    });
+    const merged = try client_two.vc_summary();
+    try std.testing.expect(merged == .response);
+    try std.testing.expectEqual(@as(usize, 2), merged.response.entries.len);
+    try std.testing.expectEqual(@as(u64, 12), merged.response.entries[0].counter);
+    try std.testing.expectEqual(vc.nodeKey("node-1"), merged.response.entries[1].node);
+    client_two.deinit();
+    server_thread.join();
+}
+
 fn cleanup_bg_flush_e2e(io: Io) void {
     const singles = [_][]const u8{
         "data/test_bg_flush_e2e.wal",
@@ -2048,11 +2560,9 @@ test "recovery skips unreachable peers" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    // Clean up
     Io.Dir.cwd().deleteFile(io, "data/test_recovery_skip.wal") catch {};
     Io.Dir.cwd().deleteFile(io, "data/test_recovery_skip.crumb") catch {};
 
-    // Contract pointing to an unreachable peer (port 1 — nobody listening)
     const event_types = [_][]const u8{"order.created"};
     const contracts = [_]DependencyContract{.{
         .source_service = "order-service",
@@ -2080,10 +2590,8 @@ test "recovery skips unreachable peers" {
     var srv = try Server.init(allocator, &event_store, identity, &contracts, io);
     defer srv.deinit();
 
-    // Should not error — unreachable peers are skipped
     try srv.run_recovery();
 
-    // Store should have no events (nothing was ingested)
     var events: [limits.pull_events_max]EventValue = undefined;
     var bytes: [1024 * 1024]u8 = undefined;
     const results = try event_store.query_events_into(
@@ -2096,3 +2604,342 @@ test "recovery skips unreachable peers" {
     try std.testing.expectEqual(@as(usize, 0), results.events.len);
 }
 
+test "bootstrap streams every own event and clock over the wire" {
+    const vc = @import("vc.zig");
+    const driver = @import("../driver.zig");
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wal_path = "data/test_bootstrap_wire.wal";
+    Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    var event_store = try EventStore.init(allocator, wal_path, io, .{
+        .identity = "compix-test",
+        .vc_node_key = vc.nodeKey("node-1"),
+        .contracts = &.{
+            .{
+                .source_service = "peer-service",
+                .event_types = &[_][]const u8{"peer.event"},
+                .peer_address = "127.0.0.1:1",
+                .retention_hint = null,
+            },
+        },
+    });
+    defer event_store.deinit();
+
+    const own_events = [_]protocol.AppendEvent{
+        .{ .event_type = "alpha.event", .schema_version = 1, .payload = "one" },
+        .{ .event_type = "beta.event", .schema_version = 1, .payload = "two" },
+        .{ .event_type = "alpha.event", .schema_version = 1, .payload = "three" },
+    };
+    _ = try event_store.append_stream(.{
+        .stream_id = "s/1",
+        .expected_version = .empty,
+        .command_id = "wire-boot-1",
+        .events = own_events[0..2],
+    }, 1);
+    _ = try event_store.append_stream(.{
+        .stream_id = "s/2",
+        .expected_version = .empty,
+        .command_id = "wire-boot-2",
+        .events = own_events[2..3],
+    }, 2);
+    try event_store.ingest_event(try EventValue.init(.{
+        .sequence = 9,
+        .origin_service = "peer-service",
+        .event_type = "peer.event",
+        .payload = "foreign",
+        .timestamp = 3,
+        .vector_clock = "777=5",
+    }));
+
+    var srv: Server = undefined;
+    const client_secret = "0123456789abcdef0123456789abcdef";
+    const credentials = [_]auth.Credential{.{
+        .service_name = "compix-test",
+        .secret = client_secret,
+        .permissions = .{ .append = true, .recover = true },
+    }};
+    try Server.init_in_place(&srv, allocator, .{
+        .store = &event_store,
+        .identity = .{
+            .name = "compix-test",
+            .instance_id = "node-1",
+            .listen_address = "127.0.0.1:0",
+        },
+        .contracts = event_store.contracts,
+        .io = io,
+        .credentials = &credentials,
+    });
+    defer srv.deinit();
+    var accepted_connection: transport.Connection = undefined;
+    var connection_scratch: Server.ConnectionScratch = undefined;
+    const server_thread = try std.Thread.spawn(
+        .{},
+        serve_test_connections,
+        .{ &srv, &accepted_connection, &connection_scratch, 1 },
+    );
+    var address_buffer: [32]u8 = undefined;
+    const address = try std.fmt.bufPrint(
+        &address_buffer,
+        "127.0.0.1:{d}",
+        .{srv.listener.get_port()},
+    );
+
+    var client: driver.Client = undefined;
+    try driver.Client.connect(&client, .{
+        .address = address,
+        .service_name = "compix-test",
+        .instance_id = "node-1",
+        .secret = "0123456789abcdef0123456789abcdef",
+        .io = io,
+    });
+
+    var cursor: [limits.key_length_max]u8 = undefined;
+    var cursor_len: usize = 0;
+    var payloads: [8][]const u8 = undefined;
+    var payload_count: usize = 0;
+    var vc_saw_foreign = false;
+    var pages: usize = 0;
+    var complete = false;
+    while (!complete) {
+        pages += 1;
+        try std.testing.expect(pages < 16);
+        const reply = try client.bootstrap(.{
+            .cursor = cursor[0..cursor_len],
+            .max_count = 2,
+        });
+        const page = switch (reply) {
+            .response => |value| value,
+            .rejected => |server_error| {
+                std.debug.print("bootstrap rejected: {}\n", .{server_error.code});
+                return error.BootstrapRejected;
+            },
+        };
+        for (page.events) |event| {
+            const parsed = try EventValue.deserialize_borrowed(event.value);
+            try std.testing.expectEqualStrings("compix-test", parsed.origin_service);
+            try std.testing.expect(parsed.vector_clock.len > 0);
+            payloads[payload_count] = try std.testing.allocator.dupe(
+                u8,
+                parsed.payload,
+            );
+            payload_count += 1;
+        }
+        if (page.vc.len > 0) {
+            for (page.vc) |entry| {
+                if (entry.node == 777) vc_saw_foreign = true;
+            }
+        }
+        complete = page.complete;
+        if (page.next_cursor.len > 0) {
+            try std.testing.expect(page.next_cursor.len <= cursor.len);
+            @memcpy(cursor[0..page.next_cursor.len], page.next_cursor);
+            cursor_len = page.next_cursor.len;
+        }
+    }
+    client.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), payload_count);
+    try std.testing.expectEqualStrings("one", payloads[0]);
+    try std.testing.expectEqualStrings("three", payloads[1]);
+    try std.testing.expectEqualStrings("two", payloads[2]);
+    try std.testing.expect(vc_saw_foreign);
+    for (payloads[0..payload_count]) |payload| std.testing.allocator.free(payload);
+    try std.testing.expect(pages >= 2);
+
+    server_thread.join();
+}
+
+test "fresh peer bootstraps full state and seeds breadcrumbs" {
+    const vc = @import("vc.zig");
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    inline for (.{
+        "data/test_recovery_bootstrap.wal",
+        "data/test_recovery_bootstrap.crumb",
+        "data/test_recovery_bootstrap.manifest",
+    }) |path| Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer {
+        inline for (.{ "data/test_recovery_bootstrap.wal", "data/test_recovery_bootstrap.crumb", "data/test_recovery_bootstrap.manifest" }) |path| {
+            Io.Dir.cwd().deleteFile(io, path) catch {};
+        }
+    }
+
+    var peer_listener = try transport.Listener.init("127.0.0.1:0", io);
+    defer peer_listener.deinit();
+    var peer_address_buffer: [32]u8 = undefined;
+    const peer_address = try std.fmt.bufPrint(
+        &peer_address_buffer,
+        "127.0.0.1:{d}",
+        .{peer_listener.get_port()},
+    );
+    var peer_connection: transport.Connection = undefined;
+
+    const peer_thread = try std.Thread.spawn(.{}, struct {
+        fn run(l: *transport.Listener, conn: *transport.Connection) void {
+            l.accept_into(conn) catch return;
+            defer conn.close();
+            _ = conn.recv_message() catch return;
+            while (true) {
+                const message = conn.recv_message() catch return;
+                switch (message) {
+                    .bootstrap_request => |request| {
+                        if (request.cursor.len == 0) {
+                            const entries = [_]protocol.BootstrapEvent{
+                                .{ .value = "1|100|2|order-service|order.created||9=3|{}" },
+                                .{ .value = "2|200|2|order-service|order.created||9=3|{}" },
+                            };
+                            conn.send_message(.{ .bootstrap_response = .{
+                                .events = &entries,
+                                .next_cursor = "evt:order-service:order.created:0000000000000002",
+                                .complete = false,
+                                .vc = &.{.{ .node = 9, .counter = 3 }},
+                            } }) catch return;
+                        } else {
+                            conn.send_message(.{ .bootstrap_response = .{
+                                .events = &.{},
+                                .next_cursor = "",
+                                .complete = true,
+                                .vc = &.{},
+                            } }) catch return;
+                            return;
+                        }
+                    },
+                    else => return,
+                }
+            }
+        }
+    }.run, .{ &peer_listener, &peer_connection });
+
+    const event_types = [_][]const u8{"order.created"};
+    const contracts = [_]DependencyContract{.{
+        .source_service = "order-service",
+        .event_types = &event_types,
+        .peer_address = peer_address,
+        .retention_hint = null,
+    }};
+
+    var event_store = try EventStore.init(allocator, "data/test_recovery_bootstrap.wal", io, .{
+        .identity = "my-service",
+        .contracts = &contracts,
+        .vc_node_key = vc.nodeKey("self"),
+    });
+    defer event_store.deinit();
+
+    const identity = ServiceIdentity{
+        .name = "my-service",
+        .instance_id = "test-1",
+        .listen_address = "127.0.0.1:0",
+    };
+    var srv = try Server.init(allocator, &event_store, identity, &contracts, io);
+    defer srv.deinit();
+
+    try srv.run_recovery();
+    peer_thread.join();
+
+    var events: [limits.pull_events_max]EventValue = undefined;
+    var bytes: [1024 * 1024]u8 = undefined;
+    const results = try event_store.query_events_into(
+        "order-service",
+        "order.created",
+        0,
+        &events,
+        &bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 2), results.events.len);
+    try std.testing.expectEqualStrings("9=3", results.events[0].vector_clock);
+    try std.testing.expectEqual(@as(u64, 3), event_store.vc_clock.get(9).?);
+
+    var crumb_buffer: [limits.key_length_max * 4]u8 = undefined;
+    _ = &crumb_buffer;
+    const tracked = try event_store.get_breadcrumb_sequence(
+        "order-service",
+        "order.created",
+        peer_address,
+        &crumb_buffer,
+    );
+    try std.testing.expectEqual(@as(u64, 2), tracked.?);
+}
+
+test "store-owner actor serves vector-clock summaries over the wire" {
+    const vc = @import("vc.zig");
+    const driver = @import("../driver.zig");
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wal_path = "data/test_owner_wire.wal";
+    inline for (.{
+        wal_path,
+        "data/test_owner_wire.crumb",
+        "data/test_owner_wire.manifest",
+    }) |path| Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer inline for (.{ wal_path, "data/test_owner_wire.crumb", "data/test_owner_wire.manifest" }) |path| {
+        Io.Dir.cwd().deleteFile(io, path) catch {};
+    };
+    var event_store = try EventStore.init(allocator, wal_path, io, .{
+        .identity = "compix-test",
+        .vc_node_key = vc.nodeKey("node-1"),
+    });
+    defer event_store.deinit();
+
+    const append_events = [_]protocol.AppendEvent{
+        .{ .event_type = "order.created", .schema_version = 1, .payload = "{}" },
+    };
+    _ = try event_store.append_stream(.{
+        .stream_id = "orders/owner",
+        .expected_version = .empty,
+        .command_id = "owner-wire-1",
+        .events = &append_events,
+    }, 100);
+
+    var srv: Server = undefined;
+    try Server.init_in_place(&srv, allocator, .{
+        .store = &event_store,
+        .identity = .{
+            .name = "compix-test",
+            .instance_id = "node-1",
+            .listen_address = "127.0.0.1:0",
+        },
+        .contracts = &.{},
+        .io = io,
+        .use_store_owner = true,
+    });
+    defer srv.deinit();
+    try std.testing.expect(srv.store_owner != null);
+
+    var address_buffer: [32]u8 = undefined;
+    const address = try std.fmt.bufPrint(
+        &address_buffer,
+        "127.0.0.1:{d}",
+        .{srv.listener.get_port()},
+    );
+    var accepted_connection: transport.Connection = undefined;
+    var connection_scratch: Server.ConnectionScratch = undefined;
+    const server_thread = try std.Thread.spawn(
+        .{},
+        serve_test_connections,
+        .{ &srv, &accepted_connection, &connection_scratch, 1 },
+    );
+
+    var client: driver.Client = undefined;
+    try driver.Client.connect(&client, .{
+        .address = address,
+        .service_name = "loopback",
+        .instance_id = "probe-1",
+        .secret = "0123456789abcdef0123456789abcdef",
+        .io = io,
+    });
+    const summary_reply = try client.vc_summary();
+    try std.testing.expect(summary_reply == .response);
+    try std.testing.expectEqual(@as(usize, 1), summary_reply.response.entries.len);
+    try std.testing.expectEqual(vc.nodeKey("node-1"), summary_reply.response.entries[0].node);
+    try std.testing.expectEqual(@as(u64, 1), summary_reply.response.entries[0].counter);
+    client.deinit();
+    server_thread.join();
+}

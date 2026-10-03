@@ -295,6 +295,7 @@ pub const RadixTree = struct {
             .timestamp = value.timestamp,
             .origin_service = self.bytes.write(value.origin_service) catch unreachable,
             .signature = self.bytes.write(value.signature) catch unreachable,
+            .vector_clock = self.bytes.write(value.vector_clock) catch unreachable,
         };
     }
 };
@@ -302,7 +303,7 @@ pub const RadixTree = struct {
 fn value_size(value: EventValue) !limits.ByteCount {
     return try limits.byte_count(
         value.event_type.len + value.payload.len + value.origin_service.len +
-            value.signature.len,
+            value.signature.len + value.vector_clock.len,
     );
 }
 

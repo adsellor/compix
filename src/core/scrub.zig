@@ -1,5 +1,3 @@
-//! Offline orphan detection and quarantine for a verified, stopped Compix node.
-
 const std = @import("std");
 const limits = @import("limits.zig");
 const store_mod = @import("store.zig");
@@ -22,13 +20,17 @@ const TableName = struct {
     temporary: bool = false,
 };
 
+/// Scrub must only run on a verified store; callers state who verified it.
+pub const Verified = enum { already_verified, verify_now };
+
 pub fn run(
     allocator: Allocator,
     io: Io,
     wal_path: []const u8,
     store: *EventStore,
+    verified: Verified,
 ) !Summary {
-    _ = try store.verify_integrity();
+    if (verified == .verify_now) _ = try store.verify_integrity();
     const base = try derive_base(allocator, wal_path);
     defer allocator.free(base);
     const parent_path = std.fs.path.dirname(base) orelse ".";
@@ -60,7 +62,6 @@ pub fn run(
             };
             quarantine = try IoDir.cwd().openDir(io, quarantine_path, .{});
         }
-        // Never replace prior evidence. A collision is surfaced to the operator.
         try parent.renamePreserve(entry.name, quarantine.?, entry.name, io);
         summary.quarantined += 1;
     }
@@ -180,7 +181,7 @@ test "scrub quarantines unreferenced tables and preserves live tables" {
     try temporary.sync(io);
     temporary.close(io);
 
-    const summary = try run(allocator, io, "data/test_scrub.wal", &store);
+    const summary = try run(allocator, io, "data/test_scrub.wal", &store, .verify_now);
     try std.testing.expectEqual(@as(u16, 1), summary.live_sstables);
     try std.testing.expectEqual(@as(u16, 3), summary.candidates);
     try std.testing.expectEqual(@as(u16, 2), summary.quarantined);

@@ -1,6 +1,5 @@
-//! Stopped-node, checksummed backup and verified restore.
-
 const std = @import("std");
+const attestation_mod = @import("attestation.zig");
 const config_mod = @import("config.zig");
 const limits = @import("limits.zig");
 const protocol = @import("protocol.zig");
@@ -314,7 +313,6 @@ pub fn restore(
     const copy_buffer = try allocator.alloc(u8, copy_buffer_size);
     defer allocator.free(copy_buffer);
 
-    // Validate every source payload and every target before publishing any file.
     var records = record_iterator(manifest);
     while (try records.next()) |record| {
         const payload_path = try std.fmt.allocPrint(
@@ -329,8 +327,7 @@ pub fn restore(
         try require_absent(io, target_path);
     }
 
-    // SSTables first, WAL second, manifest last. A failed restore cannot publish
-    // a manifest that references missing tables.
+    // NOTE: manifest last, so a failed restore never references missing tables.
     inline for (.{ FileRecord.Kind.sst, .wal, .manifest }) |kind| {
         records = record_iterator(manifest);
         while (try records.next()) |record| {
@@ -356,6 +353,10 @@ pub fn restore(
             try sync_parent_directory(target_path, io);
         }
     }
+    var attestation_buffer: [limits.wal_path_length_max]u8 = undefined;
+    if (attestation_mod.derive_path_into(&attestation_buffer, config.wal_path)) |path| {
+        attestation_mod.remove_path(path, io);
+    } else |_| {}
     return .{
         .files = parsed.files,
         .bytes = parsed.bytes,

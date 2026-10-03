@@ -26,9 +26,8 @@ const entry_reachable_max: u32 = 4 + limits.key_length_max + 4 +
     value_serialized_reachable_max + 1;
 
 comptime {
-    // Header layout: [4B magic][2B version][2B flags][8B sequence]
-    // [4B entry_len][16B BLAKE3 checksum]. The checksum covers the first
-    // 20 header bytes and the complete entry payload.
+    // NOTE: header: [4B magic][2B version][2B flags][8B sequence][4B entry_len][16B BLAKE3].
+    // The checksum covers the first 20 header bytes and the payload.
     assert(header_size == 4 + 2 + 2 + 8 + 4 + checksum_size);
     assert(entry_size_max > 0);
     assert(write_buf_size > 0);
@@ -129,8 +128,7 @@ pub const WriteAheadLog = struct {
     }
 
     pub fn deinit(self: *WriteAheadLog) void {
-        // A failed fsync means buffered durability is already lost and retrying
-        // cannot recover it; crashing is the only honest option.
+        // WARN: a failed fsync already lost buffered data and a retry cannot recover it, so crash.
         self.sync() catch @panic("wal: sync failed during deinit");
         self.file.close(self.io);
         self.allocator.free(self.write_buf);
@@ -331,7 +329,8 @@ pub const WriteAheadLog = struct {
             offset += header_size + entry_len;
 
             crumb.file_offset = offset;
-            crumb.last_sequence = sequence;
+            // NOTE: tombstones carry sequence 0 and must not regress the cursor.
+            crumb.last_sequence = @max(crumb.last_sequence, sequence);
         }
 
         assert(offset <= file_size);
@@ -593,7 +592,6 @@ test "replay with crumb resumes from correct position" {
         const crumb3 = try wal_log.replay(&tree3);
         try std.testing.expectEqual(@as(u64, 8), crumb3.last_sequence);
 
-        // Full replay from offset 0: all 8 keys should be present
         _ = tree3.get_ptr("key_0") orelse return error.ExpectedValueNotFound;
         _ = tree3.get_ptr("key_4") orelse return error.ExpectedValueNotFound;
         _ = tree3.get_ptr("key_5") orelse return error.ExpectedValueNotFound;

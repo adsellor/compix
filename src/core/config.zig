@@ -9,6 +9,8 @@ const signing = @import("signing.zig");
 const identity_mod = @import("identity.zig");
 const contract_mod = @import("contract.zig");
 
+const store_mod = @import("store.zig");
+
 const ServiceIdentity = identity_mod.ServiceIdentity;
 const DependencyContract = contract_mod.DependencyContract;
 
@@ -16,8 +18,7 @@ pub const ContractEntry = struct {
     source_service: []const u8,
     event_types: []const []const u8,
     peer_address: []const u8,
-    /// Optional hex-encoded Ed25519 public key of the owning service. When
-    /// present, pulled events from this origin must be validly signed.
+    /// When set, pulled events from this origin must be validly signed.
     origin_public_key: ?[]const u8 = null,
 };
 
@@ -38,9 +39,14 @@ pub const ServiceConfig = struct {
     connection_capacity: limits.ConnectionCount = limits.connection_capacity_default,
     stream_capacity: limits.StreamCount = limits.stream_capacity_default,
     stream_id_bytes_capacity: limits.ByteCount = limits.stream_id_bytes_capacity_default,
-    /// Optional hex-encoded 32-byte Ed25519 seed this service signs its own
-    /// events with. Absent means events are emitted unsigned.
     signing_key: ?[]const u8 = null,
+    retention: []const RetentionEntry = &.{},
+};
+
+pub const RetentionEntry = struct {
+    origin: []const u8 = "*",
+    event_type: []const u8 = "*",
+    ttl_seconds: u64,
 };
 
 pub const LoadedConfig = struct {
@@ -53,6 +59,7 @@ pub const LoadedConfig = struct {
     stream_capacity: limits.StreamCount,
     stream_id_bytes_capacity: limits.ByteCount,
     signing_key: ?signing.SigningKey,
+    retention: []const store_mod.RetentionRule,
     allocator: Allocator,
 
     pub fn deinit(self: *LoadedConfig) void {
@@ -74,6 +81,11 @@ pub const LoadedConfig = struct {
         }
         self.allocator.free(self.contracts);
         self.allocator.free(self.wal_path);
+        for (self.retention) |rule| {
+            self.allocator.free(rule.origin);
+            self.allocator.free(rule.event_type);
+        }
+        self.allocator.free(self.retention);
         var id = self.identity;
         id.deinit(self.allocator);
     }
@@ -199,6 +211,16 @@ pub fn load_from_slice(allocator: Allocator, data: []const u8) !LoadedConfig {
     else
         null;
 
+    const retention = try allocator.alloc(store_mod.RetentionRule, config.retention.len);
+    errdefer allocator.free(retention);
+    for (config.retention, 0..) |entry, index| {
+        retention[index] = .{
+            .origin = try allocator.dupe(u8, entry.origin),
+            .event_type = try allocator.dupe(u8, entry.event_type),
+            .ttl_seconds = entry.ttl_seconds,
+        };
+    }
+
     return .{
         .identity = identity,
         .contracts = contracts,
@@ -209,6 +231,7 @@ pub fn load_from_slice(allocator: Allocator, data: []const u8) !LoadedConfig {
         .stream_capacity = config.stream_capacity,
         .stream_id_bytes_capacity = config.stream_id_bytes_capacity,
         .signing_key = signing_key,
+        .retention = retention,
         .allocator = allocator,
     };
 }
@@ -363,7 +386,6 @@ test "capacity configuration rejects zero and compiled-limit overflow" {
 test "missing required fields produce an error" {
     const allocator = std.testing.allocator;
 
-    // Missing service_name
     const json =
         \\{
         \\  "instance_id": "node-1",

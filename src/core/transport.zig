@@ -45,6 +45,8 @@ pub const Connection = struct {
     _event_entries: [@import("limits.zig").pull_events_max]protocol.PullResponse.EventEntry,
     _append_events: [limits.append_events_max]protocol.AppendEvent,
     _read_events: [limits.read_events_max]protocol.ReadEvent,
+    _vc_entries: [protocol.vc_entries_max]protocol.VcEntry,
+    _bootstrap_events: [limits.pull_events_max]protocol.BootstrapEvent,
     _security: ?Security,
 
     pub fn init(
@@ -64,6 +66,8 @@ pub const Connection = struct {
             ._event_entries = undefined,
             ._append_events = undefined,
             ._read_events = undefined,
+            ._vc_entries = undefined,
+            ._bootstrap_events = undefined,
             ._security = null,
         };
         target._reader = stream.reader(io, &target._read_buf);
@@ -87,8 +91,7 @@ pub const Connection = struct {
         try self._writer.interface.flush();
     }
 
-    /// Receives a frame without allocating. Returned slices remain valid until
-    /// the next call to recv_message and must not be deinitialized.
+    /// Returned slices stay valid until the next `recv_message`.
     pub fn recv_message(self: *Connection) !Message {
         if (self._security != null) return self.recv_encrypted_message();
         return self.recv_plain_message();
@@ -114,6 +117,8 @@ pub const Connection = struct {
             .pull_events = &self._event_entries,
             .append_events = &self._append_events,
             .read_events = &self._read_events,
+            .vc_entries = &self._vc_entries,
+            .bootstrap_events = &self._bootstrap_events,
         };
         return protocol.decode(frame, &decode_buffers);
     }
@@ -186,6 +191,8 @@ pub const Connection = struct {
             .pull_events = &self._event_entries,
             .append_events = &self._append_events,
             .read_events = &self._read_events,
+            .vc_entries = &self._vc_entries,
+            .bootstrap_events = &self._bootstrap_events,
         };
         return protocol.decode(
             self._frame_read_buf[0 .. protocol.frame_prefix_size + ciphertext_length],
@@ -215,8 +222,7 @@ pub const Connection = struct {
         return self._security != null;
     }
 
-    /// Reuses the consumed read frame for response assembly. Any message
-    /// slices returned by recv_message become invalid after this call.
+    /// Invalidates slices returned by `recv_message`.
     pub fn response_scratch(self: *Connection) []u8 {
         return &self._frame_read_buf;
     }
@@ -260,8 +266,7 @@ pub const Listener = struct {
         return self.server.socket.address.getPort();
     }
 
-    /// Stops a blocking accept without closing the socket. Keeping close in
-    /// deinit avoids a descriptor-close race with the accepting thread.
+    /// Stops a blocking accept without closing; `deinit` closes, avoiding a descriptor race.
     pub fn stop_accepting(self: *Listener) !void {
         const stream: net.Stream = .{ .socket = self.server.socket };
         try stream.shutdown(self.io, .both);

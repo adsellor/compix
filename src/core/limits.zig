@@ -54,6 +54,8 @@ pub const snapshot_chunk_size_max: ByteCount = 512 * 1024;
 pub const sstables_max: u16 = 1024;
 pub const sstable_block_size_max: ByteCount = 512 * 1024;
 pub const sstable_index_size_max: ByteCount = memtable_bytes_max + 1024 * 1024;
+/// Over budget degrades lookups to a file walk; it never fails them.
+pub const sstable_index_cache_bytes_max: u64 = 256 * 1024 * 1024;
 pub const wal_path_length_max: ByteCount = 4096;
 pub const wal_entry_size_max: ByteCount = 4 * 1024 * 1024;
 

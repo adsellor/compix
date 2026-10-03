@@ -57,7 +57,8 @@ pub const Memtable = struct {
             value.event_type.len +
             value.payload.len +
             value.origin_service.len +
-            value.signature.len;
+            value.signature.len +
+            value.vector_clock.len;
         return try limits.byte_count(total);
     }
 
@@ -98,6 +99,7 @@ pub const Memtable = struct {
         const type_stored = self.bytes.write(value.event_type) catch unreachable;
         const payload_stored = self.bytes.write(value.payload) catch unreachable;
         const signature_stored = self.bytes.write(value.signature) catch unreachable;
+        const vector_clock_stored = self.bytes.write(value.vector_clock) catch unreachable;
         const stored = Entry{
             .key = key_stored,
             .value = .{
@@ -107,6 +109,7 @@ pub const Memtable = struct {
                 .timestamp = value.timestamp,
                 .origin_service = origin_stored,
                 .signature = signature_stored,
+                .vector_clock = vector_clock_stored,
             },
         };
 
@@ -200,6 +203,13 @@ pub const Memtable = struct {
 
     pub fn iterator(self: *const Memtable) EntryIterator {
         return .{ .entries = self.entries.items_const(), .pos = 0 };
+    }
+
+    /// Starts at the first entry whose key is `>= key`.
+    pub fn iterator_from(self: *const Memtable, key: []const u8) EntryIterator {
+        const start = self.find_index(key).index;
+        assert(start <= self.entries.count);
+        return .{ .entries = self.entries.items_const(), .pos = start };
     }
 
     pub fn reset(self: *Memtable) void {

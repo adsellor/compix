@@ -4,6 +4,7 @@ const config = @import("core/config.zig");
 const scrub = @import("core/scrub.zig");
 const store = @import("core/store.zig");
 const server = @import("core/server.zig");
+const vc = @import("core/vc.zig");
 
 const Command = enum { serve, verify, scrub, backup, restore };
 
@@ -94,7 +95,9 @@ pub fn main(init: std.process.Init) !void {
 
     var event_store = store.EventStore.init(allocator, cfg.wal_path, io, .{
         .identity = cfg.identity.name,
+        .vc_node_key = vc.nodeKey(cfg.identity.instance_id),
         .contracts = cfg.contracts,
+        .retention = cfg.retention,
         .stream_capacity = cfg.stream_capacity,
         .stream_id_bytes_capacity = cfg.stream_id_bytes_capacity,
         .signing_key = cfg.signing_key,
@@ -120,7 +123,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (command == .scrub) {
-        const result = scrub.run(allocator, io, cfg.wal_path, &event_store) catch |err| {
+        const result = scrub.run(allocator, io, cfg.wal_path, &event_store, .verify_now) catch |err| {
             std.debug.print("Scrub failed: {}\n", .{err});
             return err;
         };
@@ -145,11 +148,19 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const startup_verification = event_store.verify_integrity() catch |err| {
-        std.debug.print("Startup integrity verification failed: {}\n", .{err});
-        return err;
+    const trusted = event_store.trusted_state() catch null;
+    const startup_state: store.EventStore.TrustedState = if (trusted) |state| state else blk: {
+        const verification = event_store.verify_integrity() catch |err| {
+            std.debug.print("Startup integrity verification failed: {}\n", .{err});
+            return err;
+        };
+        break :blk .{
+            .streams = verification.streams,
+            .committed_log_position = verification.committed_log_position,
+        };
     };
-    const startup_scrub = scrub.run(allocator, io, cfg.wal_path, &event_store) catch |err| {
+    event_store.revoke_attestation();
+    const startup_scrub = scrub.run(allocator, io, cfg.wal_path, &event_store, .already_verified) catch |err| {
         std.debug.print("Startup orphan scrub failed: {}\n", .{err});
         return err;
     };
@@ -182,10 +193,6 @@ pub fn main(init: std.process.Init) !void {
     };
     defer srv.deinit();
 
-    srv.run_recovery() catch |err| {
-        std.debug.print("Recovery warning: {}\n", .{err});
-    };
-
     server.register_signal_handlers();
 
     std.debug.print(
@@ -194,15 +201,20 @@ pub fn main(init: std.process.Init) !void {
         .{
             cfg.identity.name,
             cfg.identity.instance_id,
-            startup_verification.streams,
+            startup_state.streams,
             cfg.stream_capacity,
-            startup_verification.committed_log_position,
+            startup_state.committed_log_position,
             cfg.stream_id_bytes_capacity,
             cfg.connection_capacity,
         },
     );
+    if (trusted != null)
+        std.debug.print("compix: startup verification skipped; clean shutdown attested\n", .{});
 
     try srv.serve();
 
+    event_store.attest_verified() catch |err| {
+        std.debug.print("compix: could not attest clean shutdown: {}\n", .{err});
+    };
     std.debug.print("compix: shutting down\n", .{});
 }

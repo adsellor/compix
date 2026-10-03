@@ -2,10 +2,31 @@ const std = @import("std");
 const assert = std.debug.assert;
 const limits = @import("limits.zig");
 const signing = @import("signing.zig");
+const vc_mod = @import("vc.zig");
 
-/// Domain separator so an event signature can never be reused as any other
-/// kind of Ed25519 signature over the same bytes.
+// NOTE: keeps an event signature from being reused as any other Ed25519 signature.
 const signing_domain = "compix-event-v1";
+
+/// Tombstone marker: read paths filter it, so applications must not author it.
+pub const tombstone_origin = "compix";
+pub const tombstone_event_type = "compix.tombstone";
+
+pub fn makeTombstone(timestamp: limits.Timestamp) EventValue {
+    return .{
+        .sequence = 0,
+        .event_type = tombstone_event_type,
+        .payload = "",
+        .timestamp = timestamp,
+        .origin_service = tombstone_origin,
+    };
+}
+
+pub fn isTombstone(value: EventValue) bool {
+    return value.sequence == 0 and
+        value.payload.len == 0 and
+        std.mem.eql(u8, value.origin_service, tombstone_origin) and
+        std.mem.eql(u8, value.event_type, tombstone_event_type);
+}
 
 pub const EventValue = struct {
     sequence: limits.Sequence,
@@ -13,12 +34,9 @@ pub const EventValue = struct {
     payload: []const u8,
     timestamp: limits.Timestamp,
     origin_service: []const u8,
-    /// The origin's Ed25519 signature over `signing_message_into`, hex-encoded
-    /// (`signature_hex_length` bytes). Stored as a borrowed slice — like the
-    /// other byte fields — rather than an inline array, to keep `EventValue`
-    /// small on the by-value hot paths. Empty means unsigned (breadcrumbs,
-    /// index entries, and legacy events).
+    /// Hex; empty means unsigned.
     signature: []const u8 = "",
+    vector_clock: []const u8 = "",
 
     pub const InitOptions = struct {
         sequence: limits.Sequence,
@@ -27,6 +45,7 @@ pub const EventValue = struct {
         payload: []const u8,
         timestamp: limits.Timestamp,
         signature: []const u8 = "",
+        vector_clock: []const u8 = "",
     };
 
     pub fn init(options: InitOptions) !EventValue {
@@ -35,6 +54,9 @@ pub const EventValue = struct {
         if (options.event_type.len > limits.event_type_length_max)
             return error.EventTypeTooLong;
         if (options.payload.len > limits.payload_size_max) return error.PayloadTooLarge;
+        if (options.vector_clock.len != 0 and
+            !vc_mod.Clock.validateText(options.vector_clock))
+            return error.InvalidVectorClock;
 
         return .{
             .sequence = options.sequence,
@@ -43,6 +65,7 @@ pub const EventValue = struct {
             .timestamp = options.timestamp,
             .origin_service = options.origin_service,
             .signature = options.signature,
+            .vector_clock = options.vector_clock,
         };
     }
 
@@ -50,9 +73,6 @@ pub const EventValue = struct {
         return self.signature.len != 0;
     }
 
-    /// Feed the canonical signing message — the immutable event identity, with
-    /// a domain separator, excluding the signature — to a streaming signer or
-    /// verifier. Streaming avoids a contiguous buffer for a large payload.
     fn feed_signing_message(self: *const EventValue, ctx: anytype) void {
         assert(std.mem.indexOfScalar(u8, self.origin_service, '|') == null);
         assert(std.mem.indexOfScalar(u8, self.event_type, '|') == null);
@@ -67,30 +87,29 @@ pub const EventValue = struct {
         ctx.update("|");
         ctx.update(self.event_type);
         ctx.update("|");
+        ctx.update(self.vector_clock);
+        ctx.update("|");
         ctx.update(std.fmt.bufPrint(&number_buffer, "{}", .{self.payload.len}) catch unreachable);
         ctx.update("|");
         ctx.update(self.payload);
     }
 
-    /// Canonical signing message built into a caller buffer (one-shot sign
-    /// path). Must produce the identical bytes `feed_signing_message` streams.
     pub fn signing_message_into(self: *const EventValue, buffer: []u8) ![]const u8 {
         assert(std.mem.indexOfScalar(u8, self.origin_service, '|') == null);
         assert(std.mem.indexOfScalar(u8, self.event_type, '|') == null);
-        return std.fmt.bufPrint(buffer, "{s}|{}|{}|{s}|{s}|{}|{s}", .{
+        return std.fmt.bufPrint(buffer, "{s}|{}|{}|{s}|{s}|{s}|{}|{s}", .{
             signing_domain,
             self.sequence,
             self.timestamp,
             self.origin_service,
             self.event_type,
+            self.vector_clock,
             self.payload.len,
             self.payload,
         }) catch return error.BufferTooSmall;
     }
 
-    /// Sign this event in place with the origin's key. `message_buffer` holds
-    /// the canonical message; `signature_hex_out` receives the hex signature and
-    /// must outlive any use of `self` (it is what `self.signature` points at).
+    /// `signature_hex_out` backs `self.signature` and must outlive any use of `self`.
     pub fn sign(
         self: *EventValue,
         key: *const signing.SigningKey,
@@ -103,7 +122,6 @@ pub const EventValue = struct {
         self.signature = signature_hex_out;
     }
 
-    /// Returns true if `signature` is a valid origin signature over this event.
     pub fn verify_provenance(
         self: *const EventValue,
         public_key: [signing.public_key_length]u8,
@@ -116,10 +134,23 @@ pub const EventValue = struct {
         return verifier.verify();
     }
 
+    /// Wire: `seq|ts|plen|origin|type|sig|vc|payload`; `vc` is optional.
+    /// The payload is always the final plen bytes.
     pub fn serialize_into(self: *const EventValue, buffer: []u8) ![]const u8 {
         assert(std.mem.indexOfScalar(u8, self.origin_service, '|') == null);
         assert(std.mem.indexOfScalar(u8, self.event_type, '|') == null);
-        // signature is already hex (or empty); write it through, no re-encoding.
+        if (self.vector_clock.len != 0) {
+            return std.fmt.bufPrint(buffer, "{}|{}|{}|{s}|{s}|{s}|{s}|{s}", .{
+                self.sequence,
+                self.timestamp,
+                self.payload.len,
+                self.origin_service,
+                self.event_type,
+                self.signature,
+                self.vector_clock,
+                self.payload,
+            }) catch return error.BufferTooSmall;
+        }
         return std.fmt.bufPrint(buffer, "{}|{}|{}|{s}|{s}|{s}|{s}", .{
             self.sequence,
             self.timestamp,
@@ -132,20 +163,31 @@ pub const EventValue = struct {
     }
 
     pub fn serialized_size(self: *const EventValue) limits.ByteCount {
-        const size = std.fmt.count("{}|{}|{}|{s}|{s}|{s}|{s}", .{
-            self.sequence,
-            self.timestamp,
-            self.payload.len,
-            self.origin_service,
-            self.event_type,
-            self.signature,
-            self.payload,
-        });
+        const size = if (self.vector_clock.len != 0)
+            std.fmt.count("{}|{}|{}|{s}|{s}|{s}|{s}|{s}", .{
+                self.sequence,
+                self.timestamp,
+                self.payload.len,
+                self.origin_service,
+                self.event_type,
+                self.signature,
+                self.vector_clock,
+                self.payload,
+            })
+        else
+            std.fmt.count("{}|{}|{}|{s}|{s}|{s}|{s}", .{
+                self.sequence,
+                self.timestamp,
+                self.payload.len,
+                self.origin_service,
+                self.event_type,
+                self.signature,
+                self.payload,
+            });
         return limits.byte_count(size) catch unreachable;
     }
 
-    /// Decode an event as views into `data`. The result owns no memory and is
-    /// valid only while `data` remains unchanged.
+    /// Result borrows `data`.
     pub fn deserialize_borrowed(data: []const u8) !EventValue {
         var iter = std.mem.splitSequence(u8, data, "|");
         const sequence_str = iter.next() orelse return error.InvalidFormat;
@@ -159,10 +201,16 @@ pub const EventValue = struct {
         const signature = iter.next() orelse return error.InvalidFormat;
         if (signature.len != 0 and signature.len != signing.signature_hex_length)
             return error.InvalidFormat;
-        const payload_raw = iter.rest();
-        const payload = if (payload_raw.len > 0) payload_raw else "";
-
-        if (payload.len != limits.usize_from(payload_len)) return error.InvalidFormat;
+        const rest = iter.rest();
+        if (rest.len < limits.usize_from(payload_len)) return error.InvalidFormat;
+        const payload = rest[rest.len - limits.usize_from(payload_len) ..];
+        var vector_clock: []const u8 = "";
+        const prefix_len = rest.len - limits.usize_from(payload_len);
+        if (prefix_len > 0) {
+            if (prefix_len < 2 or rest[prefix_len - 1] != '|') return error.InvalidFormat;
+            vector_clock = rest[0 .. prefix_len - 1];
+            if (!vc_mod.Clock.validateText(vector_clock)) return error.InvalidVectorClock;
+        }
 
         if (origin_service.len > limits.service_name_length_max)
             return error.ServiceNameTooLong;
@@ -177,6 +225,7 @@ pub const EventValue = struct {
             .payload = payload,
             .timestamp = timestamp,
             .signature = signature,
+            .vector_clock = vector_clock,
         };
     }
 };
@@ -246,4 +295,85 @@ test "empty payload round-trip" {
     try std.testing.expectEqualStrings("", deserialized.payload);
     try std.testing.expectEqualStrings("evt", deserialized.event_type);
     try std.testing.expectEqualStrings("svc", deserialized.origin_service);
+    try std.testing.expectEqualStrings("", deserialized.vector_clock);
+}
+
+test "vector clock rides through serialization and legacy events still parse" {
+    const ev = try EventValue.init(.{
+        .sequence = 7,
+        .origin_service = "order-service",
+        .event_type = "order.created",
+        .payload = "a|b|c",
+        .timestamp = 100,
+        .vector_clock = "101=4,202=9",
+    });
+    var buffer: [1024]u8 = undefined;
+    const serialized = try ev.serialize_into(&buffer);
+    try std.testing.expect(std.mem.endsWith(u8, serialized, "a|b|c"));
+    const deserialized = try EventValue.deserialize_borrowed(serialized);
+    try std.testing.expectEqualStrings("101=4,202=9", deserialized.vector_clock);
+    try std.testing.expectEqualStrings("a|b|c", deserialized.payload);
+    try std.testing.expectEqual(@as(u64, 7), deserialized.sequence);
+
+    const legacy = try EventValue.deserialize_borrowed("3|55|2|os|t||{}");
+    try std.testing.expectEqualStrings("", legacy.vector_clock);
+    try std.testing.expectEqualStrings("{}", legacy.payload);
+    try std.testing.expectEqual(@as(i64, 55), legacy.timestamp);
+
+    try std.testing.expectError(
+        error.InvalidFormat,
+        EventValue.deserialize_borrowed("3|55|5|os|t||{}"),
+    );
+}
+
+test "invalid vector clock text is rejected at init and parse" {
+    try std.testing.expectError(error.InvalidVectorClock, EventValue.init(.{
+        .sequence = 1,
+        .origin_service = "s",
+        .event_type = "t",
+        .payload = "",
+        .timestamp = 0,
+        .vector_clock = "1=x",
+    }));
+    try std.testing.expectError(error.InvalidVectorClock, EventValue.init(.{
+        .sequence = 1,
+        .origin_service = "s",
+        .event_type = "t",
+        .payload = "",
+        .timestamp = 0,
+        .vector_clock = "1|2",
+    }));
+    try std.testing.expectError(
+        error.InvalidVectorClock,
+        EventValue.deserialize_borrowed("1|2|0|s|t||bad=vc|"),
+    );
+}
+
+test "signature covers the vector clock" {
+    const key = try signing.SigningKey.from_seed(@splat(7));
+    var message_buffer: [limits.event_serialized_size_max]u8 = undefined;
+    var signature_hex: [signing.signature_hex_length]u8 = undefined;
+
+    var ev = try EventValue.init(.{
+        .sequence = 1,
+        .origin_service = "s",
+        .event_type = "t",
+        .payload = "p",
+        .timestamp = 5,
+        .vector_clock = "9=1",
+    });
+    try ev.sign(&key, &message_buffer, &signature_hex);
+    try std.testing.expect(ev.verify_provenance(key.public_key()));
+
+    const message = try ev.signing_message_into(&message_buffer);
+    try std.testing.expect(std.mem.indexOf(u8, message, "|t|9=1|1|p") != null);
+
+    var round_trip_buffer: [1024]u8 = undefined;
+    const serialized = try ev.serialize_into(&round_trip_buffer);
+    const decoded = try EventValue.deserialize_borrowed(serialized);
+    try std.testing.expect(decoded.verify_provenance(key.public_key()));
+
+    var altered = decoded;
+    altered.vector_clock = "9=2";
+    try std.testing.expect(!altered.verify_provenance(key.public_key()));
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const auth = @import("auth.zig");
 const limits = @import("limits.zig");
+const vc_mod = @import("vc.zig");
 
 pub const protocol_version: u8 = 0x05;
 pub const frame_size_max: limits.ByteCount = 1024 * 1024;
@@ -27,6 +28,10 @@ pub const MessageType = enum(u8) {
     read_log_response = 0x0A,
     health_request = 0x0B,
     health_response = 0x0C,
+    vc_summary_request = 0x0D,
+    vc_summary_response = 0x0E,
+    bootstrap_request = 0x0F,
+    bootstrap_response = 0x10,
 };
 
 pub const EventId = u128;
@@ -172,6 +177,33 @@ pub const ReadLogResponse = struct {
 
 pub const HealthRequest = struct {};
 
+pub const VcSummaryRequest = struct {};
+
+pub const VcEntry = vc_mod.Entry;
+
+pub const VcSummaryResponse = struct {
+    entries: []const VcEntry,
+};
+
+pub const vc_entries_max = vc_mod.entry_max;
+
+/// `cursor` is the last key consumed (empty = start); max_count 0 = server default.
+pub const BootstrapRequest = struct {
+    cursor: []const u8,
+    max_count: limits.EventCount,
+};
+
+pub const BootstrapEvent = struct {
+    value: []const u8,
+};
+
+pub const BootstrapResponse = struct {
+    events: []const BootstrapEvent,
+    next_cursor: []const u8,
+    complete: bool,
+    vc: []const VcEntry,
+};
+
 pub const HealthResponse = struct {
     integrity_verified: bool,
     store_poisoned: bool,
@@ -208,6 +240,8 @@ pub const DecodeBuffers = struct {
     pull_events: []PullResponse.EventEntry = &.{},
     append_events: []AppendEvent = &.{},
     read_events: []ReadEvent = &.{},
+    vc_entries: []VcEntry = &.{},
+    bootstrap_events: []BootstrapEvent = &.{},
 };
 
 pub const Message = union(MessageType) {
@@ -223,9 +257,12 @@ pub const Message = union(MessageType) {
     read_log_response: ReadLogResponse,
     health_request: HealthRequest,
     health_response: HealthResponse,
+    vc_summary_request: VcSummaryRequest,
+    vc_summary_response: VcSummaryResponse,
+    bootstrap_request: BootstrapRequest,
+    bootstrap_response: BootstrapResponse,
 };
 
-/// Encodes into caller-owned memory.
 pub fn encode_into(buffer: []u8, msg: Message) ![]const u8 {
     try validate_message(msg);
     const size = try payload_size(msg);
@@ -290,6 +327,40 @@ pub fn encode_into(buffer: []u8, msg: Message) ![]const u8 {
         },
         .health_request => {},
         .health_response => |response| offset = write_health_response(frame, offset, response),
+        .vc_summary_request => {},
+        .vc_summary_response => |response| {
+            std.mem.writeInt(u32, frame[offset..][0..4], @intCast(response.entries.len), .big);
+            offset += 4;
+            for (response.entries) |entry| {
+                std.mem.writeInt(u64, frame[offset..][0..8], entry.node, .big);
+                offset += 8;
+                std.mem.writeInt(u64, frame[offset..][0..8], entry.counter, .big);
+                offset += 8;
+            }
+        },
+        .bootstrap_request => |request| {
+            offset = write_bytes_u16(frame, offset, request.cursor);
+            std.mem.writeInt(u32, frame[offset..][0..4], request.max_count, .big);
+            offset += 4;
+        },
+        .bootstrap_response => |response| {
+            std.mem.writeInt(u32, frame[offset..][0..4], @intCast(response.events.len), .big);
+            offset += 4;
+            for (response.events) |event| {
+                offset = write_bytes_u32(frame, offset, event.value);
+            }
+            offset = write_bytes_u16(frame, offset, response.next_cursor);
+            frame[offset] = if (response.complete) 1 else 0;
+            offset += 1;
+            std.mem.writeInt(u32, frame[offset..][0..4], @intCast(response.vc.len), .big);
+            offset += 4;
+            for (response.vc) |entry| {
+                std.mem.writeInt(u64, frame[offset..][0..8], entry.node, .big);
+                offset += 8;
+                std.mem.writeInt(u64, frame[offset..][0..8], entry.counter, .big);
+                offset += 8;
+            }
+        },
     }
 
     assert(offset == total_size);
@@ -482,8 +553,7 @@ fn write_bytes_u32(buf: []u8, offset: limits.ByteCount, bytes: []const u8) limit
     return offset + 4 + @as(limits.ByteCount, @intCast(bytes.len));
 }
 
-/// Decodes without allocating. Returned slices borrow `frame`; decoded event
-/// entries use the corresponding caller-owned scratch buffers.
+/// Returned slices borrow `frame` and the caller's scratch buffers.
 pub fn decode(frame: []const u8, buffers: *DecodeBuffers) !Message {
     if (frame.len < 6) return error.TruncatedFrame;
     const payload_length = std.mem.readInt(u32, frame[0..4], .big);
@@ -514,8 +584,108 @@ pub fn decode(frame: []const u8, buffers: *DecodeBuffers) !Message {
         else
             error.TrailingData,
         0x0C => decode_health_response(payload),
+        0x0D => if (payload.len == 0)
+            .{ .vc_summary_request = .{} }
+        else
+            error.TrailingData,
+        0x0E => decode_vc_summary_response(payload, buffers.vc_entries),
+        0x0F => decode_bootstrap_request(payload),
+        0x10 => decode_bootstrap_response(
+            payload,
+            buffers.bootstrap_events,
+            buffers.vc_entries,
+        ),
         else => error.UnknownMessageType,
     };
+}
+
+fn decode_bootstrap_request(payload: []const u8) !Message {
+    var decoder: PayloadDecoder = .{ .payload = payload };
+    const cursor = try decoder.read_bytes_u16();
+    if (cursor.len > limits.key_length_max) return error.CursorTooLong;
+    const max_count = try decoder.read_int(u32);
+    if (max_count > limits.pull_events_max) return error.TooManyEvents;
+    try decoder.finish();
+    return .{ .bootstrap_request = .{
+        .cursor = cursor,
+        .max_count = @intCast(max_count),
+    } };
+}
+
+fn decode_bootstrap_response(
+    payload: []const u8,
+    event_entries: []BootstrapEvent,
+    vc_entries: []VcEntry,
+) !Message {
+    if (payload.len < 4) return error.TruncatedFrame;
+    const count = std.mem.readInt(u32, payload[0..4], .big);
+    if (count > limits.pull_events_max) return error.TooManyEvents;
+    if (count > event_entries.len) return error.EventBufferTooSmall;
+
+    var offset: limits.ByteCount = 4;
+    for (event_entries[0..count]) |*entry| {
+        if (offset + 4 > payload.len) return error.TruncatedFrame;
+        const value_length = std.mem.readInt(u32, payload[offset..][0..4], .big);
+        offset += 4;
+        if (value_length > payload.len - offset) return error.TruncatedFrame;
+        entry.* = .{ .value = payload[offset..][0..value_length] };
+        offset += value_length;
+    }
+    if (offset + 2 > payload.len) return error.TruncatedFrame;
+    const cursor_length = std.mem.readInt(u16, payload[offset..][0..2], .big);
+    offset += 2;
+    if (cursor_length > limits.key_length_max) return error.CursorTooLong;
+    if (cursor_length > payload.len - offset) return error.TruncatedFrame;
+    const next_cursor = payload[offset..][0..cursor_length];
+    offset += cursor_length;
+    if (offset + 1 > payload.len) return error.TruncatedFrame;
+    const complete_byte = payload[offset];
+    if (complete_byte > 1) return error.InvalidMessage;
+    offset += 1;
+    if (offset + 4 > payload.len) return error.TruncatedFrame;
+    const vc_count = std.mem.readInt(u32, payload[offset..][0..4], .big);
+    offset += 4;
+    if (vc_count > vc_entries_max) return error.TooManyEntries;
+    if (vc_count > vc_entries.len) return error.EventBufferTooSmall;
+    const expected_vc_size: usize = @as(usize, vc_count) * 16;
+    if (payload.len - offset != expected_vc_size) return error.InvalidMessage;
+    var previous_node: ?u64 = null;
+    for (vc_entries[0..vc_count], 0..) |*entry, index| {
+        const base = offset + index * 16;
+        entry.node = std.mem.readInt(u64, payload[base..][0..8], .big);
+        entry.counter = std.mem.readInt(u64, payload[base + 8 ..][0..8], .big);
+        if (previous_node) |previous| {
+            if (entry.node <= previous) return error.InvalidMessage;
+        }
+        previous_node = entry.node;
+    }
+    return .{ .bootstrap_response = .{
+        .events = event_entries[0..count],
+        .next_cursor = next_cursor,
+        .complete = complete_byte == 1,
+        .vc = vc_entries[0..vc_count],
+    } };
+}
+
+fn decode_vc_summary_response(payload: []const u8, entries: []VcEntry) !Message {
+    if (payload.len < 4) return error.TruncatedFrame;
+    const count = std.mem.readInt(u32, payload[0..4], .big);
+    if (count > vc_entries_max) return error.TooManyEntries;
+    if (count > entries.len) return error.EventBufferTooSmall;
+    const expected_size: limits.ByteCount = @intCast(4 + @as(usize, count) * 16);
+    if (payload.len != expected_size) return error.InvalidMessage;
+
+    var previous_node: ?u64 = null;
+    for (entries[0..count], 0..) |*entry, index| {
+        const base = 4 + index * 16;
+        entry.node = std.mem.readInt(u64, payload[base..][0..8], .big);
+        entry.counter = std.mem.readInt(u64, payload[base + 8 ..][0..8], .big);
+        if (previous_node) |previous| {
+            if (entry.node <= previous) return error.InvalidMessage;
+        }
+        previous_node = entry.node;
+    }
+    return .{ .vc_summary_response = .{ .entries = entries[0..count] } };
 }
 
 fn decode_health_response(payload: []const u8) !Message {
@@ -837,7 +1007,6 @@ fn decode_read_event(decoder: *PayloadDecoder) !ReadEvent {
 }
 
 fn payload_size(msg: Message) !limits.ByteCount {
-    // version(1) + type(1) + type-specific
     var size: limits.ByteCount = 2;
     switch (msg) {
         .handshake => |h| {
@@ -854,7 +1023,7 @@ fn payload_size(msg: Message) !limits.ByteCount {
             try payload_size_add(&size, 8 + 4);
         },
         .pull_response => |pr| {
-            try payload_size_add(&size, 4); // event_count
+            try payload_size_add(&size, 4);
             for (pr.events) |entry| {
                 try payload_size_add(&size, 4);
                 try payload_size_add(&size, entry.key.len);
@@ -887,6 +1056,25 @@ fn payload_size(msg: Message) !limits.ByteCount {
         },
         .health_request => {},
         .health_response => try payload_size_add(&size, 128),
+        .vc_summary_request => {},
+        .vc_summary_response => |response| {
+            try payload_size_add(&size, 4);
+            try payload_size_add(&size, response.entries.len * 16);
+        },
+        .bootstrap_request => |request| {
+            try payload_size_add(&size, 2 + request.cursor.len);
+            try payload_size_add(&size, 4);
+        },
+        .bootstrap_response => |response| {
+            try payload_size_add(&size, 4);
+            for (response.events) |event| {
+                try payload_size_add(&size, 4 + event.value.len);
+            }
+            try payload_size_add(&size, 2 + response.next_cursor.len);
+            try payload_size_add(&size, 1);
+            try payload_size_add(&size, 4);
+            try payload_size_add(&size, response.vc.len * 16);
+        },
     }
     assert(size >= 2);
     assert(size <= frame_payload_size_max);
@@ -973,6 +1161,25 @@ fn validate_message(msg: Message) !void {
                 response.stream_id_bytes_used > response.stream_id_bytes_max or
                 response.connections_active > response.connections_max)
                 return error.InvalidHealthResponse;
+        },
+        .vc_summary_request => {},
+        .vc_summary_response => |response| {
+            if (response.entries.len > vc_entries_max) return error.TooManyEntries;
+            for (response.entries, 0..) |entry, index| {
+                if (index > 0 and entry.node <= response.entries[index - 1].node)
+                    return error.InvalidMessage;
+            }
+        },
+        .bootstrap_request => |request| {
+            if (request.cursor.len > limits.key_length_max) return error.CursorTooLong;
+            if (request.max_count > limits.pull_events_max) return error.TooManyEvents;
+        },
+        .bootstrap_response => |response| {
+            if (response.events.len > limits.pull_events_max) return error.TooManyEvents;
+            if (response.next_cursor.len > limits.key_length_max) return error.CursorTooLong;
+            if (response.complete and response.next_cursor.len != 0 and response.events.len == 0)
+                return error.InvalidMessage;
+            if (response.vc.len > vc_entries_max) return error.TooManyEntries;
         },
     }
 }
@@ -1200,7 +1407,6 @@ test "round-trip error with each error code" {
 }
 
 test "reject frames exceeding frame_size_max" {
-    // The length prefix excludes itself, but the complete frame is bounded.
     var frame: [6]u8 = undefined;
     std.mem.writeInt(u32, frame[0..4], frame_payload_size_max + 1, .big);
     frame[4] = protocol_version;
@@ -1215,7 +1421,7 @@ test "reject unknown message types" {
     var frame: [10]u8 = undefined;
     std.mem.writeInt(u32, frame[0..4], 6, .big);
     frame[4] = protocol_version;
-    frame[5] = 0xFF; // unknown type
+    frame[5] = 0xFF;
     @memset(frame[6..], 0);
 
     var decode_buffers: DecodeBuffers = .{};
@@ -1224,12 +1430,10 @@ test "reject unknown message types" {
 }
 
 test "reject truncated frames" {
-    // Frame too short for even the header
     var decode_buffers: DecodeBuffers = .{};
     const result1 = decode(&[_]u8{ 0, 0, 0 }, &decode_buffers);
     try std.testing.expectError(error.TruncatedFrame, result1);
 
-    // Payload length says 10 but frame only has 8 bytes total
     var frame2: [8]u8 = undefined;
     std.mem.writeInt(u32, frame2[0..4], 10, .big);
     frame2[4] = protocol_version;
@@ -1239,14 +1443,12 @@ test "reject truncated frames" {
     const result2 = decode(&frame2, &decode_buffers);
     try std.testing.expectError(error.TruncatedFrame, result2);
 
-    // Valid header claiming handshake but truncated handshake body
     var frame3: [8]u8 = undefined;
     std.mem.writeInt(u32, frame3[0..4], 4, .big);
     frame3[4] = protocol_version;
     frame3[5] = @intFromEnum(MessageType.handshake);
-    // Only 2 bytes of payload after version+type, need at least 4 (two u16 lengths)
     frame3[6] = 0;
-    frame3[7] = 5; // service_name_len = 5, but no data follows
+    frame3[7] = 5;
     const result3 = decode(&frame3, &decode_buffers);
     try std.testing.expectError(error.TruncatedFrame, result3);
 }
@@ -1432,6 +1634,140 @@ test "round-trip bounded health metrics" {
     try std.testing.expectEqualDeep(expected, decoded.health_response);
     const request_frame = try encode_into(&frame_buffer, .{ .health_request = .{} });
     try std.testing.expect((try decode(request_frame, &buffers)) == .health_request);
+}
+
+test "round-trip vector-clock summary" {
+    const entries = [_]VcEntry{
+        .{ .node = 1, .counter = 44 },
+        .{ .node = 999, .counter = 7 },
+    };
+    var frame_buffer: [128]u8 = undefined;
+    const frame = try encode_into(&frame_buffer, .{ .vc_summary_response = .{
+        .entries = &entries,
+    } });
+    var entry_buffer: [vc_entries_max]VcEntry = undefined;
+    var buffers: DecodeBuffers = .{ .vc_entries = &entry_buffer };
+    const decoded = try decode(frame, &buffers);
+    try std.testing.expectEqual(entries.len, decoded.vc_summary_response.entries.len);
+    try std.testing.expectEqualSlices(
+        VcEntry,
+        &entries,
+        decoded.vc_summary_response.entries,
+    );
+
+    const request_frame = try encode_into(&frame_buffer, .{ .vc_summary_request = .{} });
+    try std.testing.expect((try decode(request_frame, &buffers)) == .vc_summary_request);
+
+    const unordered = [_]VcEntry{
+        .{ .node = 9, .counter = 1 },
+        .{ .node = 2, .counter = 1 },
+    };
+    try std.testing.expectError(
+        error.InvalidMessage,
+        encode_into(&frame_buffer, .{ .vc_summary_response = .{ .entries = &unordered } }),
+    );
+
+    var oversized: [vc_entries_max + 1]VcEntry = @splat(.{ .node = 1, .counter = 0 });
+    for (&oversized, 0..) |*entry, index| entry.node = index + 1;
+    try std.testing.expectError(
+        error.TooManyEntries,
+        encode_into(&frame_buffer, .{ .vc_summary_response = .{ .entries = &oversized } }),
+    );
+}
+
+test "round-trip bootstrap pagination" {
+    const request: Message = .{ .bootstrap_request = .{
+        .cursor = "evt:fugue-a:type:0000000000000004",
+        .max_count = 16,
+    } };
+    var frame_buffer: [512]u8 = undefined;
+    var buffers: DecodeBuffers = .{};
+    const decoded_request = try test_round_trip(&frame_buffer, request, &buffers);
+    try std.testing.expectEqualStrings(
+        request.bootstrap_request.cursor,
+        decoded_request.bootstrap_request.cursor,
+    );
+    try std.testing.expectEqual(@as(u32, 16), decoded_request.bootstrap_request.max_count);
+
+    const empty_cursor_frame = try encode_into(&frame_buffer, .{ .bootstrap_request = .{
+        .cursor = "",
+        .max_count = 8,
+    } });
+    const decoded_empty = try decode(empty_cursor_frame, &buffers);
+    try std.testing.expectEqual(@as(usize, 0), decoded_empty.bootstrap_request.cursor.len);
+    try std.testing.expectError(
+        error.TooManyEvents,
+        encode_into(&frame_buffer, .{ .bootstrap_request = .{
+            .cursor = "",
+            .max_count = limits.pull_events_max + 1,
+        } }),
+    );
+
+    const vc_entries = [_]VcEntry{.{ .node = 5, .counter = 12 }};
+    const events = [_]BootstrapEvent{
+        .{ .value = "1|10|2|os|t||{}" },
+        .{ .value = "2|20|3|os|t||9=1|xyz" },
+    };
+    const response: Message = .{ .bootstrap_response = .{
+        .events = &events,
+        .next_cursor = "evt:fugue-a:type2:0000000000000007",
+        .complete = false,
+        .vc = &vc_entries,
+    } };
+    var bootstrap_buffer: [limits.pull_events_max]BootstrapEvent = undefined;
+    var vc_buffer: [vc_entries_max]VcEntry = undefined;
+    var response_buffers: DecodeBuffers = .{
+        .bootstrap_events = &bootstrap_buffer,
+        .vc_entries = &vc_buffer,
+    };
+    var response_frame: [4096]u8 = undefined;
+    const encoded_response = try encode_into(&response_frame, response);
+    const decoded_response = try decode(encoded_response, &response_buffers);
+    try std.testing.expectEqual(events.len, decoded_response.bootstrap_response.events.len);
+    try std.testing.expectEqualStrings(
+        events[0].value,
+        decoded_response.bootstrap_response.events[0].value,
+    );
+    try std.testing.expectEqualStrings(
+        events[1].value,
+        decoded_response.bootstrap_response.events[1].value,
+    );
+    try std.testing.expectEqualStrings(
+        response.bootstrap_response.next_cursor,
+        decoded_response.bootstrap_response.next_cursor,
+    );
+    try std.testing.expect(!decoded_response.bootstrap_response.complete);
+    try std.testing.expectEqualSlices(
+        VcEntry,
+        &vc_entries,
+        decoded_response.bootstrap_response.vc,
+    );
+
+    const final: Message = .{ .bootstrap_response = .{
+        .events = &.{},
+        .next_cursor = "",
+        .complete = true,
+        .vc = &.{},
+    } };
+    const encoded_final = try encode_into(&frame_buffer, final);
+    const decoded_final = try decode(encoded_final, &response_buffers);
+    try std.testing.expect(decoded_final.bootstrap_response.complete);
+    try std.testing.expectEqual(@as(usize, 0), decoded_final.bootstrap_response.events.len);
+
+    var too_many: [limits.pull_events_max + 1]BootstrapEvent = undefined;
+    for (&too_many) |*entry| entry.* = .{ .value = "x" };
+    try std.testing.expectError(error.TooManyEvents, encode_into(&frame_buffer, .{
+        .bootstrap_response = .{
+            .events = &too_many,
+            .next_cursor = "",
+            .complete = true,
+            .vc = &.{},
+        },
+    }));
+    const long_cursor: [limits.key_length_max + 1]u8 = @splat('k');
+    try std.testing.expectError(error.CursorTooLong, encode_into(&frame_buffer, .{
+        .bootstrap_request = .{ .cursor = &long_cursor, .max_count = 1 },
+    }));
 }
 
 test "append and read contracts enforce shared bounds" {

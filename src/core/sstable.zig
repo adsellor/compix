@@ -47,11 +47,9 @@ pub const FaultInjector = struct {
 };
 
 comptime {
-    // Footer layout: [8B index_offset][4B index_size][4B num_blocks]
-    // [8B num_entries][8B min_seq][8B max_seq][4B bloom_length][4B magic]
-    // [2B version][2B flags][16B data checksum][16B index checksum]
-    // [16B bloom checksum][16B footer checksum]. The bloom filter section sits
-    // between the index and the footer: [data][index][bloom][footer].
+    // NOTE: file: [data][index][bloom][footer]. Footer: [8B index_offset][4B index_size]
+    // [4B num_blocks][8B num_entries][8B min_seq][8B max_seq][4B bloom_length][4B magic]
+    // [2B version][2B flags][16B data, index, bloom and footer checksums].
     assert(footer_size == 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 2 + 2 + 4 * checksum_size);
     assert(block_size_target > 0);
 }
@@ -92,8 +90,6 @@ pub const ScanEntry = struct {
     value_length: limits.ByteCount,
 };
 
-/// Allocation-free SSTable construction. All transient storage belongs to the
-/// caller and may be reused after `finish` returns.
 pub const StreamingWriter = struct {
     file: IoFile,
     parent_file: IoFile,
@@ -194,10 +190,7 @@ pub const StreamingWriter = struct {
         };
     }
 
-    /// Opt in to writing a Bloom filter over the table's keys. `bit_scratch`
-    /// must hold `params.byte_len()` bytes and `serialize_scratch` at least
-    /// `bloom.serialized_size_max(params)`; both belong to the caller and stay
-    /// borrowed until `finish`. Call before the first `append`.
+    /// Call before the first `append`; both scratch buffers stay borrowed until `finish`.
     pub fn enable_bloom(
         self: *StreamingWriter,
         params: bloom.Params,
@@ -323,7 +316,6 @@ pub const StreamingWriter = struct {
         );
         try self.inject_fault(.after_index_write);
 
-        // The Bloom filter section sits between the index and the footer.
         var bloom_length: u32 = 0;
         var bloom_checksum: [checksum_size]u8 = @splat(0);
         if (self.bloom_enabled) {
@@ -417,14 +409,40 @@ fn write_footer(file: IoFile, io: Io, footer: Footer) !void {
 
 pub const LoadedBloom = struct {
     params: bloom.Params,
-    /// Decompressed filter bits, owned by the caller's allocator.
     bits: []u8,
 };
+
+/// Index record: `[u32 key_length][key][u64 offset][u32 size]`, one per data block.
+pub const LoadedIndex = struct {
+    bytes: []u8,
+    offsets: []u32,
+
+    fn entry_at(self: LoadedIndex, position: usize) DiskIndexEntry {
+        const start = self.offsets[position];
+        const key_length = std.mem.readInt(u32, self.bytes[start..][0..4], .little);
+        const key = self.bytes[start + 4 ..][0..key_length];
+        const metadata = self.bytes[start + 4 + key_length ..][0..12];
+        return .{
+            .first_key = key,
+            .block_offset = std.mem.readInt(u64, metadata[0..8], .little),
+            .block_size = std.mem.readInt(u32, metadata[8..12], .little),
+        };
+    }
+};
+
+const DiskIndexEntry = struct {
+    first_key: []const u8,
+    block_offset: u64,
+    block_size: limits.ByteCount,
+};
+
+const index_entry_overhead: u32 = 4 + 12;
 
 pub const SSTableReader = struct {
     file: IoFile,
     io: Io,
     footer: Footer,
+    index: ?LoadedIndex = null,
 
     pub fn open_uncached(path: []const u8, io: Io) !SSTableReader {
         const file = IoDir.cwd().openFile(
@@ -491,9 +509,7 @@ pub const SSTableReader = struct {
         };
     }
 
-    /// Read and decompress the table's Bloom filter into a freshly allocated
-    /// buffer the caller owns and frees. Returns null when the table has no
-    /// filter. The section bytes were already checksum-verified at open.
+    /// Caller owns the result; null when the table has no filter.
     pub fn load_bloom(
         self: *SSTableReader,
         allocator: std.mem.Allocator,
@@ -517,12 +533,6 @@ pub const SSTableReader = struct {
     pub fn deinit(self: *SSTableReader) void {
         self.file.close(self.io);
     }
-
-    const DiskIndexEntry = struct {
-        first_key: []const u8,
-        block_offset: u64,
-        block_size: limits.ByteCount,
-    };
 
     fn read_disk_index_entry(
         self: *SSTableReader,
@@ -554,11 +564,53 @@ pub const SSTableReader = struct {
         };
     }
 
+    /// Release with `unload_index`; `deinit` has no allocator to do it.
+    pub fn load_index(
+        self: *SSTableReader,
+        allocator: std.mem.Allocator,
+    ) !?LoadedIndex {
+        if (self.index != null) return self.index;
+        if (self.footer.index_size == 0) return null;
+        const bytes = try allocator.alloc(u8, self.footer.index_size);
+        errdefer allocator.free(bytes);
+        try read_exact(self.file, self.io, bytes, self.footer.index_offset);
+
+        const offsets = try allocator.alloc(u32, self.footer.num_blocks);
+        errdefer allocator.free(offsets);
+        var cursor: u32 = 0;
+        var count: u32 = 0;
+        while (cursor < self.footer.index_size) {
+            if (count == offsets.len) return error.InvalidFormat;
+            if (self.footer.index_size - cursor < index_entry_overhead)
+                return error.InvalidFormat;
+            const key_length = std.mem.readInt(u32, bytes[cursor..][0..4], .little);
+            if (key_length == 0 or key_length > limits.key_length_max) return error.InvalidFormat;
+            if (cursor + index_entry_overhead + key_length > self.footer.index_size)
+                return error.InvalidFormat;
+            offsets[count] = cursor;
+            count += 1;
+            cursor += index_entry_overhead + key_length;
+        }
+        if (count != offsets.len) return error.InvalidFormat;
+
+        self.index = .{ .bytes = bytes, .offsets = offsets };
+        return self.index;
+    }
+
+    pub fn unload_index(self: *SSTableReader, allocator: std.mem.Allocator) void {
+        const loaded = self.index orelse return;
+        allocator.free(loaded.bytes);
+        allocator.free(loaded.offsets);
+        self.index = null;
+    }
+
+    // NOTE: null when `key` sorts before every block.
     fn find_disk_block(
         self: *SSTableReader,
         key: []const u8,
         key_buffer: []u8,
     ) !?DiskIndexEntry {
+        if (self.index) |loaded| return find_block_in_memory(loaded, key);
         var cursor: limits.ByteCount = 0;
         var found: ?DiskIndexEntry = null;
         while (try self.read_disk_index_entry(&cursor, key_buffer)) |entry| {
@@ -570,6 +622,26 @@ pub const SSTableReader = struct {
             };
         }
         return found;
+    }
+
+    fn find_block_in_memory(loaded: LoadedIndex, key: []const u8) ?DiskIndexEntry {
+        var low: usize = 0;
+        var high: usize = loaded.offsets.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (std.mem.order(u8, loaded.entry_at(middle).first_key, key) == .gt) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        if (low == 0) return null;
+        const entry = loaded.entry_at(low - 1);
+        return .{
+            .first_key = "",
+            .block_offset = entry.block_offset,
+            .block_size = entry.block_size,
+        };
     }
 
     fn read_disk_block_into(
@@ -613,9 +685,13 @@ pub const SSTableReader = struct {
         return (try self.get_into(key, block_buffer)) != null;
     }
 
-    /// Advances through the checksummed data region without retaining a block
-    /// per table. This lets the LSM perform a bounded k-way scan across every
-    /// live table with only one key slot per source.
+    /// Scanning from the result yields entries `>= key`, after at most one block of smaller keys.
+    pub fn scan_cursor_at(self: *SSTableReader, key: []const u8, key_buffer: []u8) !u64 {
+        const block = try self.find_disk_block(key, key_buffer) orelse return 0;
+        assert(block.block_offset < self.footer.index_offset);
+        return block.block_offset;
+    }
+
     pub fn scan_next_key(
         self: *SSTableReader,
         cursor: *u64,
@@ -882,11 +958,9 @@ test "bloom-enabled table round-trips its filter and detects corruption" {
         defer reader.deinit();
         const loaded = (try reader.load_bloom(allocator)).?;
         defer allocator.free(loaded.bits);
-        // Every present key must survive the filter round-trip.
         for (keys) |key| try std.testing.expect(bloom.mayContain(loaded.bits, loaded.params, key));
     }
 
-    // Corrupt a byte inside the Bloom section: open must fail the checksum.
     {
         const file = try IoDir.cwd().openFile(io, path, .{ .mode = .read_write });
         defer file.close(io);
@@ -980,6 +1054,80 @@ test "sstable write and read multiple entries" {
     try std.testing.expectEqual(@as(limits.CollectionCount, 2), context.count);
     try std.testing.expectEqualStrings("a:1", context.keys[0]);
     try std.testing.expectEqualStrings("a:2", context.keys[1]);
+}
+
+test "the in-memory index answers exactly as the file walk does" {
+    const allocator = std.testing.allocator;
+
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "data/test_sst_index_cache.sst";
+    IoDir.cwd().deleteFile(io, path) catch {};
+    defer IoDir.cwd().deleteFile(io, path) catch {};
+
+    const entry_count = 600;
+    var key_storage: [entry_count][16]u8 = undefined;
+    var value_storage: [entry_count][64]u8 = undefined;
+    var entries: [entry_count]RawEntry = undefined;
+    for (0..entry_count) |index| {
+        const key = try std.fmt.bufPrint(&key_storage[index], "k:{d:0>6}", .{index * 2});
+        const value = try std.fmt.bufPrint(
+            &value_storage[index],
+            "{d}|100|2|svc|evt||{{}}",
+            .{index + 1},
+        );
+        entries[index] = .{ .key = key, .value = value };
+    }
+
+    const footer = try write_test_table(allocator, path, io, &entries);
+    try std.testing.expectEqual(@as(u64, entry_count), footer.num_entries);
+    try std.testing.expect(footer.num_blocks > 1);
+
+    var walked = try SSTableReader.open_uncached(path, io);
+    defer walked.deinit();
+    var bisected = try SSTableReader.open_uncached(path, io);
+    defer bisected.deinit();
+    _ = try bisected.load_index(allocator);
+    defer bisected.unload_index(allocator);
+    try std.testing.expect(bisected.index != null);
+    try std.testing.expectEqual(
+        @as(usize, footer.num_blocks),
+        bisected.index.?.offsets.len,
+    );
+
+    var key_buffer: [limits.key_length_max]u8 = undefined;
+    var probe: [16]u8 = undefined;
+    for (0..entry_count * 2 + 4) |step| {
+        const value = if (step == 0) 0 else step - 1;
+        const key = try std.fmt.bufPrint(&probe, "k:{d:0>6}", .{value});
+        const from_walk = try walked.find_disk_block(key, &key_buffer);
+        const from_index = try bisected.find_disk_block(key, &key_buffer);
+        try std.testing.expectEqual(from_walk == null, from_index == null);
+        if (from_walk) |expected| {
+            try std.testing.expectEqual(expected.block_offset, from_index.?.block_offset);
+            try std.testing.expectEqual(expected.block_size, from_index.?.block_size);
+        }
+    }
+
+    try std.testing.expect(try walked.find_disk_block("a", &key_buffer) == null);
+    try std.testing.expect(try bisected.find_disk_block("a", &key_buffer) == null);
+
+    var block_buffer: [limits.sstable_block_size_max]u8 = undefined;
+    for ([_]usize{ 0, 1, 299, 598, 599 }) |index| {
+        const key = try std.fmt.bufPrint(&probe, "k:{d:0>6}", .{index * 2});
+        const expected = (try walked.get_into(key, &block_buffer)).?.sequence;
+        const actual = (try bisected.get_into(key, &block_buffer)).?.sequence;
+        try std.testing.expectEqual(expected, actual);
+        try std.testing.expectEqual(@as(u64, index + 1), actual);
+    }
+    try std.testing.expect(try bisected.get_into("k:999999", &block_buffer) == null);
+
+    bisected.unload_index(allocator);
+    try std.testing.expect(bisected.index == null);
+    const after_unload = (try bisected.get_into("k:000000", &block_buffer)).?;
+    try std.testing.expectEqual(@as(u64, 1), after_unload.sequence);
 }
 
 test "sstable raw iterator" {

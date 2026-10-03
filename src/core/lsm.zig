@@ -31,16 +31,21 @@ const flush_bytes_max: u64 = limits.memtable_bytes_max;
 const flush_count_max: u32 = limits.memtable_entries_max;
 const flush_high_water_bytes: u64 = flush_bytes_max / 2;
 const flush_high_water_count: u32 = flush_count_max / 2;
-// Per event: a log index, a stream index, and a signed evt: entry for pull
-// serving; plus the command index and the batch record per transaction.
 const transaction_entries_max: u32 = 3 * @as(u32, limits.append_events_max) + 2;
 const compaction_trigger_l0: u32 = 4;
+
+const compaction_trigger_level: u32 = 8;
+
+const compaction_levels_max: u32 = 7;
+
 const orphan_candidates_max: u16 = 4096;
 
 comptime {
     assert(flush_bytes_max > 0);
     assert(flush_count_max > 0);
     assert(compaction_trigger_l0 >= 2);
+    assert(compaction_trigger_level >= limits.compaction_fan_in_max);
+    assert(compaction_levels_max >= 2);
     assert(flush_count_max - flush_high_water_count > transaction_entries_max);
     assert(flush_bytes_max - flush_high_water_bytes > limits.payload_size_max + 2 * 1024 * 1024);
 }
@@ -76,28 +81,24 @@ pub const FaultInjector = struct {
     }
 };
 
-/// An open SSTable kept resident so reads never reopen or reparse table files.
-/// The list mirrors manifest.live exactly, sorted newest-first (level ascending,
-/// then id descending) so the first key hit is the freshest value.
+// NOTE: sorted newest-first, so the first key hit is the freshest value.
 const CachedTable = struct {
     id: u64,
     level: u32,
     reader: SSTableReader,
-    /// Decompressed Bloom filter over this table's keys, or empty when the
-    /// table predates filters. Owned by the LSM allocator.
     bloom_bits: []u8,
     bloom_params: bloom.Params,
 
-    /// True if this table definitely does not contain `key` (skip probing it).
     fn definitely_absent(self: *const CachedTable, key: []const u8) bool {
         if (self.bloom_bits.len == 0) return false;
         return !bloom.mayContain(self.bloom_bits, self.bloom_params, key);
     }
 };
 
-/// Transient buffers for building a table's Bloom filter, sized from an upper
-/// bound on the entry count. The filter is over-provisioned when the actual
-/// count is lower, which only lowers the false-positive rate.
+fn index_cache_cost(footer: sstable.Footer) u64 {
+    return @as(u64, footer.index_size) + @as(u64, footer.num_blocks) * @sizeOf(u32);
+}
+
 const BloomScratch = struct {
     params: bloom.Params,
     bits: []u8,
@@ -151,6 +152,12 @@ const CompactionPlan = struct {
     new_id: u64,
     ids: [limits.compaction_fan_in_max]u64,
     count: limits.SSTableCount,
+};
+
+pub const CompactionSummary = struct {
+    tables_before: limits.CollectionCount,
+    tables_after: limits.CollectionCount,
+    merges: u32,
 };
 
 fn make_flush_result(
@@ -275,6 +282,7 @@ pub const LSMEngine = struct {
     scan_sources: []ScanSource,
     base_path: []const u8,
     wal_path: []const u8,
+    index_cache_bytes: u64,
     next_sst_id: u64,
     read_scratch: []u8,
     event_scratch: []u8,
@@ -353,6 +361,7 @@ pub const LSMEngine = struct {
             .scan_sources = memory.scan_sources,
             .base_path = base,
             .wal_path = owned_wal_path,
+            .index_cache_bytes = 0,
             .next_sst_id = next_id,
             .read_scratch = memory.read_scratch,
             .event_scratch = memory.event_scratch,
@@ -419,13 +428,13 @@ pub const LSMEngine = struct {
     fn close_tables(self: *LSMEngine) void {
         for (self.tables.items()) |*t| {
             self.allocator.free(t.bloom_bits);
+            t.reader.unload_index(self.allocator);
             t.reader.deinit();
         }
         self.tables.reset();
+        self.index_cache_bytes = 0;
     }
 
-    /// Opens the table file and inserts it into the cache, keeping the
-    /// newest-first order (level ascending, id descending within a level).
     fn open_table(self: *LSMEngine, level: u32, id: u64) !void {
         assert(id > 0);
         if (self.tables.count >= limits.sstables_max) return error.TooManySSTables;
@@ -435,6 +444,11 @@ pub const LSMEngine = struct {
         errdefer reader.deinit();
         const loaded = try reader.load_bloom(self.allocator);
         errdefer if (loaded) |l| self.allocator.free(l.bits);
+        const index_bytes = index_cache_cost(reader.footer);
+        const cache_index =
+            self.index_cache_bytes + index_bytes <= limits.sstable_index_cache_bytes_max;
+        if (cache_index) _ = try reader.load_index(self.allocator);
+        errdefer reader.unload_index(self.allocator);
 
         var insert_at: limits.SSTableIndex = @intCast(self.tables.count);
         for (self.tables.items_const(), 0..) |t, i| {
@@ -451,6 +465,7 @@ pub const LSMEngine = struct {
             .bloom_bits = if (loaded) |l| l.bits else &.{},
             .bloom_params = if (loaded) |l| l.params else .{ .bits = 0, .hashes = 0 },
         }) catch unreachable;
+        if (reader.index != null) self.index_cache_bytes += index_bytes;
     }
 
     fn remove_table(self: *LSMEngine, id: u64) void {
@@ -458,6 +473,9 @@ pub const LSMEngine = struct {
             if (t.id == id) {
                 var removed = self.tables.ordered_remove(@intCast(i));
                 self.allocator.free(removed.bloom_bits);
+                if (removed.reader.index != null)
+                    self.index_cache_bytes -= index_cache_cost(removed.reader.footer);
+                removed.reader.unload_index(self.allocator);
                 removed.reader.deinit();
                 return;
             }
@@ -469,13 +487,11 @@ pub const LSMEngine = struct {
         assert(key.len > 0);
 
         if (self.background_flush) {
-            // The server freezes and reserves room before staging a transaction,
-            // so a background-mode put never flushes on the append path.
             if (!self.active_memtable.can_insert(key, &value)) {
                 return error.EventExceedsMemtableCapacity;
             }
         } else {
-            // Flush before insertion so no fallible operation follows the pool copy.
+            // NOTE: flush before insertion so no fallible operation follows the pool copy.
             if (self.active_memtable.size_bytes >= flush_bytes_max) try self.flush();
             if (self.active_memtable.count() >= flush_count_max) try self.flush();
             if (!self.active_memtable.can_insert(key, &value)) try self.flush();
@@ -490,6 +506,24 @@ pub const LSMEngine = struct {
         assert(self.active_memtable.count() <= flush_count_max);
     }
 
+    pub fn delete(self: *LSMEngine, key: []const u8, timestamp: limits.Timestamp) !void {
+        assert(key.len > 0);
+        const tombstone = event.makeTombstone(timestamp);
+        if (self.background_flush) {
+            if (!self.active_memtable.can_insert(key, &tombstone)) {
+                return error.EventExceedsMemtableCapacity;
+            }
+        } else {
+            if (self.active_memtable.size_bytes >= flush_bytes_max) try self.flush();
+            if (!self.active_memtable.can_insert(key, &tombstone)) try self.flush();
+            if (!self.active_memtable.can_insert(key, &tombstone)) {
+                return error.EventExceedsMemtableCapacity;
+            }
+        }
+        try self.wal.append_event(key, tombstone);
+        try self.active_memtable.insert(key, tombstone);
+    }
+
     pub fn sync(self: *LSMEngine) !void {
         try self.wal.sync();
     }
@@ -502,14 +536,17 @@ pub const LSMEngine = struct {
         assert(key.len > 0);
         var arena = try fixed.ByteArena.init(byte_buffer);
         if (self.active_memtable.get_ptr(key)) |value| {
+            if (event.isTombstone(value.*)) return null;
             return try copy_event_bounded(&arena, value.*);
         }
         if (self.flushing_memtable.get_ptr(key)) |value| {
+            if (event.isTombstone(value.*)) return null;
             return try copy_event_bounded(&arena, value.*);
         }
         for (self.tables.items()) |*table| {
             if (table.definitely_absent(key)) continue;
             if (try table.reader.get_into(key, self.read_scratch)) |value| {
+                if (event.isTombstone(value)) return null;
                 return try copy_event_bounded(&arena, value);
             }
         }
@@ -519,13 +556,14 @@ pub const LSMEngine = struct {
     fn copy_event_bounded(arena: *fixed.ByteArena, value: EventValue) !EventValue {
         const bytes_required = try limits.byte_count(
             value.origin_service.len + value.event_type.len + value.payload.len +
-                value.signature.len,
+                value.signature.len + value.vector_clock.len,
         );
         if (bytes_required > arena.remaining()) return error.ResultBufferTooSmall;
         const origin = arena.write(value.origin_service) catch unreachable;
         const event_type = arena.write(value.event_type) catch unreachable;
         const payload = arena.write(value.payload) catch unreachable;
         const signature = arena.write(value.signature) catch unreachable;
+        const vector_clock = arena.write(value.vector_clock) catch unreachable;
         return .{
             .sequence = value.sequence,
             .event_type = event_type,
@@ -533,18 +571,24 @@ pub const LSMEngine = struct {
             .timestamp = value.timestamp,
             .origin_service = origin,
             .signature = signature,
+            .vector_clock = vector_clock,
         };
     }
 
     pub fn contains(self: *LSMEngine, key: []const u8) !bool {
         assert(key.len > 0);
 
-        if (self.active_memtable.contains(key)) return true;
-        if (self.flushing_memtable.contains(key)) return true;
-
+        if (self.active_memtable.get_ptr(key)) |value| {
+            return !event.isTombstone(value.*);
+        }
+        if (self.flushing_memtable.get_ptr(key)) |value| {
+            return !event.isTombstone(value.*);
+        }
         for (self.tables.items()) |*t| {
             if (t.definitely_absent(key)) continue;
-            if (try t.reader.contains_into(key, self.read_scratch)) return true;
+            if (try t.reader.get_into(key, self.read_scratch)) |value| {
+                return !event.isTombstone(value);
+            }
         }
 
         return false;
@@ -556,10 +600,21 @@ pub const LSMEngine = struct {
         context: anytype,
         comptime visit: anytype,
     ) !event.VisitControl {
-        try self.initialize_scan_sources();
-        var active_iterator = self.active_memtable.iterator();
+        return self.visit_prefix_from(prefix, prefix, context, visit);
+    }
+
+    pub fn visit_prefix_from(
+        self: *LSMEngine,
+        prefix: []const u8,
+        start_key: []const u8,
+        context: anytype,
+        comptime visit: anytype,
+    ) !event.VisitControl {
+        assert(std.mem.startsWith(u8, start_key, prefix));
+        try self.initialize_scan_sources(start_key);
+        var active_iterator = self.active_memtable.iterator_from(start_key);
         var active_entry = active_iterator.next();
-        var flushing_iterator = self.flushing_memtable.iterator();
+        var flushing_iterator = self.flushing_memtable.iterator_from(start_key);
         var flushing_entry = flushing_iterator.next();
         var key_storage: [limits.key_length_max]u8 = undefined;
         while (true) {
@@ -592,7 +647,9 @@ pub const LSMEngine = struct {
                     }
                     break :value_blk try self.scan_value(key);
                 };
-                if (try visit(context, key, value) == .stop) return .stop;
+                if (!event.isTombstone(value)) {
+                    if (try visit(context, key, value) == .stop) return .stop;
+                }
             }
             if (active_entry) |entry| {
                 if (std.mem.eql(u8, entry.key, key)) active_entry = active_iterator.next();
@@ -607,11 +664,13 @@ pub const LSMEngine = struct {
         }
     }
 
-    fn initialize_scan_sources(self: *LSMEngine) !void {
+    fn initialize_scan_sources(self: *LSMEngine, start_key: []const u8) !void {
         assert(self.tables.count <= self.scan_sources.len);
+        var seek_key_buffer: [limits.key_length_max]u8 = undefined;
         for (self.scan_sources[0..self.tables.count], 0..) |*source, index| {
+            const reader = &self.tables.items()[index].reader;
             source.* = .{
-                .cursor = 0,
+                .cursor = try reader.scan_cursor_at(start_key, &seek_key_buffer),
                 .key = undefined,
                 .key_length = 0,
                 .value_offset = 0,
@@ -619,6 +678,12 @@ pub const LSMEngine = struct {
                 .current = false,
             };
             try self.advance_scan_source(index);
+            var skipped: u32 = 0;
+            while (source.current and std.mem.order(u8, source.current_key(), start_key) == .lt) {
+                skipped += 1;
+                assert(skipped <= sstable.block_size_target);
+                try self.advance_scan_source(index);
+            }
         }
     }
 
@@ -698,15 +763,40 @@ pub const LSMEngine = struct {
         assert(self.tables.count == tables_before + 1);
         assert(self.tables.count == self.manifest.live.count);
 
-        if (self.manifest.count_at_level(0) >= compaction_trigger_l0) {
+        try self.compact_overfull_levels();
+    }
+
+    // NOTE: one merge per level per flush, so a backlog drains without stalling the store.
+    fn compact_overfull_levels(self: *LSMEngine) !void {
+        var level: u32 = 0;
+        while (level < compaction_levels_max) : (level += 1) {
+            const trigger = if (level == 0) compaction_trigger_l0 else compaction_trigger_level;
+            if (self.manifest.count_at_level(level) < trigger) continue;
             self.compaction_active = true;
-            self.compact_level(0) catch |err| {
+            self.compact_level(level) catch |err| {
                 self.compaction_active = false;
                 self.compaction_failures += 1;
                 return err;
             };
             self.compaction_active = false;
         }
+    }
+
+    pub fn compact_until_stable(self: *LSMEngine) !CompactionSummary {
+        const tables_before = self.manifest.live.count;
+        var merges: u32 = 0;
+        while (true) {
+            const before = self.manifest.live.count;
+            try self.compact_overfull_levels();
+            const after = self.manifest.live.count;
+            if (after == before) break;
+            merges += 1;
+        }
+        return .{
+            .tables_before = tables_before,
+            .tables_after = self.manifest.live.count,
+            .merges = merges,
+        };
     }
 
     fn materialize_table(
@@ -1162,7 +1252,6 @@ test "bloom-filtered tables never miss a present key across many tables" {
 
     const total = 1500;
     var seq: u64 = 0;
-    // Many small flushes produce many filtered L0 tables and trigger compaction.
     for (0..total) |i| {
         seq += 1;
         var key_buffer: [64]u8 = undefined;
@@ -1179,21 +1268,18 @@ test "bloom-filtered tables never miss a present key across many tables" {
     try lsm.flush();
 
     var buffer: [limits.event_serialized_size_max]u8 = undefined;
-    // Every present key must be found — a bloom false negative would fail here.
     for (0..total) |i| {
         var key_buffer: [64]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buffer, "present:{d}", .{i});
         const value = try lsm.get_bounded(key, &buffer);
         try std.testing.expect(value != null);
     }
-    // Absent keys exercise the skip path and must report not-found.
     for (0..total) |i| {
         var key_buffer: [64]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buffer, "absent:{d}", .{i});
         try std.testing.expect((try lsm.get_bounded(key, &buffer)) == null);
     }
 
-    // Survives restart: filters are reloaded from disk and still correct.
     lsm.deinit();
     lsm = try LSMEngine.init(std.testing.allocator, wal_path, io);
     for (0..total) |i| {
@@ -1835,8 +1921,6 @@ test "lsm compaction merges L0 tables and reads survive" {
     var lsm = try LSMEngine.init(allocator, "data/test_lsm_compaction.wal", io);
     defer lsm.deinit();
 
-    // Four flushes trip the L0 compaction trigger; keys overlap so the newest
-    // sequence must win after the merge.
     for (0..4) |round| {
         for (1..6) |i| {
             const key = try std.fmt.allocPrint(allocator, "c:k{}", .{i});
@@ -1854,10 +1938,6 @@ test "lsm compaction merges L0 tables and reads survive" {
 }
 
 test "read operations allocate nothing after initialization" {
-    // Bloom filters need per-table memory proportional to table size, so
-    // flush/compaction/table-open allocate bounded filter buffers (freed on
-    // table removal). The read path — get_bounded and visit_prefix — must still
-    // allocate nothing, using only preallocated scratch and resident filters.
     const base = "data/test_lsm_no_post_init_alloc";
     const wal_path = "data/test_lsm_no_post_init_alloc.wal";
     const io = Io.Threaded.global_single_threaded.io();
@@ -1889,7 +1969,6 @@ test "read operations allocate nothing after initialization" {
         try lsm.flush();
     }
 
-    // Tables (and their filters) are built; the read path below must not allocate.
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
 
@@ -1919,4 +1998,222 @@ test "read operations allocate nothing after initialization" {
     try std.testing.expect(!failing.has_induced_failure);
     try std.testing.expectEqual(failing.fail_index, failing.alloc_index);
     try std.testing.expectEqual(failing.resize_fail_index, failing.resize_index);
+}
+
+test "tombstones hide keys across memtable flush and replay" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wal_path = "data/test_tombstones.wal";
+    const stem = "test_tombstones";
+    inline for (.{ wal_path, "data/" ++ stem ++ ".manifest" }) |p| {
+        Io.Dir.cwd().deleteFile(io, p) catch {};
+    }
+    Io.Dir.cwd().deleteTree(io, "data/" ++ stem ++ ".quarantine") catch {};
+    for (0..4) |level| {
+        for (1..64) |id| {
+            var path_buffer: [64]u8 = undefined;
+            const path = std.fmt.bufPrint(
+                &path_buffer,
+                "data/" ++ stem ++ "_L{d}_{d:0>8}.sst",
+                .{ level, id },
+            ) catch continue;
+            Io.Dir.cwd().deleteFile(io, path) catch {};
+        }
+    }
+    defer {
+        inline for (.{ wal_path, "data/" ++ stem ++ ".manifest" }) |p| {
+            Io.Dir.cwd().deleteFile(io, p) catch {};
+        }
+        Io.Dir.cwd().deleteTree(io, "data/" ++ stem ++ ".quarantine") catch {};
+        for (0..4) |level| {
+            for (1..64) |id| {
+                var path_buffer: [64]u8 = undefined;
+                const path = std.fmt.bufPrint(
+                    &path_buffer,
+                    "data/" ++ stem ++ "_L{d}_{d:0>8}.sst",
+                    .{ level, id },
+                ) catch continue;
+                Io.Dir.cwd().deleteFile(io, path) catch {};
+            }
+        }
+    }
+    var scratch: [limits.event_serialized_size_max]u8 = undefined;
+
+    {
+        var lsm = try LSMEngine.init(allocator, wal_path, io);
+        defer lsm.deinit();
+
+        const survivor = try EventValue.init(.{
+            .sequence = 1,
+            .origin_service = "svc",
+            .event_type = "e",
+            .payload = "keep",
+            .timestamp = 1,
+        });
+        const doomed = try EventValue.init(.{
+            .sequence = 2,
+            .origin_service = "svc",
+            .event_type = "e",
+            .payload = "drop",
+            .timestamp = 2,
+        });
+        try lsm.put("evt:svc:e:0000000000000001", survivor);
+        try lsm.put("evt:svc:e:0000000000000002", doomed);
+
+        try lsm.delete("evt:svc:e:0000000000000002", 3);
+        try std.testing.expect(!try lsm.contains("evt:svc:e:0000000000000002"));
+        try std.testing.expectEqual(@as(?EventValue, null), try lsm.get_bounded(
+            "evt:svc:e:0000000000000002",
+            &scratch,
+        ));
+        try std.testing.expect(try lsm.contains("evt:svc:e:0000000000000001"));
+
+        try lsm.flush();
+        try std.testing.expect(!try lsm.contains("evt:svc:e:0000000000000002"));
+        try std.testing.expectEqual(@as(?EventValue, null), try lsm.get_bounded(
+            "evt:svc:e:0000000000000002",
+            &scratch,
+        ));
+
+        const revived = try EventValue.init(.{
+            .sequence = 4,
+            .origin_service = "svc",
+            .event_type = "e",
+            .payload = "back",
+            .timestamp = 4,
+        });
+        try lsm.put("evt:svc:e:0000000000000002", revived);
+        try std.testing.expect(try lsm.contains("evt:svc:e:0000000000000002"));
+        const got = (try lsm.get_bounded("evt:svc:e:0000000000000002", &scratch)).?;
+        try std.testing.expectEqualStrings("back", got.payload);
+        try lsm.sync();
+    }
+
+    {
+        var lsm = try LSMEngine.init(allocator, wal_path, io);
+        defer lsm.deinit();
+        try std.testing.expect(try lsm.contains("evt:svc:e:0000000000000002"));
+        try lsm.delete("evt:svc:e:0000000000000002", 5);
+        try lsm.flush();
+    }
+    {
+        var lsm = try LSMEngine.init(allocator, wal_path, io);
+        defer lsm.deinit();
+        var scratch2: [limits.event_serialized_size_max]u8 = undefined;
+        try std.testing.expect(!try lsm.contains("evt:svc:e:0000000000000002"));
+        try std.testing.expectEqual(@as(?EventValue, null), try lsm.get_bounded(
+            "evt:svc:e:0000000000000002",
+            &scratch2,
+        ));
+        const kept = (try lsm.get_bounded("evt:svc:e:0000000000000001", &scratch2)).?;
+        try std.testing.expectEqualStrings("keep", kept.payload);
+
+        const Counter = struct {
+            count: usize = 0,
+            fn visit(ctx: *(@This()), _: []const u8, _: EventValue) !event.VisitControl {
+                ctx.count += 1;
+                return .continue_scan;
+            }
+        };
+        var counter: Counter = .{};
+        _ = try lsm.visit_prefix("evt:svc:", &counter, Counter.visit);
+        try std.testing.expectEqual(@as(usize, 1), counter.count);
+    }
+}
+
+test "levels above zero are compacted upward, so the probe set stays bounded" {
+    const base = "data/test_lsm_level_compaction";
+    const wal_path = "data/test_lsm_level_compaction.wal";
+    const io = Io.Threaded.global_single_threaded.io();
+    cleanup_test_lsm(std.testing.allocator, io, base);
+    defer cleanup_test_lsm(std.testing.allocator, io, base);
+
+    var lsm = try LSMEngine.init(std.testing.allocator, wal_path, io);
+    defer lsm.deinit();
+
+    const flushes = compaction_trigger_l0 * compaction_trigger_level * 2;
+    var seq: u64 = 0;
+    for (0..flushes) |flush_index| {
+        for (0..8) |i| {
+            seq += 1;
+            var key_buffer: [64]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "k:{d}:{d}", .{ flush_index, i });
+            try lsm.put(key, .{
+                .sequence = seq,
+                .event_type = "e",
+                .payload = "{}",
+                .timestamp = 1,
+                .origin_service = "svc",
+            });
+        }
+        try lsm.flush();
+    }
+
+    try std.testing.expect(lsm.manifest.count_at_level(0) < compaction_trigger_l0);
+    try std.testing.expect(lsm.manifest.count_at_level(1) < compaction_trigger_level);
+    try std.testing.expect(lsm.manifest.count_at_level(2) > 0);
+
+    var buffer: [limits.event_serialized_size_max]u8 = undefined;
+    for (0..flushes) |flush_index| {
+        for (0..8) |i| {
+            var key_buffer: [64]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buffer, "k:{d}:{d}", .{ flush_index, i });
+            const found = try lsm.get_bounded(key, &buffer);
+            try std.testing.expect(found != null);
+        }
+    }
+}
+
+test "visit_prefix_from seeks every source and never visits keys before the start" {
+    const base = "data/test_lsm_seek";
+    const wal_path = "data/test_lsm_seek.wal";
+    const io = Io.Threaded.global_single_threaded.io();
+    cleanup_test_lsm(std.testing.allocator, io, base);
+    defer cleanup_test_lsm(std.testing.allocator, io, base);
+
+    var lsm = try LSMEngine.init(std.testing.allocator, wal_path, io);
+    defer lsm.deinit();
+
+    const payload: [96]u8 = @splat('p');
+    const sequence_last: u64 = 600;
+    var sequence: u64 = 1;
+    while (sequence <= sequence_last) : (sequence += 1) {
+        var key_buffer: [64]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "evt:svc:e:{x:0>16}", .{sequence});
+        const value: EventValue = .{
+            .sequence = sequence,
+            .event_type = "e",
+            .payload = &payload,
+            .timestamp = 1,
+            .origin_service = "svc",
+        };
+        try lsm.put(key, value);
+        var other_buffer: [64]u8 = undefined;
+        try lsm.put(try std.fmt.bufPrint(&other_buffer, "evt:svc:f:{x:0>16}", .{sequence}), value);
+        try lsm.put(try std.fmt.bufPrint(&other_buffer, "aaa:{x:0>16}", .{sequence}), value);
+        if (sequence == 200 or sequence == 400) try lsm.flush();
+    }
+
+    const Recorder = struct {
+        start_key: []const u8,
+        count: u64 = 0,
+        fn visit(self: *@This(), key: []const u8, _: EventValue) !event.VisitControl {
+            try std.testing.expect(std.mem.startsWith(u8, key, "evt:svc:e:"));
+            try std.testing.expect(std.mem.order(u8, key, self.start_key) != .lt);
+            self.count += 1;
+            return .continue_scan;
+        }
+    };
+    const starts = [_]u64{ 0, 1, 150, 200, 201, 333, 401, 555, 600, 601 };
+    for (starts) |start| {
+        var start_buffer: [64]u8 = undefined;
+        const start_key = try std.fmt.bufPrint(&start_buffer, "evt:svc:e:{x:0>16}", .{start});
+        var recorder: Recorder = .{ .start_key = start_key };
+        _ = try lsm.visit_prefix_from("evt:svc:e:", start_key, &recorder, Recorder.visit);
+        const first = @max(start, 1);
+        const expected = if (first > sequence_last) 0 else sequence_last - first + 1;
+        try std.testing.expectEqual(expected, recorder.count);
+    }
 }
