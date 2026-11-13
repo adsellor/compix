@@ -41,7 +41,11 @@ const subscription_heartbeat_ms: u32 = if (builtin.is_test) 50 else 15_000;
 /// A subscriber that has not taken a frame for this long is closed instead of stalling its pusher.
 const subscription_send_deadline_ms: u32 = if (builtin.is_test) 1_000 else 30_000;
 
+/// After SIGTERM or SIGINT the process exits within this bound even if teardown hangs.
+pub const shutdown_deadline_ms: u32 = 10_000;
+
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var shutdown_deadline_armed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 comptime {
     std.debug.assert(connection_idle_deadline_ms > 0);
@@ -64,6 +68,21 @@ pub inline fn register_signal_handlers() void {
     };
     std.posix.sigaction(.TERM, &act, null);
     std.posix.sigaction(.INT, &act, null);
+}
+
+fn arm_shutdown_deadline(io: Io) void {
+    if (shutdown_deadline_armed.swap(true, .acq_rel)) return;
+    const thread = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, enforce_shutdown_deadline, .{io}) catch |err| {
+        log.warn("shutdown deadline not armed: {}", .{err});
+        return;
+    };
+    thread.detach();
+}
+
+fn enforce_shutdown_deadline(io: Io) void {
+    io.sleep(.fromMilliseconds(shutdown_deadline_ms), .awake) catch {};
+    std.debug.print("compix: shutdown exceeded {d} ms; exiting\n", .{shutdown_deadline_ms});
+    std.process.exit(1);
 }
 
 pub const Server = struct {
@@ -1368,6 +1387,7 @@ pub const Server = struct {
             };
         }
 
+        if (shutdown_requested.load(.acquire)) arm_shutdown_deadline(self.io);
         self.running.store(false, .release);
         self.flush_mutex.lockUncancelable(self.io);
         self.flush_needed.broadcast(self.io);
@@ -1386,6 +1406,7 @@ pub const Server = struct {
     fn monitor_shutdown_signal(self: *Server) Io.Cancelable!void {
         while (self.running.load(.acquire)) {
             if (shutdown_requested.load(.acquire)) {
+                arm_shutdown_deadline(self.io);
                 self.shutdown();
                 return;
             }
