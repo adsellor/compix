@@ -182,18 +182,27 @@ pub const Owner = struct {
             if (self.stopping.load(.acquire)) return;
             self.work.waitUncancelable(self.io);
             if (self.stopping.load(.acquire)) return;
+            self.drain();
+        }
+    }
 
+    // NOTE: a later slot can publish and post before an earlier one, so a wake that handled at
+    // most one cell would strand it. Draining is safe: the unpublished head posts once it lands.
+    fn drain(self: *Owner) void {
+        while (true) {
             const pos = self.dequeue_pos.load(.acquire);
             const cell = &self.cells[pos & self.mask];
             const seq = cell.seq.load(.acquire);
-            if (seq != pos + 1) continue;
+            if (seq != pos + 1) return;
 
             self.execute(&cell.command);
 
-            // NOTE: free the cell before waking; the requester never reads it again.
+            // NOTE: free the cell before waking; the requester never reads it again. Freeing
+            // lets a submitter overwrite it, so take `done` first.
+            const done = cell.command.done;
             cell.seq.store(pos + self.cells.len, .release);
             self.dequeue_pos.store(pos + 1, .release);
-            cell.command.done.post(self.io);
+            done.post(self.io);
         }
     }
 
