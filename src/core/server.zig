@@ -3102,6 +3102,12 @@ test "store-owner actor serves vector-clock summaries over the wire" {
         .events = &append_events,
     }, 100);
 
+    const client_secret = "0123456789abcdef0123456789abcdef";
+    const credentials = [_]auth.Credential{.{
+        .service_name = "loopback",
+        .secret = client_secret,
+        .permissions = .{ .observe = true },
+    }};
     var srv: Server = undefined;
     try Server.init_in_place(&srv, allocator, .{
         .store = &event_store,
@@ -3112,6 +3118,7 @@ test "store-owner actor serves vector-clock summaries over the wire" {
         },
         .contracts = &.{},
         .io = io,
+        .credentials = &credentials,
     });
     defer srv.deinit();
     try std.testing.expect(srv.store_owner.thread != null);
@@ -3135,7 +3142,7 @@ test "store-owner actor serves vector-clock summaries over the wire" {
         .address = address,
         .service_name = "loopback",
         .instance_id = "probe-1",
-        .secret = "0123456789abcdef0123456789abcdef",
+        .secret = client_secret,
         .io = io,
     });
     const summary_reply = try client.vc_summary();
