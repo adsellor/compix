@@ -33,7 +33,7 @@ pub const Permission = enum {
     replicate,
 };
 
-pub const Permissions = packed struct(u8) {
+pub const Permissions = bitpack struct(u8) {
     append: bool = false,
     read_stream: bool = false,
     read_log: bool = false,
