@@ -45,6 +45,15 @@ pub const service_name_length_max: ByteCount = 1024;
 pub const stream_capacity_default: StreamCount = 1_048_576;
 pub const stream_capacity_test_default: StreamCount = 4096;
 pub const streams_max: StreamCount = 16_777_216;
+pub const subscription_event_types_max: u8 = 16;
+/// Total bytes of one subscription's event-type filter; real types are short dotted names.
+pub const subscription_event_types_bytes_max: ByteCount = 4096;
+/// Batches one push may load under the store lock; each costs one LSM lookup.
+pub const subscription_scan_batches_max: u32 = 256;
+/// Pusher rounds before the server ends a subscription; the driver resumes it transparently.
+/// It bounds a subscription's lifetime the way `messages_per_connection_max` bounds a request
+/// connection's.
+pub const subscription_rounds_max: u32 = 1 << 24;
 pub const stream_id_bytes_capacity_default: ByteCount = 64 * 1024 * 1024;
 pub const stream_id_bytes_capacity_test_default: ByteCount = 4 * 1024 * 1024;
 pub const stream_id_bytes_capacity_max: ByteCount = std.math.maxInt(ByteCount);
@@ -85,6 +94,12 @@ comptime {
     assert(stream_id_bytes_capacity_default <= stream_id_bytes_capacity_max);
     assert(stream_id_bytes_capacity_test_default >= stream_capacity_test_default);
     assert(streams_max > 0);
+    assert(subscription_event_types_max > 0);
+    assert(subscription_event_types_bytes_max >= subscription_event_types_max);
+    assert(subscription_event_types_bytes_max <=
+        @as(ByteCount, subscription_event_types_max) * event_type_length_max);
+    assert(subscription_scan_batches_max > 0);
+    assert(subscription_rounds_max > 0);
     assert(sstables_max > 0);
     assert(sstable_block_size_max > payload_size_max + key_length_max);
     assert(sstable_index_size_max > memtable_bytes_max);

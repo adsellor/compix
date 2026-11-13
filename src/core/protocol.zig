@@ -32,6 +32,8 @@ pub const MessageType = enum(u8) {
     vc_summary_response = 0x0E,
     bootstrap_request = 0x0F,
     bootstrap_response = 0x10,
+    subscribe = 0x11,
+    subscription_batch = 0x12,
 };
 
 pub const EventId = u128;
@@ -51,6 +53,9 @@ pub const requests_per_connection_max: RequestCount = limits.messages_per_connec
 pub const append_batch_header_size: limits.ByteCount = 112;
 pub const append_event_storage_overhead: limits.ByteCount = 26;
 pub const append_batch_size_max: limits.ByteCount = limits.payload_size_max;
+pub const subscription_event_types_max = limits.subscription_event_types_max;
+/// Version, type, next position, committed position, and event count.
+pub const subscription_batch_header_size: limits.ByteCount = 2 + 8 + 8 + 2;
 
 comptime {
     assert(stream_id_length_max > 0);
@@ -67,6 +72,8 @@ comptime {
     assert(append_batch_header_size < append_batch_size_max);
     assert(read_events_max <= std.math.maxInt(u16));
     assert(requests_per_connection_max > 0);
+    assert(subscription_event_types_max > 0);
+    assert(subscription_event_types_max <= std.math.maxInt(u8));
 }
 
 pub const Handshake = struct {
@@ -204,6 +211,32 @@ pub const BootstrapResponse = struct {
     vc: []const VcEntry,
 };
 
+/// Opens a long-lived push subscription to the durable ordered log or to one stream.
+///
+/// After this frame the server owns the connection as a pusher and never reads from it again;
+/// the subscriber only receives. The server keeps no state that outlives the connection: a
+/// subscriber resumes after any disconnect by subscribing again from the `next` of the last
+/// batch it processed. Flow control is the socket itself: a subscriber that stops reading
+/// stalls the pusher, which buffers nothing because every batch is read from the log on demand.
+pub const Subscribe = struct {
+    /// Empty subscribes to the whole ordered log; otherwise to this one stream.
+    stream_id: []const u8,
+    /// A log position for the whole log, a stream version for one stream; 0 means the start.
+    from: u64,
+    /// Empty delivers every event type.
+    event_types: []const []const u8,
+};
+
+/// Pushed by the server. `next` is where to resume, in the subscription's cursor space, past
+/// any events the filter skipped. A batch without events is a heartbeat. `committed_position`
+/// is the newest durable log position, so a whole-log subscriber's lag is
+/// `committed_position + 1 - next`.
+pub const SubscriptionBatch = struct {
+    next: u64,
+    committed_position: LogPosition,
+    events: []const ReadEvent,
+};
+
 pub const HealthResponse = struct {
     integrity_verified: bool,
     store_poisoned: bool,
@@ -242,6 +275,7 @@ pub const DecodeBuffers = struct {
     read_events: []ReadEvent = &.{},
     vc_entries: []VcEntry = &.{},
     bootstrap_events: []BootstrapEvent = &.{},
+    event_types: [][]const u8 = &.{},
 };
 
 pub const Message = union(MessageType) {
@@ -261,6 +295,8 @@ pub const Message = union(MessageType) {
     vc_summary_response: VcSummaryResponse,
     bootstrap_request: BootstrapRequest,
     bootstrap_response: BootstrapResponse,
+    subscribe: Subscribe,
+    subscription_batch: SubscriptionBatch,
 };
 
 pub fn encode_into(buffer: []u8, msg: Message) ![]const u8 {
@@ -360,6 +396,25 @@ pub fn encode_into(buffer: []u8, msg: Message) ![]const u8 {
                 std.mem.writeInt(u64, frame[offset..][0..8], entry.counter, .big);
                 offset += 8;
             }
+        },
+        .subscribe => |request| {
+            offset = write_bytes_u16(frame, offset, request.stream_id);
+            std.mem.writeInt(u64, frame[offset..][0..8], request.from, .big);
+            offset += 8;
+            frame[offset] = @intCast(request.event_types.len);
+            offset += 1;
+            for (request.event_types) |event_type| {
+                offset = write_bytes_u16(frame, offset, event_type);
+            }
+        },
+        .subscription_batch => |batch| {
+            std.mem.writeInt(u64, frame[offset..][0..8], batch.next, .big);
+            offset += 8;
+            std.mem.writeInt(u64, frame[offset..][0..8], batch.committed_position, .big);
+            offset += 8;
+            std.mem.writeInt(u16, frame[offset..][0..2], @intCast(batch.events.len), .big);
+            offset += 2;
+            for (batch.events) |event| offset = write_read_event(frame, offset, event);
         },
     }
 
@@ -595,8 +650,50 @@ pub fn decode(frame: []const u8, buffers: *DecodeBuffers) !Message {
             buffers.bootstrap_events,
             buffers.vc_entries,
         ),
+        0x11 => decode_subscribe_borrowed(payload, buffers.event_types),
+        0x12 => decode_subscription_batch_borrowed(payload, buffers.read_events),
         else => error.UnknownMessageType,
     };
+}
+
+fn decode_subscribe_borrowed(payload: []const u8, event_types: [][]const u8) !Message {
+    var decoder: PayloadDecoder = .{ .payload = payload };
+    const stream_id = try decoder.read_bytes_u16();
+    const from = try decoder.read_int(u64);
+    const type_count = try decoder.read_int(u8);
+    if (type_count > subscription_event_types_max) return error.TooManyEventTypes;
+    if (type_count > event_types.len) return error.EventBufferTooSmall;
+    for (event_types[0..type_count]) |*event_type| {
+        event_type.* = try decoder.read_bytes_u16();
+    }
+    try decoder.finish();
+    const request: Subscribe = .{
+        .stream_id = stream_id,
+        .from = from,
+        .event_types = event_types[0..type_count],
+    };
+    try validate_subscribe(request);
+    return .{ .subscribe = request };
+}
+
+fn decode_subscription_batch_borrowed(payload: []const u8, event_buffer: []ReadEvent) !Message {
+    var decoder: PayloadDecoder = .{ .payload = payload };
+    const next = try decoder.read_int(u64);
+    const committed_position = try decoder.read_int(u64);
+    const event_count = try decoder.read_int(u16);
+    if (event_count > read_events_max) return error.TooManyEvents;
+    if (event_count > event_buffer.len) return error.EventBufferTooSmall;
+    for (event_buffer[0..event_count]) |*event| {
+        event.* = try decode_read_event(&decoder);
+    }
+    try decoder.finish();
+    const batch: SubscriptionBatch = .{
+        .next = next,
+        .committed_position = committed_position,
+        .events = event_buffer[0..event_count],
+    };
+    try validate_subscription_batch(batch);
+    return .{ .subscription_batch = batch };
 }
 
 fn decode_bootstrap_request(payload: []const u8) !Message {
@@ -1075,6 +1172,16 @@ fn payload_size(msg: Message) !limits.ByteCount {
             try payload_size_add(&size, 4);
             try payload_size_add(&size, response.vc.len * 16);
         },
+        .subscribe => |request| {
+            try payload_size_add(&size, 2 + request.stream_id.len + 8 + 1);
+            for (request.event_types) |event_type| {
+                try payload_size_add(&size, 2 + event_type.len);
+            }
+        },
+        .subscription_batch => |batch| {
+            try payload_size_add(&size, 8);
+            try read_response_size(&size, batch.events);
+        },
     }
     assert(size >= 2);
     assert(size <= frame_payload_size_max);
@@ -1181,6 +1288,31 @@ fn validate_message(msg: Message) !void {
                 return error.InvalidMessage;
             if (response.vc.len > vc_entries_max) return error.TooManyEntries;
         },
+        .subscribe => |request| try validate_subscribe(request),
+        .subscription_batch => |batch| try validate_subscription_batch(batch),
+    }
+}
+
+fn validate_subscribe(request: Subscribe) !void {
+    if (request.stream_id.len > stream_id_length_max) return error.StreamIdTooLong;
+    if (request.event_types.len > subscription_event_types_max) return error.TooManyEventTypes;
+    var bytes_total: u64 = 0;
+    for (request.event_types) |event_type| {
+        if (event_type.len == 0) return error.EventTypeEmpty;
+        if (event_type.len > limits.event_type_length_max) return error.EventTypeTooLong;
+        bytes_total += event_type.len;
+    }
+    if (bytes_total > limits.subscription_event_types_bytes_max) return error.FilterTooLarge;
+}
+
+fn validate_subscription_batch(batch: SubscriptionBatch) !void {
+    if (batch.events.len > read_events_max) return error.TooManyEvents;
+    var previous_position: LogPosition = 0;
+    for (batch.events) |event| {
+        try validate_read_event(event);
+        if (event.log_position <= previous_position) return error.InvalidSubscriptionBatch;
+        if (event.log_position > batch.committed_position) return error.InvalidSubscriptionBatch;
+        previous_position = event.log_position;
     }
 }
 
@@ -1593,6 +1725,99 @@ test "round-trip bounded stream and log read requests" {
     const log = try decode(log_frame, &buffers);
     try std.testing.expectEqual(@as(u64, 99), log.read_log.from_position);
     try std.testing.expectEqual(@as(limits.EventCount, 12), log.read_log.max_count);
+}
+
+test "round-trip subscription open and batch" {
+    var frame_buffer: [1024]u8 = undefined;
+    var type_buffer: [subscription_event_types_max][]const u8 = undefined;
+    var event_buffer: [2]ReadEvent = undefined;
+    var buffers: DecodeBuffers = .{ .event_types = &type_buffer, .read_events = &event_buffer };
+
+    const types = [_][]const u8{ "object.created", "object.deleted" };
+    const open = try test_round_trip(&frame_buffer, .{ .subscribe = .{
+        .stream_id = "",
+        .from = 42,
+        .event_types = &types,
+    } }, &buffers);
+    try std.testing.expectEqualStrings("", open.subscribe.stream_id);
+    try std.testing.expectEqual(@as(u64, 42), open.subscribe.from);
+    try std.testing.expectEqual(@as(usize, 2), open.subscribe.event_types.len);
+    try std.testing.expectEqualStrings("object.deleted", open.subscribe.event_types[1]);
+
+    const stream = try test_round_trip(&frame_buffer, .{ .subscribe = .{
+        .stream_id = "ontology-object/42",
+        .from = 0,
+        .event_types = &.{},
+    } }, &buffers);
+    try std.testing.expectEqualStrings("ontology-object/42", stream.subscribe.stream_id);
+    try std.testing.expectEqual(@as(usize, 0), stream.subscribe.event_types.len);
+
+    const event: ReadEvent = .{
+        .event_id = 7,
+        .stream_id = "ontology-object/42",
+        .stream_version = 1,
+        .log_position = 44,
+        .command_id = "command-1",
+        .event_type = "object.created",
+        .schema_version = 1,
+        .payload = "payload",
+    };
+    const batch = try test_round_trip(&frame_buffer, .{ .subscription_batch = .{
+        .next = 50,
+        .committed_position = 60,
+        .events = &.{event},
+    } }, &buffers);
+    try std.testing.expectEqual(@as(u64, 50), batch.subscription_batch.next);
+    try std.testing.expectEqual(@as(u64, 60), batch.subscription_batch.committed_position);
+    try std.testing.expectEqual(@as(u64, 44), batch.subscription_batch.events[0].log_position);
+
+    const heartbeat = try test_round_trip(&frame_buffer, .{ .subscription_batch = .{
+        .next = 61,
+        .committed_position = 60,
+        .events = &.{},
+    } }, &buffers);
+    try std.testing.expectEqual(@as(usize, 0), heartbeat.subscription_batch.events.len);
+}
+
+test "subscription messages reject out-of-bounds filters and batches" {
+    var frame_buffer: [1024]u8 = undefined;
+    const too_many: [subscription_event_types_max + 1][]const u8 = @splat("t");
+    try std.testing.expectError(error.TooManyEventTypes, encode_into(&frame_buffer, .{
+        .subscribe = .{ .stream_id = "", .from = 1, .event_types = &too_many },
+    }));
+    try std.testing.expectError(error.EventTypeEmpty, encode_into(&frame_buffer, .{
+        .subscribe = .{ .stream_id = "", .from = 1, .event_types = &.{""} },
+    }));
+    const long_stream: [stream_id_length_max + 1]u8 = @splat('s');
+    var large_frame: [2 * limits.subscription_event_types_bytes_max]u8 = undefined;
+    try std.testing.expectError(error.StreamIdTooLong, encode_into(&large_frame, .{
+        .subscribe = .{ .stream_id = &long_stream, .from = 1, .event_types = &.{} },
+    }));
+    // Each type is within its own limit; together they exceed the filter's byte budget.
+    const long_type: [limits.event_type_length_max]u8 = @splat('t');
+    const type_count = limits.subscription_event_types_bytes_max / limits.event_type_length_max + 1;
+    comptime assert(type_count <= subscription_event_types_max);
+    const long_types: [type_count][]const u8 = @splat(&long_type);
+    try std.testing.expectError(error.FilterTooLarge, encode_into(&large_frame, .{
+        .subscribe = .{ .stream_id = "", .from = 1, .event_types = &long_types },
+    }));
+
+    const event: ReadEvent = .{
+        .event_id = 1,
+        .stream_id = "s",
+        .stream_version = 1,
+        .log_position = 5,
+        .command_id = "c",
+        .event_type = "t",
+        .schema_version = 1,
+        .payload = "",
+    };
+    try std.testing.expectError(error.InvalidSubscriptionBatch, encode_into(&frame_buffer, .{
+        .subscription_batch = .{ .next = 6, .committed_position = 4, .events = &.{event} },
+    }));
+    try std.testing.expectError(error.InvalidSubscriptionBatch, encode_into(&frame_buffer, .{
+        .subscription_batch = .{ .next = 6, .committed_position = 9, .events = &.{ event, event } },
+    }));
 }
 
 test "round-trip bounded health metrics" {

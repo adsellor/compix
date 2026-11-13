@@ -47,6 +47,7 @@ pub const Connection = struct {
     _read_events: [limits.read_events_max]protocol.ReadEvent,
     _vc_entries: [protocol.vc_entries_max]protocol.VcEntry,
     _bootstrap_events: [limits.pull_events_max]protocol.BootstrapEvent,
+    _event_types: [limits.subscription_event_types_max][]const u8,
     _security: ?Security,
 
     pub fn init(
@@ -68,6 +69,7 @@ pub const Connection = struct {
             ._read_events = undefined,
             ._vc_entries = undefined,
             ._bootstrap_events = undefined,
+            ._event_types = undefined,
             ._security = null,
         };
         target._reader = stream.reader(io, &target._read_buf);
@@ -119,6 +121,7 @@ pub const Connection = struct {
             .read_events = &self._read_events,
             .vc_entries = &self._vc_entries,
             .bootstrap_events = &self._bootstrap_events,
+            .event_types = &self._event_types,
         };
         return protocol.decode(frame, &decode_buffers);
     }
@@ -193,6 +196,7 @@ pub const Connection = struct {
             .read_events = &self._read_events,
             .vc_entries = &self._vc_entries,
             .bootstrap_events = &self._bootstrap_events,
+            .event_types = &self._event_types,
         };
         return protocol.decode(
             self._frame_read_buf[0 .. protocol.frame_prefix_size + ciphertext_length],

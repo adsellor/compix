@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
@@ -15,12 +16,15 @@ const identity_mod = @import("identity.zig");
 const time_mod = @import("time.zig");
 const limits = @import("limits.zig");
 const owner_mod = @import("owner.zig");
+const subscription_mod = @import("subscription.zig");
 
 const EventStore = store_mod.EventStore;
+const StreamStore = @import("stream_store.zig").StreamStore;
 const EventValue = event_mod.EventValue;
 const DependencyContract = contract_mod.DependencyContract;
 const ServiceIdentity = identity_mod.ServiceIdentity;
 const Breadcrumb = breadcrumb_mod.Breadcrumb;
+const Subscriber = subscription_mod.Subscriber;
 
 const log = std.log.scoped(.server);
 // NOTE: a leak bound, not a liveness mechanism; keep it above any client stall.
@@ -31,12 +35,20 @@ const gossip_dial_timeout_ms: u32 = if (builtin.is_test) 50 else 5_000;
 const gossip_interval_ms: u64 = if (builtin.is_test) 20 else 60_000;
 const gossip_retry_first_ms: u64 = if (builtin.is_test) 20 else 1_000;
 const gossip_tick_ms: u64 = 100;
+/// A quiet subscription still gets an empty batch this often, so the subscriber can tell a
+/// quiet log from a dead connection well inside the driver's receive deadline.
+const subscription_heartbeat_ms: u32 = if (builtin.is_test) 50 else 15_000;
+/// A subscriber that has not taken a frame for this long is closed instead of stalling its pusher.
+const subscription_send_deadline_ms: u32 = if (builtin.is_test) 1_000 else 30_000;
 
 var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 comptime {
     std.debug.assert(connection_idle_deadline_ms > 0);
     std.debug.assert(connection_idle_deadline_ms < std.math.maxInt(u32));
+    std.debug.assert(subscription_heartbeat_ms > 0);
+    std.debug.assert(subscription_heartbeat_ms < connection_idle_deadline_ms);
+    std.debug.assert(subscription_send_deadline_ms > 0);
 }
 
 fn handle_signal(_: std.posix.SIG) callconv(.c) void {
@@ -88,14 +100,15 @@ pub const Server = struct {
     recovery_scratch: []u8,
     integrity_verified: bool,
     connections_active: std.atomic.Value(u16),
-    /// When set, store access routes through it and skips `store_mutex`.
-    store_owner: ?*owner_mod.Owner,
+    store_owner: *owner_mod.Owner,
     auth_failures: std.atomic.Value(u64),
     permission_denials: std.atomic.Value(u64),
     admission_saturation: std.atomic.Value(u64),
     corruption_findings: std.atomic.Value(u64),
     backups_completed: u64,
     last_backup_unix_seconds: i64,
+    /// Lets group commit skip walking the connection pool while nobody subscribes.
+    subscriptions_active: std.atomic.Value(u16),
 
     const ConnectionSlot = struct {
         connection: transport.Connection,
@@ -110,6 +123,13 @@ pub const Server = struct {
         bootstrap_cursor: [limits.key_length_max]u8,
         query_bytes: [protocol.frame_size_max]u8,
         receive_completions: [2]ReceiveCompletion,
+        send_completions: [2]SendCompletion,
+        subscriber: Subscriber,
+    };
+
+    const SendCompletion = union(enum) {
+        sent: anyerror!void,
+        deadline: Io.Cancelable!void,
     };
 
     const ReceiveCompletion = union(enum) {
@@ -130,26 +150,25 @@ pub const Server = struct {
         client_secret: []const u8 = "",
         credentials: []const auth.Credential = &.{},
         integrity_verified: bool = true,
-        use_store_owner: bool = false,
         backups_completed: u64 = 0,
         last_backup_unix_seconds: i64 = 0,
     };
 
+    /// In place, like `init_in_place`: the store owner's thread points back into the server.
     pub fn init(
+        target: *Server,
         allocator: Allocator,
         store: *EventStore,
         identity: ServiceIdentity,
         contracts: []const DependencyContract,
         io: Io,
-    ) !Server {
-        var target: Server = undefined;
-        try init_in_place(&target, allocator, .{
+    ) !void {
+        try init_in_place(target, allocator, .{
             .store = store,
             .identity = identity,
             .contracts = contracts,
             .io = io,
         });
-        return target;
     }
 
     pub fn init_in_place(
@@ -168,7 +187,10 @@ pub const Server = struct {
             return error.InvalidConnectionCapacity;
         const connection_pool = try allocator.alloc(ConnectionSlot, options.connection_capacity);
         errdefer allocator.free(connection_pool);
-        for (connection_pool) |*slot| slot.in_use = false;
+        for (connection_pool) |*slot| {
+            slot.in_use = false;
+            slot.scratch.subscriber = .idle;
+        }
 
         var recovery_task_capacity: u32 = 0;
         for (options.contracts) |contract| {
@@ -193,20 +215,14 @@ pub const Server = struct {
         errdefer allocator.free(replay_entries);
         for (replay_entries) |*entry| entry.* = .{};
 
-        var store_owner: ?*owner_mod.Owner = null;
-        if (options.use_store_owner) {
-            const owner = try allocator.create(owner_mod.Owner);
-            errdefer allocator.destroy(owner);
-            owner.* = try owner_mod.Owner.init(
-                allocator,
-                options.store,
-                options.io,
-                owner_mod.capacity_default,
-            );
-            errdefer owner.deinit();
-            try owner.start();
-            store_owner = owner;
-        }
+        const store_owner = try allocator.create(owner_mod.Owner);
+        errdefer allocator.destroy(store_owner);
+        store_owner.* = try owner_mod.Owner.init(allocator, options.store, options.io, .{
+            .capacity = std.math.ceilPowerOfTwoAssert(u32, options.connection_capacity),
+            .legacy_store_lock = &target.store_mutex,
+            .durable_listener = .{ .context = target, .on_durable = on_durable },
+        });
+        errdefer store_owner.deinit();
 
         target.* = .{
             .allocator = allocator,
@@ -250,19 +266,19 @@ pub const Server = struct {
             ))),
             .backups_completed = options.backups_completed,
             .last_backup_unix_seconds = options.last_backup_unix_seconds,
+            .subscriptions_active = .init(0),
         };
+        // NOTE: only now, since the owner calls back into the finished server.
+        try store_owner.start();
 
         options.store.lsm.enable_background_flush();
     }
 
     pub fn deinit(self: *Server) void {
         self.connection_group.cancel(self.io);
-        if (self.store_owner) |owner| {
-            owner.stop();
-            owner.deinit();
-            self.allocator.destroy(owner);
-            self.store_owner = null;
-        }
+        self.store_owner.stop();
+        self.store_owner.deinit();
+        self.allocator.destroy(self.store_owner);
         for (self.connection_pool) |slot| {
             std.debug.assert(!slot.in_use);
         }
@@ -630,48 +646,25 @@ pub const Server = struct {
                     try conn.send_message(.{ .health_response = self.health() });
                 },
                 .vc_summary_request => {
-                    if (self.store_owner) |owner| {
-                        var summary_len: usize = 0;
-                        var outcome: owner_mod.Outcome =
-                            .{ .failed = error.Unset };
-                        var done: Io.Semaphore = .{ .permits = 0 };
-                        owner.submit(.{
-                            .payload = .{ .vc_summary = .{
-                                .out = &scratch.vc_entries,
-                                .out_len = &summary_len,
-                            } },
-                            .outcome = &outcome,
-                            .done = &done,
-                        }) catch {
-                            try conn.send_message(.{ .err = .{
-                                .code = .internal_error,
-                                .message = "store busy",
-                            } });
-                            return;
-                        };
-                        switch (outcome) {
-                            .done => {},
-                            .failed => |err| {
-                                try send_store_error(conn, err);
-                                return;
-                            },
-                        }
-                        try conn.send_message(.{ .vc_summary_response = .{
-                            .entries = scratch.vc_entries[0..summary_len],
-                        } });
-                        return;
-                    }
-                    self.store_mutex.lockUncancelable(self.io);
-                    const entries = self.store.vc_summary();
-                    const count = @min(entries.len, scratch.vc_entries.len);
-                    @memcpy(scratch.vc_entries[0..count], entries[0..count]);
-                    self.store_mutex.unlock(self.io);
+                    var summary_len: usize = 0;
+                    self.submit_to_owner(.{ .vc_summary = .{
+                        .out = &scratch.vc_entries,
+                        .out_len = &summary_len,
+                    } }) catch |err| {
+                        try send_store_error(conn, err);
+                        continue;
+                    };
+                    assert(summary_len <= scratch.vc_entries.len);
                     try conn.send_message(.{ .vc_summary_response = .{
-                        .entries = scratch.vc_entries[0..count],
+                        .entries = scratch.vc_entries[0..summary_len],
                     } });
                 },
                 .bootstrap_request => |request| {
                     try self.serve_bootstrap_request(conn, scratch, request);
+                },
+                // NOTE: a subscription owns the connection until either side ends it.
+                .subscribe => |request| {
+                    return self.serve_subscription(conn, scratch, request);
                 },
                 else => {
                     conn.send_message(.{ .err = .{
@@ -1149,6 +1142,180 @@ pub const Server = struct {
         try conn.send_message(.{ .read_log_response = response });
     }
 
+    /// Pushes the durable log, or one stream, from `request.from` until either side ends it.
+    ///
+    /// This task is the connection's only owner from here on: it never reads from `conn`
+    /// again and is the only sender. Every page is read on demand by the store's owner into
+    /// this connection's scratch, so nothing is queued per subscriber. A subscriber that reads
+    /// slowly stalls only this task in `send`, and one that stops reading hits the send deadline.
+    fn serve_subscription(
+        self: *Server,
+        conn: *transport.Connection,
+        scratch: *ConnectionScratch,
+        request: protocol.Subscribe,
+    ) !void {
+        const subscriber = &scratch.subscriber;
+        // NOTE: copies out of the receive frame, which every encrypted send overwrites.
+        try subscriber.open(request.stream_id, request.event_types);
+        defer subscriber.shut();
+        _ = self.subscriptions_active.fetchAdd(1, .seq_cst);
+        defer _ = self.subscriptions_active.fetchSub(1, .seq_cst);
+
+        var cursor: u64 = request.from;
+        // The durable position at which the last read found nothing past `cursor`. Until the
+        // durable position moves beyond it, reading again could only find nothing again.
+        var caught_up_at: ?protocol.LogPosition = null;
+        var heartbeat: Heartbeat = .start(self.io);
+        for (0..limits.subscription_rounds_max) |_| {
+            if (!self.running.load(.acquire)) return;
+            // NOTE: read before checking for work, so a notification after the check is kept.
+            const epoch_seen = subscriber.epoch();
+            const durable = self.store_owner.durable_position.load(.seq_cst);
+            if (caught_up_at == null or durable > caught_up_at.?) {
+                const page = try self.read_subscription_page(conn, scratch, cursor);
+                assert(page.next >= cursor);
+                if (page.events.len > 0) {
+                    try self.send_with_deadline(conn, scratch, .{ .subscription_batch = .{
+                        .next = page.next,
+                        .committed_position = page.committed,
+                        .events = page.events,
+                    } });
+                    heartbeat.sent = true;
+                }
+                // NOTE: skipped events move the cursor without a frame; the next batch or
+                // heartbeat carries it.
+                const idle = page.events.len == 0 and page.next == cursor;
+                caught_up_at = if (idle) page.committed else null;
+                cursor = page.next;
+                continue;
+            }
+            if (heartbeat.due(self.io)) {
+                if (!heartbeat.sent) try self.send_with_deadline(conn, scratch, .{
+                    .subscription_batch = .{
+                        .next = cursor,
+                        .committed_position = durable,
+                        .events = &.{},
+                    },
+                });
+                heartbeat = .start(self.io);
+                continue;
+            }
+            try subscriber.wait(self.io, epoch_seen, heartbeat.deadline);
+        }
+        return error.SubscriptionLimitExceeded;
+    }
+
+    fn read_subscription_page(
+        self: *Server,
+        conn: *transport.Connection,
+        scratch: *ConnectionScratch,
+        cursor: u64,
+    ) !StreamStore.SubscriptionPage {
+        const target = &scratch.subscriber.target;
+        var page: StreamStore.SubscriptionPage = undefined;
+        self.submit_to_owner(.{ .subscription_page = .{
+            .query = .{
+                .stream_id = target.stream_id(),
+                .from = cursor,
+                .event_types = target.filter.event_types(),
+            },
+            .output = &scratch.read_events,
+            .output_bytes = &scratch.query_bytes,
+            .page = &page,
+        } }) catch |err| {
+            self.record_store_error(err);
+            log.err("subscription read failed: {}", .{err});
+            try self.send_with_deadline(conn, scratch, .{ .err = .{
+                .code = .internal_error,
+                .message = "stream operation failed",
+            } });
+            return err;
+        };
+        assert(page.events.len <= scratch.read_events.len);
+        return page;
+    }
+
+    /// Sends one frame, or fails once `subscription_send_deadline_ms` passes first. A canceled
+    /// send leaves the stream mid-frame, so the caller must close the connection on error.
+    fn send_with_deadline(
+        self: *Server,
+        conn: *transport.Connection,
+        scratch: *ConnectionScratch,
+        message: protocol.Message,
+    ) !void {
+        var select = Io.Select(SendCompletion).init(self.io, &scratch.send_completions);
+        defer select.cancelDiscard();
+        try select.concurrent(.sent, send_message_task, .{ conn, message });
+        try select.concurrent(.deadline, connection_deadline, .{
+            self.io,
+            subscription_send_deadline_ms,
+        });
+        switch (try select.await()) {
+            .sent => |result| return result,
+            .deadline => |result| {
+                try result;
+                return error.SubscriberSendDeadlineExceeded;
+            },
+        }
+    }
+
+    fn send_message_task(connection: *transport.Connection, message: protocol.Message) anyerror!void {
+        return connection.send_message(message);
+    }
+
+    fn submit_to_owner(self: *Server, payload: owner_mod.Command.Payload) !void {
+        var outcome: owner_mod.Outcome = .{ .failed = error.Unset };
+        var done: Io.Semaphore = .{ .permits = 0 };
+        // NOTE: the queue holds one command per connection, so it cannot be full.
+        self.store_owner.submit(.{ .payload = payload, .outcome = &outcome, .done = &done }) catch
+            unreachable;
+        switch (outcome) {
+            .done => {},
+            .failed => |err| return err,
+        }
+    }
+
+    fn on_durable(context: *anyopaque, position: protocol.LogPosition) void {
+        const self: *Server = @ptrCast(@alignCast(context));
+        assert(position <= self.store_owner.durable_position.load(.seq_cst));
+        self.notify_subscribers();
+    }
+
+    /// Wakes every live subscriber after a commit or on shutdown. A no-op without subscribers.
+    ///
+    /// NOTE: an awake subscriber is notified too. It may have checked the durable position
+    /// already without being asleep yet; only the epoch bump keeps it from sleeping through
+    /// this commit, and `notify` itself skips the syscall when nobody sleeps.
+    fn notify_subscribers(self: *Server) void {
+        if (self.subscriptions_active.load(.seq_cst) == 0) return;
+        for (self.connection_pool) |*slot| {
+            const subscriber = &slot.scratch.subscriber;
+            if (subscriber.active.load(.acquire)) subscriber.notify(self.io);
+        }
+    }
+
+    const Heartbeat = struct {
+        deadline: Io.Clock.Timestamp,
+        /// Whether a batch went out this period; if so the period's heartbeat is skipped, so
+        /// the longest silence is two periods.
+        sent: bool,
+
+        fn start(io: Io) Heartbeat {
+            return .{
+                .deadline = .fromNow(io, .{
+                    .raw = .fromMilliseconds(subscription_heartbeat_ms),
+                    .clock = .awake,
+                }),
+                .sent = false,
+            };
+        }
+
+        fn due(heartbeat: *const Heartbeat, io: Io) bool {
+            const now = Io.Clock.Timestamp.now(io, heartbeat.deadline.clock);
+            return now.raw.nanoseconds >= heartbeat.deadline.raw.nanoseconds;
+        }
+    };
+
     pub fn serve(self: *Server) !void {
         log.info("listening on {s}", .{self.identity.listen_address});
 
@@ -1210,6 +1377,7 @@ pub const Server = struct {
 
     pub fn shutdown(self: *Server) void {
         self.running.store(false, .release);
+        self.notify_subscribers();
         self.listener.stop_accepting() catch |err| {
             log.err("failed to stop listener: {}", .{err});
         };
@@ -1286,7 +1454,10 @@ pub const Server = struct {
 
         self.handle_connection(connection, &slot.scratch) catch |err| switch (err) {
             error.Canceled => std.debug.assert(!self.running.load(.acquire)),
-            error.EndOfStream, error.MessageLimitExceeded => {},
+            error.EndOfStream,
+            error.MessageLimitExceeded,
+            error.SubscriptionLimitExceeded,
+            => {},
             else => log.warn("connection closed: {}", .{err}),
         };
     }
@@ -1314,12 +1485,10 @@ pub const Server = struct {
         };
 
         self.group_commit_mutex.lockUncancelable(self.io);
-        self.store_mutex.lockUncancelable(self.io);
         const failed = sync: {
-            self.store.durable_sync() catch break :sync true;
+            self.submit_to_owner(.durable_sync) catch break :sync true;
             break :sync false;
         };
-        self.store_mutex.unlock(self.io);
 
         self.group_commit_failed = failed;
         self.group_commit_count += 1;
@@ -1406,6 +1575,10 @@ fn message_permitted(permissions: auth.Permissions, message: protocol.Message) b
         .append_stream => permissions.append,
         .read_stream => permissions.read_stream,
         .read_log => permissions.read_log,
+        .subscribe => |request| if (request.stream_id.len == 0)
+            permissions.read_log
+        else
+            permissions.read_stream,
         .pull_request, .bootstrap_request => permissions.recover,
         .health_request, .vc_summary_request => permissions.observe,
         .handshake,
@@ -1417,6 +1590,7 @@ fn message_permitted(permissions: auth.Permissions, message: protocol.Message) b
         .health_response,
         .vc_summary_response,
         .bootstrap_response,
+        .subscription_batch,
         => false,
     };
 }
@@ -1531,7 +1705,8 @@ test "group commit batches concurrent durability waits" {
         .instance_id = "node-1",
         .listen_address = "127.0.0.1:0",
     };
-    var server = try Server.init(allocator, &event_store, identity, &.{}, io);
+    var server: Server = undefined;
+    try Server.init(&server, allocator, &event_store, identity, &.{}, io);
     defer server.deinit();
 
     const Worker = struct {
@@ -1564,7 +1739,8 @@ test "shutdown interrupts a blocked accept" {
         .instance_id = "node-1",
         .listen_address = "127.0.0.1:0",
     };
-    var server = try Server.init(allocator, &event_store, identity, &.{}, io);
+    var server: Server = undefined;
+    try Server.init(&server, allocator, &event_store, identity, &.{}, io);
     defer server.deinit();
 
     const server_thread = try std.Thread.spawn(.{}, struct {
@@ -1595,7 +1771,8 @@ test "shutdown cancels an idle accepted connection" {
         .instance_id = "node-1",
         .listen_address = "127.0.0.1:0",
     };
-    var server = try Server.init(allocator, &event_store, identity, &.{}, io);
+    var server: Server = undefined;
+    try Server.init(&server, allocator, &event_store, identity, &.{}, io);
     defer server.deinit();
     const server_thread = try std.Thread.spawn(.{}, struct {
         fn run(target: *Server) void {
@@ -1643,7 +1820,8 @@ test "unauthenticated connection receives only the handshake deadline" {
     }
     var event_store = try EventStore.init(allocator, wal_path, io, .{});
     defer event_store.deinit();
-    var srv = try Server.init(allocator, &event_store, .{
+    var srv: Server = undefined;
+    try Server.init(&srv, allocator, &event_store, .{
         .name = "deadline-test",
         .instance_id = "node-1",
         .listen_address = "127.0.0.1:0",
@@ -1814,7 +1992,8 @@ test "recovery ingests events from peer" {
         .listen_address = "127.0.0.1:0",
     };
 
-    var srv = try Server.init(allocator, &event_store, identity, &contracts, io);
+    var srv: Server = undefined;
+    try Server.init(&srv, allocator, &event_store, identity, &contracts, io);
     defer srv.deinit();
 
     try srv.run_recovery();
@@ -1872,7 +2051,8 @@ test "handle_connection serves PullRequest" {
         .listen_address = "127.0.0.1:0",
     };
 
-    var srv = try Server.init(allocator, &event_store, identity, &.{}, io);
+    var srv: Server = undefined;
+    try Server.init(&srv, allocator, &event_store, identity, &.{}, io);
     defer srv.deinit();
 
     const port = srv.listener.get_port();
@@ -2437,7 +2617,8 @@ test "single-node appends drive background flushes and survive restart" {
             .instance_id = "node-1",
             .listen_address = "127.0.0.1:0",
         };
-        var server = try Server.init(allocator, &event_store, identity, &.{}, io);
+        var server: Server = undefined;
+        try Server.init(&server, allocator, &event_store, identity, &.{}, io);
         defer server.deinit();
         const server_thread = try std.Thread.spawn(.{}, struct {
             fn run(target: *Server) void {
@@ -2587,7 +2768,8 @@ test "recovery skips unreachable peers" {
         .listen_address = "127.0.0.1:0",
     };
 
-    var srv = try Server.init(allocator, &event_store, identity, &contracts, io);
+    var srv: Server = undefined;
+    try Server.init(&srv, allocator, &event_store, identity, &contracts, io);
     defer srv.deinit();
 
     try srv.run_recovery();
@@ -2836,7 +3018,8 @@ test "fresh peer bootstraps full state and seeds breadcrumbs" {
         .instance_id = "test-1",
         .listen_address = "127.0.0.1:0",
     };
-    var srv = try Server.init(allocator, &event_store, identity, &contracts, io);
+    var srv: Server = undefined;
+    try Server.init(&srv, allocator, &event_store, identity, &contracts, io);
     defer srv.deinit();
 
     try srv.run_recovery();
@@ -2908,10 +3091,9 @@ test "store-owner actor serves vector-clock summaries over the wire" {
         },
         .contracts = &.{},
         .io = io,
-        .use_store_owner = true,
     });
     defer srv.deinit();
-    try std.testing.expect(srv.store_owner != null);
+    try std.testing.expect(srv.store_owner.thread != null);
 
     var address_buffer: [32]u8 = undefined;
     const address = try std.fmt.bufPrint(
@@ -2942,4 +3124,178 @@ test "store-owner actor serves vector-clock summaries over the wire" {
     try std.testing.expectEqual(@as(u64, 1), summary_reply.response.entries[0].counter);
     client.deinit();
     server_thread.join();
+}
+
+test "driver subscription pushes filtered log and stream batches and resumes" {
+    const driver = DriverTest.driver;
+    const client_secret = "0123456789abcdef0123456789abcdef";
+    const allocator = std.testing.allocator;
+    var threaded = Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const wal_path = "data/test_driver_subscription.wal";
+    const paths = [_][]const u8{
+        wal_path,
+        "data/test_driver_subscription.crumb",
+        "data/test_driver_subscription.manifest",
+    };
+    for (paths) |path| Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer for (paths) |path| Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var event_store = try EventStore.init(allocator, wal_path, io, .{});
+    defer event_store.deinit();
+    const credentials = [_]auth.Credential{ .{
+        .service_name = "meridian-writer",
+        .secret = client_secret,
+        .permissions = .{ .append = true },
+    }, .{
+        .service_name = "meridian-subscriber",
+        .secret = client_secret,
+        .permissions = .{ .read_log = true, .read_stream = true },
+    } };
+    var srv: Server = undefined;
+    try Server.init_in_place(&srv, allocator, .{
+        .store = &event_store,
+        .identity = .{
+            .name = "compix-test",
+            .instance_id = "node-1",
+            .listen_address = "127.0.0.1:0",
+        },
+        .contracts = &.{},
+        .io = io,
+        .credentials = &credentials,
+    });
+    defer srv.deinit();
+    const server_thread = try std.Thread.spawn(.{}, struct {
+        fn run(target: *Server) void {
+            target.serve() catch @panic("server failed during subscription test");
+        }
+    }.run, .{&srv});
+    defer server_thread.join();
+    defer srv.shutdown();
+
+    var address_buffer: [32]u8 = undefined;
+    const address = try std.fmt.bufPrint(
+        &address_buffer,
+        "127.0.0.1:{d}",
+        .{srv.listener.get_port()},
+    );
+    var writer: driver.Client = undefined;
+    try driver.Client.connect(&writer, .{
+        .address = address,
+        .service_name = "meridian-writer",
+        .instance_id = "writer-1",
+        .secret = client_secret,
+        .io = io,
+    });
+    defer writer.deinit();
+
+    const first = [_]driver.AppendEvent{
+        .{ .event_type = "object.created", .schema_version = 1, .payload = "one" },
+        .{ .event_type = "noise", .schema_version = 1, .payload = "" },
+        .{ .event_type = "object.created", .schema_version = 1, .payload = "three" },
+    };
+    const first_reply = try writer.append(.{
+        .stream_id = "object/1",
+        .expected_version = .empty,
+        .command_id = "subscription-1",
+        .events = &first,
+    });
+    try std.testing.expect(first_reply.response == .committed);
+
+    var subscriber: driver.Client = undefined;
+    try driver.Client.connect(&subscriber, .{
+        .address = address,
+        .service_name = "meridian-subscriber",
+        .instance_id = "subscriber-1",
+        .secret = client_secret,
+        .io = io,
+    });
+    defer subscriber.deinit();
+    var subscription: driver.Subscription = undefined;
+    try subscription.start(&subscriber, .{
+        .from = 0,
+        .event_types = &.{"object.created"},
+    });
+
+    const backlog = (try subscription.next()).batch;
+    try std.testing.expectEqual(@as(usize, 2), backlog.events.len);
+    try std.testing.expectEqualStrings("one", backlog.events[0].payload);
+    try std.testing.expectEqualStrings("three", backlog.events[1].payload);
+    try std.testing.expectEqual(@as(u64, 3), backlog.events[1].log_position);
+    try std.testing.expectEqual(@as(u64, 4), backlog.next);
+    try std.testing.expectEqual(@as(u64, 3), backlog.committed_position);
+
+    const quiet = (try subscription.next()).batch;
+    try std.testing.expectEqual(@as(usize, 0), quiet.events.len);
+    try std.testing.expectEqual(@as(u64, 4), quiet.next);
+    try std.testing.expectEqual(@as(u64, 3), quiet.committed_position);
+
+    const later = [_]driver.AppendEvent{
+        .{ .event_type = "noise", .schema_version = 1, .payload = "" },
+        .{ .event_type = "object.created", .schema_version = 1, .payload = "five" },
+    };
+    const later_reply = try writer.append(.{
+        .stream_id = "object/1",
+        .expected_version = .{ .exact = 3 },
+        .command_id = "subscription-2",
+        .events = &later,
+    });
+    try std.testing.expect(later_reply.response == .committed);
+    const five = try next_subscription_events(&subscription);
+    try std.testing.expectEqual(@as(usize, 1), five.events.len);
+    try std.testing.expectEqualStrings("five", five.events[0].payload);
+    try std.testing.expectEqual(@as(u64, 5), five.events[0].log_position);
+    const resume_from = five.next;
+    try std.testing.expectEqual(@as(u64, 6), resume_from);
+    subscription.stop();
+
+    const after = [_]driver.AppendEvent{
+        .{ .event_type = "object.created", .schema_version = 1, .payload = "six" },
+    };
+    const after_reply = try writer.append(.{
+        .stream_id = "object/1",
+        .expected_version = .{ .exact = 5 },
+        .command_id = "subscription-3",
+        .events = &after,
+    });
+    try std.testing.expect(after_reply.response == .committed);
+
+    try subscription.start(&subscriber, .{ .from = resume_from });
+    const six = try next_subscription_events(&subscription);
+    try std.testing.expectEqual(@as(usize, 1), six.events.len);
+    try std.testing.expectEqualStrings("six", six.events[0].payload);
+    try std.testing.expectEqual(@as(u64, 7), six.next);
+    subscription.stop();
+
+    try subscription.start(&subscriber, .{
+        .stream_id = "object/1",
+        .from = 4,
+        .event_types = &.{"object.created"},
+    });
+    const stream = try next_subscription_events(&subscription);
+    try std.testing.expectEqual(@as(usize, 2), stream.events.len);
+    try std.testing.expectEqualStrings("five", stream.events[0].payload);
+    try std.testing.expectEqual(@as(u64, 5), stream.events[0].stream_version);
+    try std.testing.expectEqualStrings("six", stream.events[1].payload);
+    try std.testing.expectEqual(@as(u64, 7), stream.next);
+    subscription.stop();
+
+    inline for (.{ "", "object/1" }) |stream_id| {
+        var denied: driver.Subscription = undefined;
+        try denied.start(&writer, .{ .stream_id = stream_id, .from = 0 });
+        const rejected = try denied.next();
+        try std.testing.expectEqual(protocol.ErrorCode.permission_denied, rejected.rejected.code);
+    }
+}
+
+/// Skips heartbeats, which a slow test machine may interleave before any live batch.
+fn next_subscription_events(
+    subscription: *DriverTest.driver.Subscription,
+) !DriverTest.driver.SubscriptionBatch {
+    for (0..64) |_| {
+        const batch = (try subscription.next()).batch;
+        if (batch.events.len > 0) return batch;
+    }
+    return error.TestExpectedEvents;
 }

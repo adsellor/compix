@@ -5,6 +5,8 @@ const Io = std.Io;
 pub const protocol = @import("core/protocol.zig");
 const auth = @import("core/auth.zig");
 const transport = @import("core/transport.zig");
+const limits = @import("core/limits.zig");
+const subscription = @import("core/subscription.zig");
 
 pub const endpoint_count_max: u8 = 5;
 pub const endpoint_list_length_max: u16 =
@@ -82,7 +84,149 @@ pub const BootstrapReply = union(enum) {
     rejected: ServerError,
 };
 
-/// Not thread-safe. Returned slices borrow its buffers until the next request.
+pub const SubscriptionBatch = protocol.SubscriptionBatch;
+
+pub const SubscriptionReply = union(enum) {
+    batch: SubscriptionBatch,
+    /// The server ended the subscription; `Subscription.start` again to retry.
+    rejected: ServerError,
+};
+
+pub const SubscribeOptions = struct {
+    /// Empty subscribes to the whole ordered log; otherwise to this one stream.
+    stream_id: []const u8 = "",
+    /// Where to start, typically the caller's checkpointed `next`: a log position for the
+    /// whole log, a stream version for one stream. 0 means the start.
+    from: u64,
+    /// Only these event types are delivered; empty delivers every event.
+    event_types: []const []const u8 = &.{},
+};
+
+/// A resumable push subscription to the ordered log or one stream, on a client used for
+/// nothing else.
+///
+/// The server holds no state for it, so it survives disconnects and endpoint failover: the
+/// subscription reconnects and resubscribes from the `next` of the last batch it returned.
+/// Across process restarts, start again from the caller's own checkpoint.
+///
+/// There is no window to tune: the server reads each batch from the log on demand, so a
+/// caller that is slow to call `next` only leaves the socket full and the server's pusher
+/// waiting. A caller that stops calling `next` for the server's send deadline is disconnected,
+/// and resumes on its next call.
+///
+/// WARN: Not thread-safe. Returned batches borrow the client's buffers until the next `next`.
+/// FIXME: Check to see weather we can do better here, the subscription should be distributed
+/// by ownership, subagents attached as fugue nodes may messed this up
+pub const Subscription = struct {
+    client: *Client,
+    /// The cursor to resume from: a log position, or a stream version for one stream.
+    next_cursor: u64,
+    active: bool,
+    target: subscription.Target,
+
+    pub fn start(target: *Subscription, client: *Client, options: SubscribeOptions) !void {
+        for (options.event_types) |event_type| {
+            if (event_type.len == 0) return error.EventTypeEmpty;
+            if (event_type.len > limits.event_type_length_max) return error.EventTypeTooLong;
+        }
+        target.* = .{
+            .client = client,
+            .next_cursor = options.from,
+            .active = false,
+            .target = undefined,
+        };
+        try target.target.set(options.stream_id, options.event_types);
+        try target.subscribe_with_failover();
+        assert(target.active);
+    }
+
+    pub fn stop(self: *Subscription) void {
+        self.client.close();
+        self.active = false;
+    }
+
+    /// The next batch, waiting for one if nothing is new. A batch without events is a
+    /// heartbeat; its `next` may still have moved past events the filter skipped.
+    pub fn next(self: *Subscription) !SubscriptionReply {
+        if (!self.active) return error.SubscriptionInactive;
+        const attempts_max: u8 = self.client.endpoint_count * request_rounds_max;
+        assert(attempts_max > 0);
+        var last_error: anyerror = error.ClusterUnavailable;
+        for (0..attempts_max) |_| {
+            if (self.receive_batch()) |reply| {
+                return reply;
+            } else |err| switch (err) {
+                error.InvalidSubscriptionBatch, error.UnexpectedMessage => {
+                    self.stop();
+                    return err;
+                },
+                else => last_error = err,
+            }
+            // NOTE: a lost connection loses nothing: the server resumes at `next_cursor`.
+            self.client.close();
+            self.client.advance_endpoint();
+            self.subscribe() catch |err| {
+                last_error = err;
+                self.client.close();
+            };
+        }
+        self.stop();
+        return last_error;
+    }
+
+    fn receive_batch(self: *Subscription) !SubscriptionReply {
+        if (!self.active) return error.SubscriptionInactive;
+        const message = try self.client.recv_bounded();
+        const batch = switch (message) {
+            .subscription_batch => |batch| batch,
+            .err => |server_error| {
+                self.stop();
+                return .{ .rejected = server_error };
+            },
+            else => return error.UnexpectedMessage,
+        };
+        if (batch.next < self.next_cursor) return error.InvalidSubscriptionBatch;
+        const whole_log = self.target.stream_id().len == 0;
+        for (batch.events) |event| {
+            const cursor = if (whole_log) event.log_position else event.stream_version;
+            if (cursor < self.next_cursor or cursor >= batch.next)
+                return error.InvalidSubscriptionBatch;
+            if (!whole_log and !std.mem.eql(u8, event.stream_id, self.target.stream_id()))
+                return error.InvalidSubscriptionBatch;
+        }
+        self.next_cursor = batch.next;
+        return .{ .batch = batch };
+    }
+
+    fn subscribe_with_failover(self: *Subscription) !void {
+        const attempts_max: u8 = self.client.endpoint_count * request_rounds_max;
+        assert(attempts_max > 0);
+        var last_error: anyerror = error.ClusterUnavailable;
+        for (0..attempts_max) |_| {
+            self.subscribe() catch |err| {
+                last_error = err;
+                self.client.close();
+                self.client.advance_endpoint();
+                continue;
+            };
+            return;
+        }
+        return last_error;
+    }
+
+    fn subscribe(self: *Subscription) !void {
+        self.active = false;
+        if (!self.client.connected) try self.client.connect_transport();
+        try self.client.connection.send_message(.{ .subscribe = .{
+            .stream_id = self.target.stream_id(),
+            .from = self.next_cursor,
+            .event_types = self.target.filter.event_types(),
+        } });
+        self.active = true;
+    }
+};
+
+/// WARN: Not thread-safe. Returned slices borrow its buffers until the next request.
 pub const Client = struct {
     addresses: [endpoint_count_max][protocol.address_length_max]u8,
     address_lengths: [endpoint_count_max]u16,
@@ -442,6 +586,7 @@ comptime {
     assert(@hasDecl(Client, "pull"));
     assert(@hasDecl(Client, "vc_summary"));
     assert(@hasDecl(Client, "bootstrap"));
+    assert(@hasDecl(Subscription, "next"));
 }
 
 const ReceiveState = struct {

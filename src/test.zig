@@ -6,6 +6,7 @@ test {
     _ = @import("core/signing.zig");
     _ = @import("core/bloom.zig");
     _ = @import("core/store.zig");
+    _ = @import("core/subscription.zig");
     _ = @import("core/vc.zig");
     _ = @import("driver.zig");
 }

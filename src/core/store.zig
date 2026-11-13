@@ -320,6 +320,19 @@ pub const EventStore = struct {
         return self.streams.read_log(request, output, output_bytes);
     }
 
+    pub fn read_subscription_page(
+        self: *EventStore,
+        query: StreamStore.SubscriptionQuery,
+        output: []protocol.ReadEvent,
+        output_bytes: []u8,
+    ) !StreamStore.SubscriptionPage {
+        return self.streams.read_subscription_page(query, output, output_bytes);
+    }
+
+    pub fn log_position_durable(self: *const EventStore) protocol.LogPosition {
+        return self.streams.log_position_durable;
+    }
+
     pub fn verify_integrity(self: *EventStore) !StreamStore.Verification {
         return self.streams.verify_integrity();
     }

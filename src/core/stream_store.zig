@@ -180,7 +180,7 @@ fn request_hash(request: protocol.AppendStream) [request_hash_size]u8 {
     var hasher = std.crypto.hash.Blake3.init(.{});
     hash_bytes_u16(&hasher, request.stream_id);
     hash_bytes_u16(&hasher, request.command_id);
-    hash_int(&hasher, u8, @intFromEnum(request.expected_version));
+    hash_int(&hasher, u8, @backingInt(request.expected_version));
     const expected_value: u64 = switch (request.expected_version) {
         .empty => 0,
         .exact => |version| version,
@@ -212,7 +212,7 @@ fn hash_batch_request(decoder_start: BatchDecoder) ![request_hash_size]u8 {
     var hasher = std.crypto.hash.Blake3.init(.{});
     hash_bytes_u16(&hasher, decoder.stream_id);
     hash_bytes_u16(&hasher, decoder.command_id);
-    hash_int(&hasher, u8, @intFromEnum(decoder.expected_version));
+    hash_int(&hasher, u8, @backingInt(decoder.expected_version));
     const expected_value: u64 = switch (decoder.expected_version) {
         .empty => 0,
         .exact => |version| version,
@@ -264,7 +264,7 @@ fn encode_batch(
     try writer.write_int(u16, @intCast(request.events.len));
     try writer.write_bytes_u16(request.stream_id);
     try writer.write_bytes_u16(request.command_id);
-    try writer.write_int(u8, @intFromEnum(request.expected_version));
+    try writer.write_int(u8, @backingInt(request.expected_version));
     const expected_value: u64 = switch (request.expected_version) {
         .empty => 0,
         .exact => |version| version,
@@ -857,6 +857,7 @@ pub const StreamStore = struct {
             request.max_count,
             head,
             self.log_position_durable,
+            .{},
             output,
             output_bytes,
         );
@@ -876,15 +877,90 @@ pub const StreamStore = struct {
             request.max_count,
             self.log_position_durable,
             self.log_position_durable,
+            .{},
             output,
             output_bytes,
         );
         return .{ .next_position = page.next_cursor, .events = page.events };
     }
 
+    pub const SubscriptionQuery = struct {
+        /// Empty reads the whole ordered log; otherwise one stream.
+        stream_id: []const u8,
+        /// A log position for the whole log, a stream version for one stream.
+        from: u64,
+        /// Empty keeps every event type.
+        event_types: []const []const u8,
+    };
+
+    pub const SubscriptionPage = struct {
+        /// Resume cursor; past every examined event, kept or skipped.
+        next: u64,
+        /// The durable log position the page was read at.
+        committed: protocol.LogPosition,
+        events: []protocol.ReadEvent,
+    };
+
+    /// One durable page for a subscription, sized for a subscription batch.
+    ///
+    /// At most `subscription_scan_batches_max` batches are loaded, so a filter that matches
+    /// nothing still costs the store's owner bounded work per page.
+    pub fn read_subscription_page(
+        self: *StreamStore,
+        query: SubscriptionQuery,
+        output: []protocol.ReadEvent,
+        output_bytes: []u8,
+    ) !SubscriptionPage {
+        if (self.poisoned) return error.StorePoisoned;
+        assert(query.event_types.len <= limits.subscription_event_types_max);
+        assert(query.stream_id.len <= protocol.stream_id_length_max);
+        const whole_log = query.stream_id.len == 0;
+        const head = if (whole_log)
+            self.log_position_durable
+        else
+            try self.stream_version(query.stream_id);
+        const page = try self.read_page(
+            if (whole_log) null else query.stream_id,
+            query.from,
+            0,
+            head,
+            self.log_position_durable,
+            .{
+                .event_types = query.event_types,
+                .batches_max = limits.subscription_scan_batches_max,
+                .header_size = protocol.subscription_batch_header_size,
+            },
+            output,
+            output_bytes,
+        );
+        assert(page.next_cursor >= query.from);
+        return .{
+            .next = page.next_cursor,
+            .committed = self.log_position_durable,
+            .events = page.events,
+        };
+    }
+
     const ReadPage = struct {
         next_cursor: u64,
         events: []protocol.ReadEvent,
+    };
+
+    const PageFilter = struct {
+        /// Empty keeps every event.
+        event_types: []const []const u8 = &.{},
+        /// Batches loaded before the page ends; each costs one LSM lookup.
+        batches_max: u32 = std.math.maxInt(u32),
+        /// Response bytes ahead of the events; the page stops before the frame would overflow.
+        header_size: limits.ByteCount = 2 + 8 + 2,
+
+        fn keeps(filter: PageFilter, event_type: []const u8) bool {
+            if (filter.event_types.len == 0) return true;
+            for (filter.event_types) |wanted| {
+                if (std.mem.eql(u8, wanted, event_type)) return true;
+            }
+            return false;
+        }
     };
 
     fn read_page(
@@ -894,33 +970,40 @@ pub const StreamStore = struct {
         count_max_request: limits.EventCount,
         head: u64,
         durable_max: u64,
+        filter: PageFilter,
         output: []protocol.ReadEvent,
         output_bytes: []u8,
     ) !ReadPage {
+        assert(filter.batches_max > 0);
         const count_max = if (count_max_request == 0)
             protocol.read_events_max
         else
             count_max_request;
         if (count_max > output.len) return error.EventBufferTooSmall;
         var arena = try fixed.ByteArena.init(output_bytes);
-        var cursor: u64 = if (from_cursor == 0) 1 else from_cursor;
+        const cursor_start: u64 = if (from_cursor == 0) 1 else from_cursor;
+        var cursor: u64 = cursor_start;
         var count: limits.EventCount = 0;
-        var wire_size: limits.ByteCount = 12;
-        while (count < count_max) {
-            if (cursor <= head) {
-                assert(cursor > 0);
-            } else {
-                break;
-            }
-            const index_ref = try self.lookup_event(stream_id, cursor) orelse
-                return error.CorruptStreamData;
+        var wire_size: limits.ByteCount = filter.header_size;
+        // NOTE: log positions are contiguous across batches, so once a batch is consumed whole the
+        // cursor is the next batch's key and the ordered-log index lookup can be skipped.
+        var batch_aligned = false;
+        var batches: u32 = 0;
+        while (count < count_max and batches < filter.batches_max and cursor <= head) {
+            assert(cursor > 0);
+            const index_ref: IndexRef = if (batch_aligned)
+                .{ .batch_first = cursor, .event_index = 0 }
+            else
+                try self.lookup_event(stream_id, cursor) orelse return error.CorruptStreamData;
             const batch_bytes = try self.load_batch(index_ref.batch_first) orelse
                 return error.CorruptStreamData;
+            batches += 1;
             var decoder = try validate_batch(batch_bytes);
-            const page_has_capacity = try append_batch_events(
+            const batch_consumed = try append_batch_events(
                 &decoder,
                 index_ref.event_index,
                 stream_id,
+                filter,
                 &cursor,
                 count_max,
                 durable_max,
@@ -929,9 +1012,12 @@ pub const StreamStore = struct {
                 &arena,
                 &wire_size,
             );
-            if (!page_has_capacity) break;
+            if (!batch_consumed) break;
+            batch_aligned = stream_id == null;
         }
-        const next_cursor = if (count == 0) from_cursor else cursor;
+        assert(cursor >= cursor_start);
+        assert(count <= cursor - cursor_start);
+        const next_cursor = if (cursor == cursor_start) from_cursor else cursor;
         return .{ .next_cursor = next_cursor, .events = output[0..count] };
     }
 
@@ -965,6 +1051,7 @@ fn append_batch_events(
     decoder: *BatchDecoder,
     event_index_start: limits.EventCount,
     stream_filter: ?[]const u8,
+    filter: StreamStore.PageFilter,
     cursor: *u64,
     count_max: limits.EventCount,
     durable_max: u64,
@@ -987,6 +1074,10 @@ fn append_batch_events(
         if (log_position > durable_max) return false;
         const expected_cursor = if (stream_filter) |_| stream_version else log_position;
         if (cursor.* != expected_cursor) return error.CorruptStreamData;
+        if (!filter.keeps(batch_event.event_type)) {
+            cursor.* += 1;
+            continue;
+        }
         const event_wire_size = try read_event_wire_size(decoder.*, batch_event);
         if (event_wire_size > protocol.frame_payload_size_max - wire_size.*) {
             if (count.* == 0) return error.ReadEventTooLarge;
@@ -1486,4 +1577,120 @@ test "staged appends stay invisible to reads until durable_sync" {
     }, &output, &output_bytes);
     try std.testing.expectEqual(@as(usize, 1), durable_stream.events.len);
     try std.testing.expectEqual(@as(u64, 1), streams.metrics().committed_log_position);
+}
+
+test "subscription pages filter the log and one stream within a bounded scan" {
+    const allocator = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{ .environ = .empty });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const stem = "test_stream_filtered_log";
+    delete_test_files(io, stem);
+    defer delete_test_files(io, stem);
+    var lsm = try LSMEngine.init(allocator, "data/test_stream_filtered_log.wal", io);
+    defer lsm.deinit();
+    var streams = try StreamStore.init(allocator, &lsm, .{
+        .stream_capacity = limits.stream_capacity_test_default,
+        .stream_id_bytes_capacity = limits.stream_id_bytes_capacity_test_default,
+    });
+    defer streams.deinit();
+
+    // More unwanted batches than one scan may load, then the ones a subscriber wants.
+    const noise_appends: u32 = limits.subscription_scan_batches_max + 1;
+    const noise = [_]protocol.AppendEvent{
+        .{ .event_type = "noise", .schema_version = 1, .payload = "" },
+    };
+    for (0..noise_appends) |index| {
+        var command_buffer: [32]u8 = undefined;
+        const command_id = try std.fmt.bufPrint(&command_buffer, "noise-{d}", .{index});
+        _ = try expect_committed(try streams.append(.{
+            .stream_id = "noise",
+            .expected_version = if (index == 0) .empty else .{ .exact = index },
+            .command_id = command_id,
+            .events = &noise,
+        }, 100));
+    }
+    const wanted = [_]protocol.AppendEvent{
+        .{ .event_type = "wanted", .schema_version = 1, .payload = "first" },
+        .{ .event_type = "noise", .schema_version = 1, .payload = "" },
+        .{ .event_type = "wanted", .schema_version = 1, .payload = "second" },
+    };
+    const result = try expect_committed(try streams.append(.{
+        .stream_id = "wanted",
+        .expected_version = .empty,
+        .command_id = "wanted-1",
+        .events = &wanted,
+    }, 100));
+
+    var output: [protocol.read_events_max]protocol.ReadEvent = undefined;
+    var output_bytes: [64 * 1024]u8 = undefined;
+    const types = [_][]const u8{"wanted"};
+
+    const whole_log: StreamStore.SubscriptionQuery = .{
+        .stream_id = "",
+        .from = 0,
+        .event_types = &types,
+    };
+    const skipped = try streams.read_subscription_page(whole_log, &output, &output_bytes);
+    try std.testing.expectEqual(@as(usize, 0), skipped.events.len);
+    try std.testing.expectEqual(@as(u64, limits.subscription_scan_batches_max + 1), skipped.next);
+    try std.testing.expectEqual(result.log_position_last, skipped.committed);
+
+    var query = whole_log;
+    query.from = skipped.next;
+    const expected_payloads = [_][]const u8{ "first", "second" };
+    var found_count: usize = 0;
+    for (0..noise_appends) |_| {
+        if (query.from > result.log_position_last) break;
+        const page = try streams.read_subscription_page(query, &output, &output_bytes);
+        try std.testing.expect(page.next > query.from);
+        // NOTE: payloads borrow `output_bytes`, which the next read reuses.
+        for (page.events) |read_event| {
+            try std.testing.expectEqualStrings("wanted", read_event.event_type);
+            try std.testing.expectEqualStrings(expected_payloads[found_count], read_event.payload);
+            found_count += 1;
+        }
+        query.from = page.next;
+    }
+    try std.testing.expectEqual(@as(usize, 2), found_count);
+    try std.testing.expectEqual(result.log_position_last + 1, query.from);
+
+    const unfiltered = try streams.read_subscription_page(.{
+        .stream_id = "",
+        .from = result.log_position_first,
+        .event_types = &.{},
+    }, &output, &output_bytes);
+    try std.testing.expectEqual(@as(usize, 3), unfiltered.events.len);
+
+    const stream_page = try streams.read_subscription_page(.{
+        .stream_id = "wanted",
+        .from = 0,
+        .event_types = &types,
+    }, &output, &output_bytes);
+    try std.testing.expectEqual(@as(usize, 2), stream_page.events.len);
+    try std.testing.expectEqual(@as(u64, 3), stream_page.events[1].stream_version);
+    try std.testing.expectEqual(@as(u64, 4), stream_page.next);
+
+    // Mid-batch starts use the index; later batches are read by their first position alone.
+    const mid_batch = try streams.read_log(
+        .{ .from_position = result.log_position_first + 1, .max_count = 0 },
+        &output,
+        &output_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 2), mid_batch.events.len);
+    try std.testing.expectEqual(result.log_position_first + 1, mid_batch.events[0].log_position);
+    const across_batches = try streams.read_log(
+        .{ .from_position = result.log_position_first - 2, .max_count = 0 },
+        &output,
+        &output_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 5), across_batches.events.len);
+    for (across_batches.events, 0..) |read_event, index| {
+        try std.testing.expectEqual(result.log_position_first - 2 + index, read_event.log_position);
+    }
+    try std.testing.expectEqualStrings("second", across_batches.events[4].payload);
+
+    const caught_up = try streams.read_subscription_page(query, &output, &output_bytes);
+    try std.testing.expectEqual(@as(usize, 0), caught_up.events.len);
+    try std.testing.expectEqual(query.from, caught_up.next);
 }
